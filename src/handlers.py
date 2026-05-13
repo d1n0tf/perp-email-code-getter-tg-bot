@@ -38,7 +38,6 @@ def build_router(service: BotService) -> Router:
             translate(locale, "choose_language"),
             reply_markup=language_keyboard(),
         )
-        await message.answer(translate(locale, "start_text"))
 
     @router.callback_query(F.data.startswith("lang:"))
     async def language_callback_handler(callback: CallbackQuery) -> None:
