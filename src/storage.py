@@ -116,23 +116,47 @@ class JsonStorage:
         self,
         email_address: str,
         *,
-        user_id: int,
-        chat_id: int,
+        owner_id: str,
+        owner_kind: str,
+        user_id: int | None,
+        chat_id: int | None,
         username: str | None,
         full_name: str | None,
     ) -> bool:
         normalized_email = normalize_email(email_address)
         async with self._taken_lock:
             data = self._load_json(self.taken_email_store_path, default={})
-            if normalized_email in data:
-                return False
+            normalized_record = self._normalize_taken_record(data.get(normalized_email))
+            now = datetime.now(timezone.utc).isoformat()
+
+            if normalized_record is not None:
+                existing_owner_id = str(normalized_record["owner_id"])
+                if existing_owner_id != owner_id:
+                    data[normalized_email] = normalized_record
+                    self._write_json(self.taken_email_store_path, data)
+                    return False
+
+                created_at = str(normalized_record.get("created_at") or now)
+                request_count_raw = normalized_record.get("request_count", 1)
+                request_count = (
+                    request_count_raw
+                    if isinstance(request_count_raw, int) and request_count_raw > 0
+                    else 1
+                )
+            else:
+                created_at = now
+                request_count = 0
 
             data[normalized_email] = {
+                "owner_id": owner_id,
+                "owner_kind": owner_kind,
                 "user_id": user_id,
                 "chat_id": chat_id,
                 "username": username,
                 "full_name": full_name,
-                "created_at": datetime.now(timezone.utc).isoformat(),
+                "created_at": created_at,
+                "last_used_at": now,
+                "request_count": request_count + 1,
             }
             self._write_json(self.taken_email_store_path, data)
             return True
@@ -184,3 +208,38 @@ class JsonStorage:
             temp_name = temporary_file.name
 
         os.replace(temp_name, path)
+
+    def _normalize_taken_record(self, record: Any) -> dict[str, Any] | None:
+        if not isinstance(record, dict):
+            return None
+
+        normalized_record = dict(record)
+        owner_id = normalized_record.get("owner_id")
+        owner_kind = normalized_record.get("owner_kind")
+
+        if not owner_id:
+            legacy_user_id = normalized_record.get("user_id")
+            legacy_username = normalized_record.get("username")
+            legacy_full_name = normalized_record.get("full_name")
+            legacy_created_at = normalized_record.get("created_at")
+
+            if isinstance(legacy_user_id, int) and legacy_user_id > 0:
+                owner_id = f"tg:{legacy_user_id}"
+                owner_kind = "telegram"
+            elif legacy_username == "web":
+                legacy_marker = legacy_full_name or legacy_created_at or "anonymous"
+                owner_id = f"web-legacy:{legacy_marker}"
+                owner_kind = "web"
+            else:
+                legacy_marker = legacy_created_at or "unknown"
+                owner_id = f"legacy:{legacy_marker}"
+                owner_kind = "unknown"
+
+        normalized_record["owner_id"] = str(owner_id)
+        normalized_record["owner_kind"] = str(owner_kind)
+
+        request_count = normalized_record.get("request_count")
+        if not isinstance(request_count, int) or request_count <= 0:
+            normalized_record["request_count"] = 1
+
+        return normalized_record

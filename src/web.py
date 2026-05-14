@@ -1,0 +1,329 @@
+import html
+import re
+from urllib.parse import parse_qs
+from uuid import uuid4
+
+from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
+
+from src.email_manager import CodeWaitTimeout
+from src.messages import DEFAULT_LOCALE, SUPPORTED_LOCALES, translate
+from src.service import BotService
+from src.storage import normalize_email
+
+
+EMAIL_REGEX = re.compile(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", re.IGNORECASE)
+WEB_USER_COOKIE_NAME = "perp_web_user_id"
+
+WEB_TEXTS = {
+    "ru": {
+        "title": "Perp Mail Bot",
+        "subtitle": "Это тот же backend проекта, только с простым web-интерфейсом.",
+        "request_heading": "Получить код",
+        "request_label": "Email",
+        "request_placeholder": "example@outlook.com",
+        "request_button": "Запросить код",
+        "code_found_web": "Код для {email}: {code}",
+        "lang_ru": "Русский",
+        "lang_en": "English",
+    },
+    "en": {
+        "title": "Perp Mail Bot",
+        "subtitle": "This is the same project backend, just with a simple web interface.",
+        "request_heading": "Get code",
+        "request_label": "Email",
+        "request_placeholder": "example@outlook.com",
+        "request_button": "Request code",
+        "code_found_web": "Code for {email}: {code}",
+        "lang_ru": "Русский",
+        "lang_en": "English",
+    },
+}
+
+
+def create_web_app(service: BotService) -> FastAPI:
+    app = FastAPI(title="Perp Mail Bot")
+    app.state.service = service
+
+    @app.get("/", response_class=HTMLResponse)
+    async def index(request: Request) -> HTMLResponse:
+        locale = resolve_locale(request.query_params.get("lang"))
+        web_user_id = get_or_create_web_user_id(request)
+        return build_page_response(locale=locale, web_user_id=web_user_id)
+
+    @app.post("/request-code", response_class=HTMLResponse)
+    async def request_code(request: Request) -> HTMLResponse:
+        payload = await read_form_body(request)
+        locale = resolve_locale(payload.get("lang"))
+        email_address = normalize_email(payload.get("email", ""))
+        web_user_id = get_or_create_web_user_id(request)
+
+        if not EMAIL_REGEX.fullmatch(email_address):
+            return build_page_response(
+                locale=locale,
+                web_user_id=web_user_id,
+                email_value=email_address,
+                status_message=translate(locale, "email_invalid"),
+                status_kind="error",
+                status_code=400,
+            )
+
+        client_host = request.client.host if request.client is not None else "web"
+        status, account = await service.prepare_code_request(
+            requester_id=f"web:{web_user_id}",
+            requester_kind="web",
+            user_id=None,
+            chat_id=None,
+            username="web",
+            full_name=f"web:{client_host}",
+            email_address=email_address,
+        )
+
+        if status == "missing":
+            return build_page_response(
+                locale=locale,
+                web_user_id=web_user_id,
+                email_value=email_address,
+                status_message=translate(locale, "email_missing"),
+                status_kind="error",
+                status_code=404,
+            )
+        if status == "taken":
+            return build_page_response(
+                locale=locale,
+                web_user_id=web_user_id,
+                email_value=email_address,
+                status_message=translate(locale, "email_taken"),
+                status_kind="error",
+                status_code=409,
+            )
+        if account is None:
+            return build_page_response(
+                locale=locale,
+                web_user_id=web_user_id,
+                email_value=email_address,
+                status_message=translate(locale, "code_failed", email=email_address),
+                status_kind="error",
+                status_code=500,
+            )
+
+        try:
+            result = await service.fetch_code(account)
+        except CodeWaitTimeout:
+            return build_page_response(
+                locale=locale,
+                web_user_id=web_user_id,
+                email_value=email_address,
+                status_message=translate(locale, "code_timeout", email=email_address),
+                status_kind="error",
+                status_code=504,
+            )
+        except Exception:
+            return build_page_response(
+                locale=locale,
+                web_user_id=web_user_id,
+                email_value=email_address,
+                status_message=translate(locale, "code_failed", email=email_address),
+                status_kind="error",
+                status_code=500,
+            )
+
+        return build_page_response(
+            locale=locale,
+            web_user_id=web_user_id,
+            email_value=email_address,
+            status_message=web_text(
+                locale,
+                "code_found_web",
+                email=email_address,
+                code=result.code,
+            ),
+            status_kind="success",
+        )
+
+    return app
+
+
+async def read_form_body(request: Request) -> dict[str, str]:
+    raw_body = (await request.body()).decode("utf-8", errors="ignore")
+    parsed = parse_qs(raw_body, keep_blank_values=True)
+    return {key: values[0] if values else "" for key, values in parsed.items()}
+
+
+def render_page(
+    *,
+    locale: str,
+    email_value: str = "",
+    status_message: str = "",
+    status_kind: str = "info",
+) -> str:
+    locale = resolve_locale(locale)
+    safe_email_value = html.escape(email_value, quote=True)
+    safe_status_message = html.escape(status_message)
+    safe_locale = html.escape(locale, quote=True)
+    status_class = {
+        "success": "status success",
+        "error": "status error",
+    }.get(status_kind, "status")
+
+    status_block = ""
+    if safe_status_message:
+        status_block = f'<div class="{status_class}">{safe_status_message}</div>'
+
+    return f"""<!DOCTYPE html>
+<html lang="{safe_locale}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{html.escape(web_text(locale, "title"))}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      font-family: Arial, sans-serif;
+      background: #f6f7fb;
+      color: #111827;
+    }}
+    * {{
+      box-sizing: border-box;
+    }}
+    body {{
+      margin: 0;
+      background: #f6f7fb;
+    }}
+    main {{
+      max-width: 760px;
+      margin: 32px auto;
+      padding: 0 16px 32px;
+    }}
+    .card {{
+      background: #ffffff;
+      border: 1px solid #d7dce5;
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }}
+    h1, h2 {{
+      margin-top: 0;
+    }}
+    .lang-switch {{
+      display: flex;
+      gap: 10px;
+      margin-bottom: 16px;
+    }}
+    .lang-switch a {{
+      color: #0f766e;
+      text-decoration: none;
+      font-weight: 700;
+    }}
+    label {{
+      display: block;
+      margin-bottom: 8px;
+      font-weight: 700;
+    }}
+    input {{
+      width: 100%;
+      padding: 12px;
+      border: 1px solid #bfc7d4;
+      border-radius: 8px;
+      margin-bottom: 12px;
+    }}
+    button {{
+      padding: 12px 16px;
+      border: 0;
+      border-radius: 8px;
+      background: #0f766e;
+      color: #ffffff;
+      cursor: pointer;
+      font-weight: 700;
+    }}
+    .status {{
+      margin-bottom: 16px;
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: #eef2ff;
+    }}
+    .status.success {{
+      background: #dcfce7;
+    }}
+    .status.error {{
+      background: #fee2e2;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <div class="lang-switch">
+      <a href="/?lang=ru">{html.escape(web_text(locale, "lang_ru"))}</a>
+      <a href="/?lang=en">{html.escape(web_text(locale, "lang_en"))}</a>
+    </div>
+    <h1>{html.escape(web_text(locale, "title"))}</h1>
+    <p>{html.escape(web_text(locale, "subtitle"))}</p>
+    {status_block}
+    <section class="card">
+      <h2>{html.escape(web_text(locale, "request_heading"))}</h2>
+      <form action="/request-code" method="post">
+        <input type="hidden" name="lang" value="{safe_locale}">
+        <label for="email">{html.escape(web_text(locale, "request_label"))}</label>
+        <input
+          id="email"
+          name="email"
+          type="text"
+          value="{safe_email_value}"
+          placeholder="{html.escape(web_text(locale, "request_placeholder"), quote=True)}"
+        >
+        <button type="submit">{html.escape(web_text(locale, "request_button"))}</button>
+      </form>
+    </section>
+  </main>
+</body>
+</html>"""
+
+
+def build_page_response(
+    *,
+    locale: str,
+    web_user_id: str,
+    email_value: str = "",
+    status_message: str = "",
+    status_kind: str = "info",
+    status_code: int = 200,
+) -> HTMLResponse:
+    response = HTMLResponse(
+        render_page(
+            locale=locale,
+            email_value=email_value,
+            status_message=status_message,
+            status_kind=status_kind,
+        ),
+        status_code=status_code,
+    )
+    response.set_cookie(
+        key=WEB_USER_COOKIE_NAME,
+        value=web_user_id,
+        httponly=True,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 365,
+    )
+    return response
+
+
+def get_or_create_web_user_id(request: Request) -> str:
+    raw_cookie = request.cookies.get(WEB_USER_COOKIE_NAME, "").strip()
+    if raw_cookie:
+        return raw_cookie
+    return uuid4().hex
+
+
+def resolve_locale(raw_locale: str | None) -> str:
+    if raw_locale is None:
+        return DEFAULT_LOCALE
+    locale = raw_locale.strip().lower()
+    if locale not in SUPPORTED_LOCALES:
+        return DEFAULT_LOCALE
+    return locale
+
+
+def web_text(locale: str, key: str, **kwargs: str) -> str:
+    bundle = WEB_TEXTS.get(locale, WEB_TEXTS[DEFAULT_LOCALE])
+    template = bundle.get(key) or WEB_TEXTS[DEFAULT_LOCALE][key]
+    return template.format(**kwargs)

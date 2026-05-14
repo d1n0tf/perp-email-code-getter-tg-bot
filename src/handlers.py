@@ -102,6 +102,8 @@ def build_router(service: BotService) -> Router:
 
         status = await service.start_code_request(
             bot=message.bot,
+            requester_id=f"tg:{message.from_user.id}",
+            requester_kind="telegram",
             user_id=message.from_user.id,
             chat_id=message.chat.id,
             username=message.from_user.username,

@@ -13,7 +13,7 @@ class Settings(BaseSettings):
         extra="allow",
     )
 
-    tg_token: str
+    tg_token: str | None = None
     tg_admins: list[int] = []
     imap_host: str = "outlook.office365.com"
     search_from: str = "team@mail.perplexity.ai"
@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     mail_global_rate_limit_per_second: float = 2.0
     mail_global_backoff_base_seconds: float = 5.0
     mail_global_backoff_max_seconds: float = 120.0
+    web_host: str = "127.0.0.1"
+    web_port: int = 8000
 
     @field_validator("tg_admins", mode="before")
     @classmethod

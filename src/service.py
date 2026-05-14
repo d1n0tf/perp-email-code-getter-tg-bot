@@ -5,7 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from aiogram import Bot
 
 from src.config import Settings
-from src.email_manager import CodeWaitTimeout, EmailCodeFetcher
+from src.email_manager import CodeResult, CodeWaitTimeout, EmailCodeFetcher
 from src.messages import DEFAULT_LOCALE
 from src.storage import EmailAccount, JsonStorage, normalize_email
 
@@ -37,30 +37,67 @@ class BotService:
         existed = await self.storage.upsert_account(account)
         return account, existed
 
-    async def start_code_request(
+    async def prepare_code_request(
         self,
         *,
-        bot: Bot,
-        user_id: int,
-        chat_id: int,
+        requester_id: str,
+        requester_kind: str,
+        user_id: int | None,
+        chat_id: int | None,
         username: str | None,
         full_name: str | None,
         email_address: str,
-    ) -> str:
+    ) -> tuple[str, EmailAccount | None]:
         normalized_email = normalize_email(email_address)
         account = await self.storage.get_account(normalized_email)
         if account is None:
-            return "missing"
+            return "missing", None
 
         reserved = await self.storage.reserve_email(
             normalized_email,
+            owner_id=requester_id,
+            owner_kind=requester_kind,
             user_id=user_id,
             chat_id=chat_id,
             username=username,
             full_name=full_name,
         )
         if not reserved:
-            return "taken"
+            return "taken", None
+
+        return "started", account
+
+    async def fetch_code(self, account: EmailAccount) -> CodeResult:
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(
+            self.executor,
+            self.fetcher.wait_for_code,
+            account,
+        )
+
+    async def start_code_request(
+        self,
+        *,
+        bot: Bot,
+        requester_id: str,
+        requester_kind: str,
+        user_id: int,
+        chat_id: int,
+        username: str | None,
+        full_name: str | None,
+        email_address: str,
+    ) -> str:
+        status, account = await self.prepare_code_request(
+            requester_id=requester_id,
+            requester_kind=requester_kind,
+            user_id=user_id,
+            chat_id=chat_id,
+            username=username,
+            full_name=full_name,
+            email_address=email_address,
+        )
+        if account is None:
+            return status
 
         task = asyncio.create_task(
             self._deliver_code(
@@ -89,13 +126,8 @@ class BotService:
         chat_id: int,
         account: EmailAccount,
     ) -> None:
-        loop = asyncio.get_running_loop()
         try:
-            result = await loop.run_in_executor(
-                self.executor,
-                self.fetcher.wait_for_code,
-                account,
-            )
+            result = await self.fetch_code(account)
             locale = await self.get_locale(user_id)
             await bot.send_message(
                 chat_id,
