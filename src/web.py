@@ -99,16 +99,16 @@ def create_web_app(service: BotService) -> FastAPI:
                 status_kind="error",
                 status_code=404,
             )
-        if status == "taken":
-            return build_page_response(
-                locale=locale,
-                web_user_id=web_user_id,
-                base_path=base_path,
-                email_value=email_address,
-                status_message=translate(locale, "email_taken"),
-                status_kind="error",
-                status_code=409,
-            )
+        # if status == "taken":
+        #     return build_page_response(
+        #         locale=locale,
+        #         web_user_id=web_user_id,
+        #         base_path=base_path,
+        #         email_value=email_address,
+        #         status_message=translate(locale, "email_taken"),
+        #         status_kind="error",
+        #         status_code=409,
+        #     )
         if request_id is None:
             return build_page_response(
                 locale=locale,
