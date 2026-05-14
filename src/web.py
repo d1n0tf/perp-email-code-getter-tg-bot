@@ -1,13 +1,12 @@
 import html
 import re
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlencode
 from uuid import uuid4
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from src.config import settings
-from src.email_manager import CodeWaitTimeout
 from src.messages import DEFAULT_LOCALE, SUPPORTED_LOCALES, translate
 from src.service import BotService
 from src.storage import normalize_email
@@ -24,6 +23,9 @@ WEB_TEXTS = {
         "request_label": "Email",
         "request_placeholder": "example@outlook.com",
         "request_button": "Запросить код",
+        "waiting_title": "Ожидание кода",
+        "waiting_text": "Жду код для {email}. Страница будет ждать сколько угодно.",
+        "polling_error": "Нет связи с сервером. Продолжаю пытаться...",
         "code_found_web": "Код для {email}: {code}",
         "lang_ru": "Русский",
         "lang_en": "English",
@@ -35,6 +37,9 @@ WEB_TEXTS = {
         "request_label": "Email",
         "request_placeholder": "example@outlook.com",
         "request_button": "Request code",
+        "waiting_title": "Waiting for code",
+        "waiting_text": "Waiting for a code for {email}. This page will keep waiting as long as needed.",
+        "polling_error": "Connection issue. Retrying...",
         "code_found_web": "Code for {email}: {code}",
         "lang_ru": "Русский",
         "lang_en": "English",
@@ -56,7 +61,7 @@ def create_web_app(service: BotService) -> FastAPI:
             base_path=base_path,
         )
 
-    async def request_code(request: Request) -> HTMLResponse:
+    async def request_code(request: Request) -> RedirectResponse | HTMLResponse:
         payload = await read_form_body(request)
         locale = resolve_locale(payload.get("lang"))
         email_address = normalize_email(payload.get("email", ""))
@@ -74,7 +79,7 @@ def create_web_app(service: BotService) -> FastAPI:
             )
 
         client_host = request.client.host if request.client is not None else "web"
-        status, account = await service.prepare_code_request(
+        status, request_id = await service.start_web_code_request(
             requester_id=f"web:{web_user_id}",
             requester_kind="web",
             user_id=None,
@@ -104,7 +109,7 @@ def create_web_app(service: BotService) -> FastAPI:
                 status_kind="error",
                 status_code=409,
             )
-        if account is None:
+        if request_id is None:
             return build_page_response(
                 locale=locale,
                 web_user_id=web_user_id,
@@ -115,42 +120,118 @@ def create_web_app(service: BotService) -> FastAPI:
                 status_code=500,
             )
 
-        try:
-            result = await service.fetch_code(account)
-        except CodeWaitTimeout:
+        response = RedirectResponse(
+            url=build_wait_url(
+                base_path=base_path,
+                request_id=request_id,
+                locale=locale,
+            ),
+            status_code=303,
+        )
+        response.set_cookie(
+            key=WEB_USER_COOKIE_NAME,
+            value=web_user_id,
+            httponly=True,
+            samesite="lax",
+            max_age=60 * 60 * 24 * 365,
+        )
+        return response
+
+    async def wait_page(request: Request) -> HTMLResponse:
+        locale = resolve_locale(request.query_params.get("lang"))
+        request_id = request.query_params.get("request_id", "").strip()
+        web_user_id = get_or_create_web_user_id(request)
+        requester_id = f"web:{web_user_id}"
+        request_state = await service.get_web_code_request(
+            request_id=request_id,
+            requester_id=requester_id,
+        )
+        if request_state is None:
             return build_page_response(
                 locale=locale,
                 web_user_id=web_user_id,
                 base_path=base_path,
-                email_value=email_address,
-                status_message=translate(locale, "code_timeout", email=email_address),
+                status_message=translate(locale, "code_failed", email=""),
                 status_kind="error",
-                status_code=504,
-            )
-        except Exception:
-            return build_page_response(
-                locale=locale,
-                web_user_id=web_user_id,
-                base_path=base_path,
-                email_value=email_address,
-                status_message=translate(locale, "code_failed", email=email_address),
-                status_kind="error",
-                status_code=500,
+                status_code=404,
             )
 
-        return build_page_response(
+        return build_wait_page_response(
             locale=locale,
             web_user_id=web_user_id,
             base_path=base_path,
-            email_value=email_address,
-            status_message=web_text(
+            request_id=request_id,
+            email_address=request_state.email_address,
+        )
+
+    async def request_status(request: Request) -> JSONResponse:
+        locale = resolve_locale(request.query_params.get("lang"))
+        request_id = request.query_params.get("request_id", "").strip()
+        web_user_id = get_or_create_web_user_id(request)
+        requester_id = f"web:{web_user_id}"
+        request_state = await service.get_web_code_request(
+            request_id=request_id,
+            requester_id=requester_id,
+        )
+        if request_state is None:
+            response = JSONResponse(
+                {
+                    "status": "missing",
+                    "message": translate(locale, "code_failed", email=""),
+                },
+                status_code=404,
+            )
+            response.set_cookie(
+                key=WEB_USER_COOKIE_NAME,
+                value=web_user_id,
+                httponly=True,
+                samesite="lax",
+                max_age=60 * 60 * 24 * 365,
+            )
+            return response
+
+        if request_state.status == "pending":
+            message = web_text(
+                locale,
+                "waiting_text",
+                email=request_state.email_address,
+            )
+        elif request_state.status == "success":
+            message = web_text(
                 locale,
                 "code_found_web",
-                email=email_address,
-                code=result.code,
-            ),
-            status_kind="success",
+                email=request_state.email_address,
+                code=request_state.code or "",
+            )
+        elif request_state.status == "timeout":
+            message = translate(
+                locale,
+                "code_timeout",
+                email=request_state.email_address,
+            )
+        else:
+            message = translate(
+                locale,
+                "code_failed",
+                email=request_state.email_address,
+            )
+
+        response = JSONResponse(
+            {
+                "status": request_state.status,
+                "message": message,
+                "email": request_state.email_address,
+                "code": request_state.code,
+            }
         )
+        response.set_cookie(
+            key=WEB_USER_COOKIE_NAME,
+            value=web_user_id,
+            httponly=True,
+            samesite="lax",
+            max_age=60 * 60 * 24 * 365,
+        )
+        return response
 
     for route_path in route_variants("/", base_path):
         app.add_api_route(route_path, index, methods=["GET"], response_class=HTMLResponse)
@@ -160,6 +241,15 @@ def create_web_app(service: BotService) -> FastAPI:
             request_code,
             methods=["POST"],
             response_class=HTMLResponse,
+        )
+    for route_path in route_variants("/wait", base_path):
+        app.add_api_route(route_path, wait_page, methods=["GET"], response_class=HTMLResponse)
+    for route_path in route_variants("/request-status", base_path):
+        app.add_api_route(
+            route_path,
+            request_status,
+            methods=["GET"],
+            response_class=JSONResponse,
         )
 
     return app
@@ -336,6 +426,32 @@ def build_page_response(
     return response
 
 
+def build_wait_page_response(
+    *,
+    locale: str,
+    web_user_id: str,
+    base_path: str,
+    request_id: str,
+    email_address: str,
+) -> HTMLResponse:
+    response = HTMLResponse(
+        render_wait_page(
+            locale=locale,
+            base_path=base_path,
+            request_id=request_id,
+            email_address=email_address,
+        )
+    )
+    response.set_cookie(
+        key=WEB_USER_COOKIE_NAME,
+        value=web_user_id,
+        httponly=True,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 365,
+    )
+    return response
+
+
 def get_or_create_web_user_id(request: Request) -> str:
     raw_cookie = request.cookies.get(WEB_USER_COOKIE_NAME, "").strip()
     if raw_cookie:
@@ -362,6 +478,11 @@ def build_web_path(base_path: str, route_path: str) -> str:
     return f"{normalized_base_path}{route_path}" if normalized_base_path else route_path
 
 
+def build_wait_url(*, base_path: str, request_id: str, locale: str) -> str:
+    query_string = urlencode({"request_id": request_id, "lang": locale})
+    return f'{build_web_path(base_path, "/wait")}?{query_string}'
+
+
 def route_variants(route_path: str, base_path: str) -> list[str]:
     paths = [route_path]
     prefixed_path = build_web_path(base_path, route_path)
@@ -383,3 +504,119 @@ def web_text(locale: str, key: str, **kwargs: str) -> str:
     bundle = WEB_TEXTS.get(locale, WEB_TEXTS[DEFAULT_LOCALE])
     template = bundle.get(key) or WEB_TEXTS[DEFAULT_LOCALE][key]
     return template.format(**kwargs)
+
+
+def render_wait_page(
+    *,
+    locale: str,
+    base_path: str,
+    request_id: str,
+    email_address: str,
+) -> str:
+    locale = resolve_locale(locale)
+    base_path = normalize_base_path(base_path)
+    safe_locale = html.escape(locale, quote=True)
+    safe_waiting_title = html.escape(web_text(locale, "waiting_title"))
+    safe_initial_message = html.escape(
+        web_text(locale, "waiting_text", email=email_address)
+    )
+    status_url = html.escape(
+        f'{build_web_path(base_path, "/request-status")}?{urlencode({"request_id": request_id, "lang": locale})}',
+        quote=True,
+    )
+    polling_error = html.escape(web_text(locale, "polling_error"))
+
+    return f"""<!DOCTYPE html>
+<html lang="{safe_locale}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{safe_waiting_title}</title>
+  <style>
+    :root {{
+      color-scheme: light;
+      font-family: Arial, sans-serif;
+      background: #f6f7fb;
+      color: #111827;
+    }}
+    * {{
+      box-sizing: border-box;
+    }}
+    body {{
+      margin: 0;
+      background: #f6f7fb;
+    }}
+    main {{
+      max-width: 760px;
+      margin: 32px auto;
+      padding: 0 16px 32px;
+    }}
+    .card {{
+      background: #ffffff;
+      border: 1px solid #d7dce5;
+      border-radius: 12px;
+      padding: 20px;
+      margin-bottom: 16px;
+    }}
+    .status {{
+      padding: 12px 14px;
+      border-radius: 10px;
+      background: #eef2ff;
+    }}
+    .status.success {{
+      background: #dcfce7;
+    }}
+    .status.error {{
+      background: #fee2e2;
+    }}
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card">
+      <h1>{safe_waiting_title}</h1>
+      <div id="status" class="status">{safe_initial_message}</div>
+    </section>
+  </main>
+  <script>
+    const statusUrl = "{status_url}";
+    const pollingErrorText = "{polling_error}";
+    const statusNode = document.getElementById("status");
+
+    async function pollStatus() {{
+      try {{
+        const response = await fetch(statusUrl, {{
+          method: "GET",
+          cache: "no-store",
+          credentials: "same-origin",
+        }});
+
+        if (!response.ok) {{
+          throw new Error("Bad status: " + response.status);
+        }}
+
+        const data = await response.json();
+        statusNode.textContent = data.message || "";
+        statusNode.className = "status";
+
+        if (data.status === "success") {{
+          statusNode.classList.add("success");
+          return;
+        }}
+
+        if (data.status === "failed" || data.status === "timeout" || data.status === "missing") {{
+          statusNode.classList.add("error");
+          return;
+        }}
+      }} catch (error) {{
+        statusNode.textContent = pollingErrorText;
+        statusNode.className = "status error";
+      }}
+
+      window.setTimeout(pollStatus, 2000);
+    }}
+
+    pollStatus();
+  </script>
+</body>
+</html>"""
