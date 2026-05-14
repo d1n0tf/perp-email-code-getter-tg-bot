@@ -6,6 +6,7 @@ from uuid import uuid4
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse
 
+from src.config import settings
 from src.email_manager import CodeWaitTimeout
 from src.messages import DEFAULT_LOCALE, SUPPORTED_LOCALES, translate
 from src.service import BotService
@@ -44,14 +45,17 @@ WEB_TEXTS = {
 def create_web_app(service: BotService) -> FastAPI:
     app = FastAPI(title="Perp Mail Bot")
     app.state.service = service
+    base_path = normalize_base_path(settings.web_base_path)
 
-    @app.get("/", response_class=HTMLResponse)
     async def index(request: Request) -> HTMLResponse:
         locale = resolve_locale(request.query_params.get("lang"))
         web_user_id = get_or_create_web_user_id(request)
-        return build_page_response(locale=locale, web_user_id=web_user_id)
+        return build_page_response(
+            locale=locale,
+            web_user_id=web_user_id,
+            base_path=base_path,
+        )
 
-    @app.post("/request-code", response_class=HTMLResponse)
     async def request_code(request: Request) -> HTMLResponse:
         payload = await read_form_body(request)
         locale = resolve_locale(payload.get("lang"))
@@ -62,6 +66,7 @@ def create_web_app(service: BotService) -> FastAPI:
             return build_page_response(
                 locale=locale,
                 web_user_id=web_user_id,
+                base_path=base_path,
                 email_value=email_address,
                 status_message=translate(locale, "email_invalid"),
                 status_kind="error",
@@ -83,6 +88,7 @@ def create_web_app(service: BotService) -> FastAPI:
             return build_page_response(
                 locale=locale,
                 web_user_id=web_user_id,
+                base_path=base_path,
                 email_value=email_address,
                 status_message=translate(locale, "email_missing"),
                 status_kind="error",
@@ -92,6 +98,7 @@ def create_web_app(service: BotService) -> FastAPI:
             return build_page_response(
                 locale=locale,
                 web_user_id=web_user_id,
+                base_path=base_path,
                 email_value=email_address,
                 status_message=translate(locale, "email_taken"),
                 status_kind="error",
@@ -101,6 +108,7 @@ def create_web_app(service: BotService) -> FastAPI:
             return build_page_response(
                 locale=locale,
                 web_user_id=web_user_id,
+                base_path=base_path,
                 email_value=email_address,
                 status_message=translate(locale, "code_failed", email=email_address),
                 status_kind="error",
@@ -113,6 +121,7 @@ def create_web_app(service: BotService) -> FastAPI:
             return build_page_response(
                 locale=locale,
                 web_user_id=web_user_id,
+                base_path=base_path,
                 email_value=email_address,
                 status_message=translate(locale, "code_timeout", email=email_address),
                 status_kind="error",
@@ -122,6 +131,7 @@ def create_web_app(service: BotService) -> FastAPI:
             return build_page_response(
                 locale=locale,
                 web_user_id=web_user_id,
+                base_path=base_path,
                 email_value=email_address,
                 status_message=translate(locale, "code_failed", email=email_address),
                 status_kind="error",
@@ -131,6 +141,7 @@ def create_web_app(service: BotService) -> FastAPI:
         return build_page_response(
             locale=locale,
             web_user_id=web_user_id,
+            base_path=base_path,
             email_value=email_address,
             status_message=web_text(
                 locale,
@@ -139,6 +150,16 @@ def create_web_app(service: BotService) -> FastAPI:
                 code=result.code,
             ),
             status_kind="success",
+        )
+
+    for route_path in route_variants("/", base_path):
+        app.add_api_route(route_path, index, methods=["GET"], response_class=HTMLResponse)
+    for route_path in route_variants("/request-code", base_path):
+        app.add_api_route(
+            route_path,
+            request_code,
+            methods=["POST"],
+            response_class=HTMLResponse,
         )
 
     return app
@@ -153,14 +174,20 @@ async def read_form_body(request: Request) -> dict[str, str]:
 def render_page(
     *,
     locale: str,
+    base_path: str,
     email_value: str = "",
     status_message: str = "",
     status_kind: str = "info",
 ) -> str:
     locale = resolve_locale(locale)
+    base_path = normalize_base_path(base_path)
     safe_email_value = html.escape(email_value, quote=True)
     safe_status_message = html.escape(status_message)
     safe_locale = html.escape(locale, quote=True)
+    home_path = build_web_path(base_path, "/")
+    request_code_path = build_web_path(base_path, "/request-code")
+    lang_ru_path = f"{home_path}?lang=ru"
+    lang_en_path = f"{home_path}?lang=en"
     status_class = {
         "success": "status success",
         "error": "status error",
@@ -253,15 +280,15 @@ def render_page(
 <body>
   <main>
     <div class="lang-switch">
-      <a href="/?lang=ru">{html.escape(web_text(locale, "lang_ru"))}</a>
-      <a href="/?lang=en">{html.escape(web_text(locale, "lang_en"))}</a>
+      <a href="{html.escape(lang_ru_path, quote=True)}">{html.escape(web_text(locale, "lang_ru"))}</a>
+      <a href="{html.escape(lang_en_path, quote=True)}">{html.escape(web_text(locale, "lang_en"))}</a>
     </div>
     <h1>{html.escape(web_text(locale, "title"))}</h1>
     <p>{html.escape(web_text(locale, "subtitle"))}</p>
     {status_block}
     <section class="card">
       <h2>{html.escape(web_text(locale, "request_heading"))}</h2>
-      <form action="/request-code" method="post">
+      <form action="{html.escape(request_code_path, quote=True)}" method="post">
         <input type="hidden" name="lang" value="{safe_locale}">
         <label for="email">{html.escape(web_text(locale, "request_label"))}</label>
         <input
@@ -283,6 +310,7 @@ def build_page_response(
     *,
     locale: str,
     web_user_id: str,
+    base_path: str,
     email_value: str = "",
     status_message: str = "",
     status_kind: str = "info",
@@ -291,6 +319,7 @@ def build_page_response(
     response = HTMLResponse(
         render_page(
             locale=locale,
+            base_path=base_path,
             email_value=email_value,
             status_message=status_message,
             status_kind=status_kind,
@@ -312,6 +341,33 @@ def get_or_create_web_user_id(request: Request) -> str:
     if raw_cookie:
         return raw_cookie
     return uuid4().hex
+
+
+def normalize_base_path(base_path: str | None) -> str:
+    if not base_path:
+        return ""
+
+    normalized = base_path.strip()
+    if not normalized or normalized == "/":
+        return ""
+    if not normalized.startswith("/"):
+        normalized = f"/{normalized}"
+    return normalized.rstrip("/")
+
+
+def build_web_path(base_path: str, route_path: str) -> str:
+    normalized_base_path = normalize_base_path(base_path)
+    if route_path == "/":
+        return f"{normalized_base_path}/" if normalized_base_path else "/"
+    return f"{normalized_base_path}{route_path}" if normalized_base_path else route_path
+
+
+def route_variants(route_path: str, base_path: str) -> list[str]:
+    paths = [route_path]
+    prefixed_path = build_web_path(base_path, route_path)
+    if prefixed_path not in paths:
+        paths.append(prefixed_path)
+    return paths
 
 
 def resolve_locale(raw_locale: str | None) -> str:
