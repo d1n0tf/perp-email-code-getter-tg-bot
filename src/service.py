@@ -1,13 +1,22 @@
 import asyncio
 import contextlib
+import json
+import traceback
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from time import monotonic
 from uuid import uuid4
 
 from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from src.config import Settings
 from src.email_manager import CodeResult, CodeWaitTimeout, EmailCodeFetcher
+from src.microsoft_device_flow import (
+    DeviceCodeResponse,
+    MicrosoftDeviceFlowClient,
+    MicrosoftDeviceFlowError,
+)
 from src.messages import DEFAULT_LOCALE
 from src.storage import EmailAccount, JsonStorage, normalize_email
 
@@ -21,11 +30,18 @@ class WebCodeRequest:
     code: str | None = None
 
 
+@dataclass(slots=True)
+class RefreshPromptState:
+    user_id: int
+    created_at: float
+
+
 class BotService:
     def __init__(self, settings: Settings, storage: JsonStorage) -> None:
         self.settings = settings
         self.storage = storage
         self.fetcher = EmailCodeFetcher(settings)
+        self.device_flow_client = MicrosoftDeviceFlowClient()
         self.executor = ThreadPoolExecutor(
             max_workers=settings.concurrent_mail_workers,
             thread_name_prefix="mail-worker",
@@ -34,6 +50,10 @@ class BotService:
         self._web_requests_lock = asyncio.Lock()
         self._web_requests: dict[str, WebCodeRequest] = {}
         self._active_web_requests: dict[tuple[str, str], str] = {}
+        self._refresh_lock = asyncio.Lock()
+        self._refresh_prompts: dict[int, RefreshPromptState] = {}
+        self._active_refresh_tasks: dict[int, asyncio.Task[None]] = {}
+        self._refresh_prompt_timeout_seconds = 15 * 60
 
     def is_admin(self, user_id: int) -> bool:
         if not self.settings.tg_admins:
@@ -50,6 +70,63 @@ class BotService:
         account = EmailAccount.from_add_string(raw_value)
         existed = await self.storage.upsert_account(account)
         return account, existed
+
+    async def begin_refresh_prompt(self, user_id: int) -> None:
+        async with self._refresh_lock:
+            self._refresh_prompts[user_id] = RefreshPromptState(
+                user_id=user_id,
+                created_at=monotonic(),
+            )
+
+    async def consume_refresh_prompt(self, user_id: int) -> bool:
+        async with self._refresh_lock:
+            prompt = self._refresh_prompts.get(user_id)
+            if prompt is None:
+                return False
+
+            if monotonic() - prompt.created_at > self._refresh_prompt_timeout_seconds:
+                self._refresh_prompts.pop(user_id, None)
+                return False
+
+            self._refresh_prompts.pop(user_id, None)
+            return True
+
+    async def start_refresh_token_request(
+        self,
+        *,
+        bot: Bot,
+        user_id: int,
+        chat_id: int,
+        client_id: str,
+    ) -> str:
+        normalized_client_id = client_id.strip().strip("\"'")
+        if not normalized_client_id:
+            raise ValueError("client_id is empty")
+
+        async with self._refresh_lock:
+            active_task = self._active_refresh_tasks.get(user_id)
+            if active_task is not None and not active_task.done():
+                return "running"
+
+            task = asyncio.create_task(
+                self._run_refresh_token_request(
+                    bot=bot,
+                    user_id=user_id,
+                    chat_id=chat_id,
+                    client_id=normalized_client_id,
+                )
+            )
+            self._active_refresh_tasks[user_id] = task
+
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(
+            lambda done_task, refresh_user_id=user_id: self._drop_refresh_task(
+                refresh_user_id,
+                done_task,
+            )
+        )
+        return "started"
 
     async def prepare_code_request(
         self,
@@ -203,6 +280,59 @@ class BotService:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self.executor.shutdown(wait=False, cancel_futures=True)
 
+    async def _run_refresh_token_request(
+        self,
+        *,
+        bot: Bot,
+        user_id: int,
+        chat_id: int,
+        client_id: str,
+    ) -> None:
+        locale = await self.get_locale(user_id)
+
+        try:
+            device_code = await self.device_flow_client.request_device_code(client_id)
+            await self._send_long_message(
+                bot,
+                chat_id,
+                self._format_device_code_intro_message(locale, device_code),
+                reply_markup=self._build_refresh_login_keyboard(
+                    locale,
+                    device_code,
+                    user_id,
+                ),
+            )
+            await self._send_long_message(
+                bot,
+                chat_id,
+                self._format_device_code_debug_message(device_code),
+            )
+
+            refresh_token_result = await self.device_flow_client.poll_for_refresh_token(
+                client_id,
+                device_code.device_code,
+                expires_in=device_code.expires_in,
+                interval=device_code.interval,
+            )
+            await self._send_long_message(
+                bot,
+                chat_id,
+                self._format_refresh_success_message(
+                    locale,
+                    client_id,
+                    refresh_token_result.refresh_token,
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            with contextlib.suppress(Exception):
+                await self._send_long_message(
+                    bot,
+                    chat_id,
+                    self._format_refresh_error_message(locale, client_id, exc),
+                )
+
     async def _deliver_code(
         self,
         *,
@@ -246,6 +376,168 @@ class BotService:
                         email=account.login_email,
                     ),
                 )
+
+    def _format_device_code_intro_message(
+        self,
+        locale: str,
+        device_code: DeviceCodeResponse,
+    ) -> str:
+        login_url = self._get_refresh_login_url(device_code)
+        lines = [
+            self._format_message(
+                locale,
+                "refresh_device_code_ready",
+                client_id=device_code.client_id,
+            ),
+            f"user_code: {device_code.user_code}",
+            f"verification_uri: {device_code.verification_uri}",
+            f"login_url: {login_url}",
+        ]
+        if device_code.verification_uri_complete:
+            lines.append(
+                f"verification_uri_complete: {device_code.verification_uri_complete}"
+            )
+        lines.extend(
+            [
+                f"expires_in: {device_code.expires_in}",
+                f"interval: {device_code.interval}",
+                "",
+                self._format_message(locale, "refresh_waiting_for_confirmation"),
+            ]
+        )
+        return "\n".join(lines)
+
+    def _format_device_code_debug_message(self, device_code: DeviceCodeResponse) -> str:
+        response_json = json.dumps(
+            device_code.raw,
+            ensure_ascii=False,
+            indent=2,
+        )
+        return "\n".join(
+            [
+                "Microsoft response:",
+                response_json,
+            ]
+        )
+
+    def _format_refresh_success_message(
+        self,
+        locale: str,
+        client_id: str,
+        refresh_token: str,
+    ) -> str:
+        return self._format_message(
+            locale,
+            "refresh_success",
+            client_id=client_id,
+            refresh_token=refresh_token,
+        )
+
+    def _format_refresh_error_message(
+        self,
+        locale: str,
+        client_id: str,
+        exc: Exception,
+    ) -> str:
+        lines = [
+            self._format_message(locale, "refresh_failed", client_id=client_id),
+            f"Exception: {exc.__class__.__name__}: {exc}",
+        ]
+
+        if isinstance(exc, MicrosoftDeviceFlowError):
+            lines.append(f"Step: {exc.step}")
+            if exc.status is not None:
+                lines.append(f"HTTP status: {exc.status}")
+            if exc.data:
+                lines.extend(
+                    [
+                        "",
+                        "Microsoft response JSON:",
+                        json.dumps(exc.data, ensure_ascii=False, indent=2),
+                    ]
+                )
+            elif exc.raw_text:
+                lines.extend(
+                    [
+                        "",
+                        "Microsoft response text:",
+                        exc.raw_text,
+                    ]
+                )
+
+        trace = "".join(traceback.format_exception(exc))
+        lines.extend(
+            [
+                "",
+                "Traceback:",
+                trace.rstrip(),
+            ]
+        )
+        return "\n".join(lines)
+
+    async def _send_long_message(
+        self,
+        bot: Bot,
+        chat_id: int,
+        text: str,
+        reply_markup: InlineKeyboardMarkup | None = None,
+    ) -> None:
+        chunks = self._chunk_message(text)
+        for index, chunk in enumerate(chunks):
+            await bot.send_message(
+                chat_id,
+                chunk,
+                reply_markup=reply_markup if index == 0 else None,
+            )
+
+    def _chunk_message(self, text: str, limit: int = 3900) -> list[str]:
+        if len(text) <= limit:
+            return [text]
+
+        chunks: list[str] = []
+        remaining = text
+        while len(remaining) > limit:
+            split_at = remaining.rfind("\n", 0, limit)
+            if split_at <= 0:
+                split_at = limit
+            chunks.append(remaining[:split_at].rstrip())
+            remaining = remaining[split_at:].lstrip("\n")
+
+        if remaining:
+            chunks.append(remaining)
+        return chunks
+
+    def _drop_refresh_task(self, user_id: int, task: asyncio.Task[None]) -> None:
+        current_task = self._active_refresh_tasks.get(user_id)
+        if current_task is task:
+            self._active_refresh_tasks.pop(user_id, None)
+
+    def _build_refresh_login_keyboard(
+        self,
+        locale: str,
+        device_code: DeviceCodeResponse,
+        user_id: int,
+    ) -> InlineKeyboardMarkup:
+        login_url = self._get_refresh_login_url(device_code)
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(
+                        text=self._format_message(locale, "refresh_open_login_button"),
+                        url=login_url,
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text=self._format_message(locale, "refresh_logged_in_button"),
+                        callback_data=f"refresh_ack:{user_id}",
+                    )
+                ],
+            ]
+        )
+
+    def _get_refresh_login_url(self, device_code: DeviceCodeResponse) -> str:
+        return device_code.verification_uri_complete or device_code.verification_uri
 
     def _format_message(self, locale: str, key: str, **kwargs: str) -> str:
         from src.messages import translate
