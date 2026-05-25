@@ -67,6 +67,7 @@ class BotService:
         self._web_requests_lock = asyncio.Lock()
         self._web_requests: dict[str, WebCodeRequest] = {}
         self._active_web_requests: dict[tuple[str, str], str] = {}
+        self._active_web_request_tasks: dict[str, asyncio.Task[None]] = {}
         self._refresh_lock = asyncio.Lock()
         self._refresh_prompts: dict[int, RefreshPromptState] = {}
         self._active_refresh_tasks: dict[int, asyncio.Task[None]] = {}
@@ -140,11 +141,10 @@ class BotService:
     async def get_user_activation(self, user_id: int) -> UserKeyActivation | None:
         return await self.storage.get_user_activation(f"tg:{user_id}")
 
-    async def get_activated_subscription(
+    async def get_requester_activated_subscription(
         self,
-        user_id: int,
+        requester_id: str,
     ) -> ActivatedSubscription | None:
-        requester_id = f"tg:{user_id}"
         activation = await self.storage.get_user_activation(requester_id)
         if activation is None:
             return None
@@ -160,9 +160,53 @@ class BotService:
             account=account,
         )
 
+    async def get_activated_subscription(
+        self,
+        user_id: int,
+    ) -> ActivatedSubscription | None:
+        return await self.get_requester_activated_subscription(f"tg:{user_id}")
+
+    async def clear_requester_subscription_activation(self, requester_id: str) -> bool:
+        await self.cancel_web_code_requests(requester_id)
+        return await self.storage.clear_user_activation(requester_id)
+
     async def clear_subscription_activation(self, user_id: int) -> bool:
         await self.cancel_subscription_code_request(user_id)
-        return await self.storage.clear_user_activation(f"tg:{user_id}")
+        return await self.clear_requester_subscription_activation(f"tg:{user_id}")
+
+    async def cancel_web_code_requests(self, requester_id: str) -> bool:
+        request_ids_to_cancel: list[str] = []
+        tasks_to_cancel: list[asyncio.Task[None]] = []
+
+        async with self._web_requests_lock:
+            request_ids_to_cancel = [
+                request_id
+                for request_id, request in self._web_requests.items()
+                if request.requester_id == requester_id and request.status == "pending"
+            ]
+            if not request_ids_to_cancel:
+                return False
+
+            for request_id in request_ids_to_cancel:
+                self._web_requests.pop(request_id, None)
+                active_task = self._active_web_request_tasks.pop(request_id, None)
+                if active_task is not None and not active_task.done():
+                    active_task.cancel()
+                    tasks_to_cancel.append(active_task)
+
+            stale_request_keys = [
+                request_key
+                for request_key, active_request_id in self._active_web_requests.items()
+                if active_request_id in request_ids_to_cancel
+            ]
+            for request_key in stale_request_keys:
+                self._active_web_requests.pop(request_key, None)
+
+        for active_task in tasks_to_cancel:
+            with contextlib.suppress(asyncio.CancelledError):
+                await active_task
+
+        return True
 
     async def cancel_subscription_code_request(self, user_id: int) -> bool:
         requester_id = f"tg:{user_id}"
@@ -192,6 +236,25 @@ class BotService:
         full_name: str | None,
         code: str,
     ) -> tuple[str, ActivatedSubscription | SubscriptionKey | None]:
+        return await self.activate_requester_subscription_code(
+            requester_id=f"tg:{user_id}",
+            user_id=user_id,
+            chat_id=chat_id,
+            username=username,
+            full_name=full_name,
+            code=code,
+        )
+
+    async def activate_requester_subscription_code(
+        self,
+        *,
+        requester_id: str,
+        user_id: int,
+        chat_id: int,
+        username: str | None,
+        full_name: str | None,
+        code: str,
+    ) -> tuple[str, ActivatedSubscription | SubscriptionKey | None]:
         normalized_code = normalize_key_code(code)
         key = await self.storage.get_subscription_key(normalized_code)
         if key is None:
@@ -206,7 +269,7 @@ class BotService:
         # Activating a key never consumes it globally. We only remember which
         # reusable key this requester chose for later "request code" actions.
         activation = await self.storage.activate_subscription_key(
-            requester_id=f"tg:{user_id}",
+            requester_id=requester_id,
             user_id=user_id,
             chat_id=chat_id,
             username=username,
@@ -263,6 +326,48 @@ class BotService:
             )
         )
         return "started"
+
+    async def start_web_subscription_code_request(
+        self,
+        *,
+        requester_id: str,
+    ) -> tuple[str, str | SubscriptionKey | None]:
+        subscription = await self.get_requester_activated_subscription(requester_id)
+        if subscription is None:
+            return "inactive", None
+        if subscription.key.is_expired():
+            await self.clear_requester_subscription_activation(requester_id)
+            return "expired", subscription.key
+        if subscription.account is None:
+            return "email_missing", subscription.key
+
+        request_key = (requester_id, subscription.key.email_address)
+
+        async with self._web_requests_lock:
+            existing_request_id = self._active_web_requests.get(request_key)
+            if existing_request_id is not None:
+                existing_request = self._web_requests.get(existing_request_id)
+                if existing_request is not None and existing_request.status == "pending":
+                    return "started", existing_request_id
+
+            request_id = uuid4().hex
+            self._web_requests[request_id] = WebCodeRequest(
+                request_id=request_id,
+                requester_id=requester_id,
+                email_address=subscription.key.email_address,
+                status="pending",
+            )
+            self._active_web_requests[request_key] = request_id
+
+        task = asyncio.create_task(
+            self._complete_web_code_request(
+                request_id=request_id,
+                request_key=request_key,
+                account=subscription.account,
+            )
+        )
+        self._register_web_request_task(request_id, task)
+        return "started", request_id
 
     async def begin_refresh_prompt(self, user_id: int) -> None:
         async with self._refresh_lock:
@@ -408,8 +513,7 @@ class BotService:
                 account=account,
             )
         )
-        self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+        self._register_web_request_task(request_id, task)
         return "started", request_id
 
     async def get_web_code_request(
@@ -727,6 +831,30 @@ class BotService:
         current_task = self._active_subscription_code_tasks.get(requester_id)
         if current_task is task:
             self._active_subscription_code_tasks.pop(requester_id, None)
+
+    def _register_web_request_task(
+        self,
+        request_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        self._active_web_request_tasks[request_id] = task
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(
+            lambda done_task, active_request_id=request_id: self._drop_web_request_task(
+                active_request_id,
+                done_task,
+            )
+        )
+
+    def _drop_web_request_task(
+        self,
+        request_id: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        current_task = self._active_web_request_tasks.get(request_id)
+        if current_task is task:
+            self._active_web_request_tasks.pop(request_id, None)
 
     def _build_refresh_login_keyboard(
         self,

@@ -1,5 +1,4 @@
 import html
-import re
 from urllib.parse import parse_qs, urlencode
 from uuid import uuid4
 
@@ -8,39 +7,64 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from src.config import settings
 from src.messages import DEFAULT_LOCALE, SUPPORTED_LOCALES, translate
-from src.service import BotService
-from src.storage import normalize_email
+from src.service import ActivatedSubscription, BotService
+from src.storage import SubscriptionKey, normalize_key_code
 
 
-EMAIL_REGEX = re.compile(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", re.IGNORECASE)
 WEB_USER_COOKIE_NAME = "perp_web_user_id"
 
 WEB_TEXTS = {
     "ru": {
-        "title": "Perp Mail Bot",
-        "subtitle": "",
-        "request_heading": "Получить код",
-        "request_label": "Email",
-        "request_placeholder": "example@outlook.com",
-        "request_button": "Запросить код",
+        "title": "Perplexity Access",
+        "subtitle": "Активируйте код от продавца и запрашивайте коды для входа.",
+        "activation_heading": "Активировать код",
+        "activation_label": "Код от продавца",
+        "activation_placeholder": "XHASHDAUSHFAFS",
+        "activation_button": "Активировать код",
+        "activation_success": "Код успешно активирован.",
+        "code_required": "Введите код от продавца.",
+        "subscription_heading": "Подписка активна",
+        "subscription_details_web": (
+            "1️⃣ Почта для входа: {email}\n"
+            "2️⃣ Срок подписки: {duration_days} дней\n"
+            "3️⃣ Конец подписки: {end_date}\n"
+            "4️⃣ Активированный код: {code}"
+        ),
+        "subscription_hint": (
+            "Нажмите кнопку «Запросить код», чтобы получить код для входа в Perplexity."
+        ),
+        "change_success": "Текущий аккаунт отвязан. Введите новый код от продавца.",
         "waiting_title": "Ожидание кода",
-        "waiting_text": "Жду код для {email}. Страница будет ждать сколько угодно.",
+        "waiting_text": "Жду код для входа для {email}. Страница будет ждать сколько угодно.",
         "polling_error": "Нет связи с сервером. Продолжаю пытаться...",
-        "code_found_web": "Код для {email}: {code}",
+        "code_found_web": "Код для `{email}`: `{code}`",
+        "request_missing": "Запрос кода не найден или уже недоступен.",
         "lang_ru": "Русский",
         "lang_en": "English",
     },
     "en": {
-        "title": "Perp Mail Bot",
-        "subtitle": "",
-        "request_heading": "Get code",
-        "request_label": "Email",
-        "request_placeholder": "example@outlook.com",
-        "request_button": "Request code",
+        "title": "Perplexity Access",
+        "subtitle": "Activate the seller code and request login codes when you need them.",
+        "activation_heading": "Activate code",
+        "activation_label": "Seller code",
+        "activation_placeholder": "XHASHDAUSHFAFS",
+        "activation_button": "Activate code",
+        "activation_success": "The code has been activated successfully.",
+        "code_required": "Enter the seller code.",
+        "subscription_heading": "Subscription active",
+        "subscription_details_web": (
+            "1️⃣ Login email: {email}\n"
+            "2️⃣ Subscription term: {duration_days} days\n"
+            "3️⃣ Subscription ends: {end_date}\n"
+            "4️⃣ Activated code: {code}"
+        ),
+        "subscription_hint": "Tap “Request code” to get a Perplexity login code.",
+        "change_success": "The current account has been unlinked. Enter a new seller code.",
         "waiting_title": "Waiting for code",
-        "waiting_text": "Waiting for a code for {email}. This page will keep waiting as long as needed.",
+        "waiting_text": "Waiting for a login code for {email}. This page will keep waiting as long as needed.",
         "polling_error": "Connection issue. Retrying...",
-        "code_found_web": "Code for {email}: {code}",
+        "code_found_web": "Code for `{email}`: `{code}`",
+        "request_missing": "The code request was not found or is no longer available.",
         "lang_ru": "Русский",
         "lang_en": "English",
     },
@@ -55,38 +79,68 @@ def create_web_app(service: BotService) -> FastAPI:
     async def index(request: Request) -> HTMLResponse:
         locale = resolve_locale(request.query_params.get("lang"))
         web_user_id = get_or_create_web_user_id(request)
+        requester_id = build_web_requester_id(web_user_id)
+
+        subscription = await service.get_requester_activated_subscription(requester_id)
+        status_message = ""
+        status_kind = "info"
+        if subscription is not None:
+            if subscription.key.is_expired():
+                await service.clear_requester_subscription_activation(requester_id)
+                status_message = translate(
+                    locale,
+                    "key_expired",
+                    code=subscription.key.code,
+                    end_date=service.format_date(subscription.key.expires_at),
+                )
+                status_kind = "error"
+                subscription = None
+            elif subscription.account is None:
+                status_message = translate(
+                    locale,
+                    "key_email_missing",
+                    code=subscription.key.code,
+                )
+                status_kind = "error"
+                subscription = None
+
         return build_page_response(
             locale=locale,
             web_user_id=web_user_id,
             base_path=base_path,
+            service=service,
+            subscription=subscription,
+            status_message=status_message,
+            status_kind=status_kind,
         )
 
-    async def request_code(request: Request):
+    async def activate_code(request: Request) -> HTMLResponse:
         payload = await read_form_body(request)
         locale = resolve_locale(payload.get("lang"))
-        email_address = normalize_email(payload.get("email", ""))
+        code = payload.get("code", "").strip()
         web_user_id = get_or_create_web_user_id(request)
+        requester_id = build_web_requester_id(web_user_id)
 
-        if not EMAIL_REGEX.fullmatch(email_address):
+        if not code:
             return build_page_response(
                 locale=locale,
                 web_user_id=web_user_id,
                 base_path=base_path,
-                email_value=email_address,
-                status_message=translate(locale, "email_invalid"),
+                service=service,
+                code_value=code,
+                status_message=web_text(locale, "code_required"),
                 status_kind="error",
                 status_code=400,
             )
 
         client_host = request.client.host if request.client is not None else "web"
-        status, request_id = await service.start_web_code_request(
-            requester_id=f"web:{web_user_id}",
-            requester_kind="web",
-            user_id=None,
-            chat_id=None,
+        status, result = await service.activate_requester_subscription_code(
+            requester_id=requester_id,
+            user_id=0,
+            chat_id=0,
             username="web",
             full_name=f"web:{client_host}",
-            email_address=email_address,
+            code=code,
         )
 
         if status == "missing":
@@ -94,28 +148,118 @@ def create_web_app(service: BotService) -> FastAPI:
                 locale=locale,
                 web_user_id=web_user_id,
                 base_path=base_path,
-                email_value=email_address,
-                status_message=translate(locale, "email_missing"),
+                service=service,
+                code_value=code,
+                status_message=translate(
+                    locale,
+                    "key_invalid",
+                    code=normalize_key_code(code),
+                ),
                 status_kind="error",
                 status_code=404,
             )
-        if status == "taken":
+
+        if status == "expired" and isinstance(result, SubscriptionKey):
             return build_page_response(
                 locale=locale,
                 web_user_id=web_user_id,
                 base_path=base_path,
-                email_value=email_address,
-                status_message=translate(locale, "email_taken"),
+                service=service,
+                code_value=code,
+                status_message=translate(
+                    locale,
+                    "key_expired",
+                    code=result.code,
+                    end_date=service.format_date(result.expires_at),
+                ),
                 status_kind="error",
-                status_code=409,
+                status_code=410,
             )
+
+        if status == "email_missing" and isinstance(result, SubscriptionKey):
+            return build_page_response(
+                locale=locale,
+                web_user_id=web_user_id,
+                base_path=base_path,
+                service=service,
+                code_value=code,
+                status_message=translate(
+                    locale,
+                    "key_email_missing",
+                    code=result.code,
+                ),
+                status_kind="error",
+                status_code=404,
+            )
+
+        subscription = result if isinstance(result, ActivatedSubscription) else None
+        return build_page_response(
+            locale=locale,
+            web_user_id=web_user_id,
+            base_path=base_path,
+            service=service,
+            subscription=subscription,
+            status_message=web_text(locale, "activation_success"),
+            status_kind="success",
+        )
+
+    async def request_code(request: Request):
+        payload = await read_form_body(request)
+        locale = resolve_locale(payload.get("lang"))
+        web_user_id = get_or_create_web_user_id(request)
+        requester_id = build_web_requester_id(web_user_id)
+
+        status, result = await service.start_web_subscription_code_request(
+            requester_id=requester_id,
+        )
+        if status == "inactive":
+            return build_page_response(
+                locale=locale,
+                web_user_id=web_user_id,
+                base_path=base_path,
+                service=service,
+                status_message=translate(locale, "subscription_inactive"),
+                status_kind="error",
+                status_code=400,
+            )
+        if status == "expired" and isinstance(result, SubscriptionKey):
+            return build_page_response(
+                locale=locale,
+                web_user_id=web_user_id,
+                base_path=base_path,
+                service=service,
+                status_message=translate(
+                    locale,
+                    "key_expired",
+                    code=result.code,
+                    end_date=service.format_date(result.expires_at),
+                ),
+                status_kind="error",
+                status_code=410,
+            )
+        if status == "email_missing" and isinstance(result, SubscriptionKey):
+            return build_page_response(
+                locale=locale,
+                web_user_id=web_user_id,
+                base_path=base_path,
+                service=service,
+                status_message=translate(
+                    locale,
+                    "key_email_missing",
+                    code=result.code,
+                ),
+                status_kind="error",
+                status_code=404,
+            )
+
+        request_id = result if isinstance(result, str) else None
         if request_id is None:
             return build_page_response(
                 locale=locale,
                 web_user_id=web_user_id,
                 base_path=base_path,
-                email_value=email_address,
-                status_message=translate(locale, "code_failed", email=email_address),
+                service=service,
+                status_message=translate(locale, "code_failed", email=""),
                 status_kind="error",
                 status_code=500,
             )
@@ -137,11 +281,27 @@ def create_web_app(service: BotService) -> FastAPI:
         )
         return response
 
+    async def change_account(request: Request) -> HTMLResponse:
+        payload = await read_form_body(request)
+        locale = resolve_locale(payload.get("lang"))
+        web_user_id = get_or_create_web_user_id(request)
+        requester_id = build_web_requester_id(web_user_id)
+        await service.clear_requester_subscription_activation(requester_id)
+
+        return build_page_response(
+            locale=locale,
+            web_user_id=web_user_id,
+            base_path=base_path,
+            service=service,
+            status_message=web_text(locale, "change_success"),
+            status_kind="success",
+        )
+
     async def wait_page(request: Request) -> HTMLResponse:
         locale = resolve_locale(request.query_params.get("lang"))
         request_id = request.query_params.get("request_id", "").strip()
         web_user_id = get_or_create_web_user_id(request)
-        requester_id = f"web:{web_user_id}"
+        requester_id = build_web_requester_id(web_user_id)
         request_state = await service.get_web_code_request(
             request_id=request_id,
             requester_id=requester_id,
@@ -151,7 +311,8 @@ def create_web_app(service: BotService) -> FastAPI:
                 locale=locale,
                 web_user_id=web_user_id,
                 base_path=base_path,
-                status_message=translate(locale, "code_failed", email=""),
+                service=service,
+                status_message=web_text(locale, "request_missing"),
                 status_kind="error",
                 status_code=404,
             )
@@ -168,7 +329,7 @@ def create_web_app(service: BotService) -> FastAPI:
         locale = resolve_locale(request.query_params.get("lang"))
         request_id = request.query_params.get("request_id", "").strip()
         web_user_id = get_or_create_web_user_id(request)
-        requester_id = f"web:{web_user_id}"
+        requester_id = build_web_requester_id(web_user_id)
         request_state = await service.get_web_code_request(
             request_id=request_id,
             requester_id=requester_id,
@@ -177,7 +338,7 @@ def create_web_app(service: BotService) -> FastAPI:
             response = JSONResponse(
                 {
                     "status": "missing",
-                    "message": translate(locale, "code_failed", email=""),
+                    "message": web_text(locale, "request_missing"),
                 },
                 status_code=404,
             )
@@ -241,10 +402,26 @@ def create_web_app(service: BotService) -> FastAPI:
             response_class=HTMLResponse,
             response_model=None,
         )
+    for route_path in route_variants("/activate-code", base_path):
+        app.add_api_route(
+            route_path,
+            activate_code,
+            methods=["POST"],
+            response_class=HTMLResponse,
+            response_model=None,
+        )
     for route_path in route_variants("/request-code", base_path):
         app.add_api_route(
             route_path,
             request_code,
+            methods=["POST"],
+            response_class=HTMLResponse,
+            response_model=None,
+        )
+    for route_path in route_variants("/change-account", base_path):
+        app.add_api_route(
+            route_path,
+            change_account,
             methods=["POST"],
             response_class=HTMLResponse,
             response_model=None,
@@ -279,17 +456,21 @@ def render_page(
     *,
     locale: str,
     base_path: str,
-    email_value: str = "",
+    code_value: str = "",
     status_message: str = "",
     status_kind: str = "info",
+    subscription: ActivatedSubscription | None = None,
+    service: BotService,
 ) -> str:
     locale = resolve_locale(locale)
     base_path = normalize_base_path(base_path)
-    safe_email_value = html.escape(email_value, quote=True)
+    safe_code_value = html.escape(code_value, quote=True)
     safe_status_message = html.escape(status_message)
     safe_locale = html.escape(locale, quote=True)
     home_path = build_web_path(base_path, "/")
+    activate_code_path = build_web_path(base_path, "/activate-code")
     request_code_path = build_web_path(base_path, "/request-code")
+    change_account_path = build_web_path(base_path, "/change-account")
     lang_ru_path = f"{home_path}?lang=ru"
     lang_en_path = f"{home_path}?lang=en"
     status_class = {
@@ -300,6 +481,44 @@ def render_page(
     status_block = ""
     if safe_status_message:
         status_block = f'<div class="{status_class}">{safe_status_message}</div>'
+
+    if subscription is None:
+        content_block = f"""
+    <section class="card">
+      <h2>{html.escape(web_text(locale, "activation_heading"))}</h2>
+      <form action="{html.escape(activate_code_path, quote=True)}" method="post">
+        <input type="hidden" name="lang" value="{safe_locale}">
+        <label for="code">{html.escape(web_text(locale, "activation_label"))}</label>
+        <input
+          id="code"
+          name="code"
+          type="text"
+          value="{safe_code_value}"
+          placeholder="{html.escape(web_text(locale, "activation_placeholder"), quote=True)}"
+          autocomplete="off"
+          autocapitalize="characters"
+          spellcheck="false"
+        >
+        <button type="submit">{html.escape(web_text(locale, "activation_button"))}</button>
+      </form>
+    </section>"""
+    else:
+        content_block = f"""
+    <section class="card">
+      <h2>{html.escape(web_text(locale, "subscription_heading"))}</h2>
+      <div class="details">{render_subscription_details_html(locale, subscription, service)}</div>
+      <p class="hint">{html.escape(web_text(locale, "subscription_hint"))}</p>
+      <div class="actions">
+        <form action="{html.escape(request_code_path, quote=True)}" method="post">
+          <input type="hidden" name="lang" value="{safe_locale}">
+          <button type="submit">{html.escape(translate(locale, "subscription_request_button"))}</button>
+        </form>
+        <form action="{html.escape(change_account_path, quote=True)}" method="post">
+          <input type="hidden" name="lang" value="{safe_locale}">
+          <button type="submit" class="secondary">{html.escape(translate(locale, "subscription_change_button"))}</button>
+        </form>
+      </div>
+    </section>"""
 
     return f"""<!DOCTYPE html>
 <html lang="{safe_locale}">
@@ -319,7 +538,9 @@ def render_page(
     }}
     body {{
       margin: 0;
-      background: #f6f7fb;
+      background:
+        radial-gradient(circle at top, rgba(15, 118, 110, 0.12), transparent 38%),
+        #f6f7fb;
     }}
     main {{
       max-width: 760px;
@@ -332,6 +553,7 @@ def render_page(
       border-radius: 12px;
       padding: 20px;
       margin-bottom: 16px;
+      box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
     }}
     h1, h2 {{
       margin-top: 0;
@@ -357,6 +579,7 @@ def render_page(
       border: 1px solid #bfc7d4;
       border-radius: 8px;
       margin-bottom: 12px;
+      text-transform: uppercase;
     }}
     button {{
       padding: 12px 16px;
@@ -367,17 +590,38 @@ def render_page(
       cursor: pointer;
       font-weight: 700;
     }}
+    button.secondary {{
+      background: #1f2937;
+    }}
+    .actions {{
+      display: flex;
+      gap: 12px;
+      flex-wrap: wrap;
+    }}
+    .actions form {{
+      margin: 0;
+    }}
     .status {{
       margin-bottom: 16px;
       padding: 12px 14px;
       border-radius: 10px;
       background: #eef2ff;
+      white-space: pre-wrap;
     }}
     .status.success {{
       background: #dcfce7;
     }}
     .status.error {{
       background: #fee2e2;
+    }}
+    .details {{
+      white-space: pre-wrap;
+      line-height: 1.6;
+      margin-bottom: 12px;
+    }}
+    .hint {{
+      margin: 0 0 16px;
+      color: #334155;
     }}
   </style>
 </head>
@@ -387,24 +631,12 @@ def render_page(
       <a href="{html.escape(lang_ru_path, quote=True)}">{html.escape(web_text(locale, "lang_ru"))}</a>
       <a href="{html.escape(lang_en_path, quote=True)}">{html.escape(web_text(locale, "lang_en"))}</a>
     </div>
-    <h1>{html.escape(web_text(locale, "title"))}</h1>
-    <p>{html.escape(web_text(locale, "subtitle"))}</p>
-    {status_block}
     <section class="card">
-      <h2>{html.escape(web_text(locale, "request_heading"))}</h2>
-      <form action="{html.escape(request_code_path, quote=True)}" method="post">
-        <input type="hidden" name="lang" value="{safe_locale}">
-        <label for="email">{html.escape(web_text(locale, "request_label"))}</label>
-        <input
-          id="email"
-          name="email"
-          type="text"
-          value="{safe_email_value}"
-          placeholder="{html.escape(web_text(locale, "request_placeholder"), quote=True)}"
-        >
-        <button type="submit">{html.escape(web_text(locale, "request_button"))}</button>
-      </form>
+      <h1>{html.escape(web_text(locale, "title"))}</h1>
+      <p>{html.escape(web_text(locale, "subtitle"))}</p>
     </section>
+    {status_block}
+    {content_block}
   </main>
 </body>
 </html>"""
@@ -415,18 +647,22 @@ def build_page_response(
     locale: str,
     web_user_id: str,
     base_path: str,
-    email_value: str = "",
+    service: BotService,
+    code_value: str = "",
     status_message: str = "",
     status_kind: str = "info",
     status_code: int = 200,
+    subscription: ActivatedSubscription | None = None,
 ) -> HTMLResponse:
     response = HTMLResponse(
         render_page(
             locale=locale,
             base_path=base_path,
-            email_value=email_value,
+            code_value=code_value,
             status_message=status_message,
             status_kind=status_kind,
+            subscription=subscription,
+            service=service,
         ),
         status_code=status_code,
     )
@@ -471,6 +707,10 @@ def get_or_create_web_user_id(request: Request) -> str:
     if raw_cookie:
         return raw_cookie
     return uuid4().hex
+
+
+def build_web_requester_id(web_user_id: str) -> str:
+    return f"web:{web_user_id}"
 
 
 def normalize_base_path(base_path: str | None) -> str:
@@ -520,6 +760,22 @@ def web_text(locale: str, key: str, **kwargs: str) -> str:
     return template.format(**kwargs)
 
 
+def render_subscription_details_html(
+    locale: str,
+    subscription: ActivatedSubscription,
+    service: BotService,
+) -> str:
+    details = web_text(
+        locale,
+        "subscription_details_web",
+        email=subscription.key.email_address,
+        duration_days=str(subscription.key.duration_days),
+        end_date=service.format_date(subscription.key.expires_at),
+        code=subscription.key.code,
+    )
+    return html.escape(details).replace("\n", "<br>")
+
+
 def render_wait_page(
     *,
     locale: str,
@@ -558,7 +814,9 @@ def render_wait_page(
     }}
     body {{
       margin: 0;
-      background: #f6f7fb;
+      background:
+        radial-gradient(circle at top, rgba(15, 118, 110, 0.12), transparent 38%),
+        #f6f7fb;
     }}
     main {{
       max-width: 760px;
@@ -571,11 +829,13 @@ def render_wait_page(
       border-radius: 12px;
       padding: 20px;
       margin-bottom: 16px;
+      box-shadow: 0 10px 30px rgba(15, 23, 42, 0.06);
     }}
     .status {{
       padding: 12px 14px;
       border-radius: 10px;
       background: #eef2ff;
+      white-space: pre-wrap;
     }}
     .status.success {{
       background: #dcfce7;
