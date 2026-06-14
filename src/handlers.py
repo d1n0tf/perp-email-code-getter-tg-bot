@@ -16,6 +16,7 @@ from src.storage import SubscriptionKey, normalize_key_code
 
 
 EMAIL_REGEX = re.compile(r"^[A-Z0-9._%+\-]+@[A-Z0-9.\-]+\.[A-Z]{2,}$", re.IGNORECASE)
+KEYLIST_PAGE_SIZE = 15
 
 
 def build_router(service: BotService) -> Router:
@@ -238,6 +239,58 @@ def build_router(service: BotService) -> Router:
         await callback.message.answer(translate(locale, "subscription_request_started"))
         await callback.answer()
 
+    @router.callback_query(F.data.startswith("keylist:"))
+    async def keylist_page_callback_handler(callback: CallbackQuery) -> None:
+        if callback.from_user is None or callback.data is None or callback.message is None:
+            await callback.answer()
+            return
+
+        locale = await service.get_locale(callback.from_user.id)
+        parts = callback.data.split(":", 2)
+        if len(parts) != 3:
+            await callback.answer()
+            return
+
+        _, owner_id_raw, page_raw = parts
+        if not owner_id_raw.isdigit():
+            await callback.answer()
+            return
+
+        try:
+            requested_page = int(page_raw)
+        except ValueError:
+            await callback.answer()
+            return
+
+        if callback.from_user.id != int(owner_id_raw):
+            await callback.answer(
+                translate(locale, "keylist_access_denied"),
+                show_alert=True,
+            )
+            return
+
+        if not service.is_admin(callback.from_user.id):
+            await callback.answer(translate(locale, "admin_only"), show_alert=True)
+            return
+
+        keys = await service.list_subscription_keys()
+        if not keys:
+            with suppress(Exception):
+                await callback.message.edit_text(translate(locale, "keylist_empty"), reply_markup=None)  # type: ignore[arg-type]
+            await callback.answer()
+            return
+
+        text, reply_markup = render_keylist_page(
+            locale,
+            callback.from_user.id,
+            keys,
+            requested_page,
+            service,
+        )
+        with suppress(Exception):
+            await callback.message.edit_text(text, reply_markup=reply_markup)  # type: ignore[arg-type]
+        await callback.answer()
+
     @router.message(Command("help"))
     async def help_handler(message: Message) -> None:
         if message.from_user is None:
@@ -363,15 +416,14 @@ def build_router(service: BotService) -> Router:
             await message.answer(translate(locale, "keylist_empty"))
             return
 
-        rows = [
-            f"{'+' if not key.is_expired() else '-'} {key.code} {key.email_address}"
-            for key in keys
-        ]
-        await send_chunks(
-            message,
+        text, reply_markup = render_keylist_page(
+            locale,
+            message.from_user.id,
+            keys,
+            0,
             service,
-            translate(locale, "keylist_header", rows="\n".join(rows)),
         )
+        await message.answer(text, reply_markup=reply_markup)
 
     @router.message(Command("refresh"))
     async def refresh_handler(message: Message, command: CommandObject) -> None:
@@ -616,6 +668,79 @@ def render_subscription_details(
         end_date=service.format_date(subscription.key.expires_at),
         code=subscription.key.code,
     )
+
+
+def render_keylist_page(
+    locale: str,
+    user_id: int,
+    keys: list[SubscriptionKey],
+    page: int,
+    service: BotService,
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    current_page, total_pages = normalize_keylist_page(page, len(keys))
+    start_index = current_page * KEYLIST_PAGE_SIZE
+    page_keys = keys[start_index : start_index + KEYLIST_PAGE_SIZE]
+    rows = "\n".join(format_keylist_row(service, key) for key in page_keys)
+    text = translate(
+        locale,
+        "keylist_page_header",
+        total_count=str(len(keys)),
+        rows=rows,
+    )
+    return text, keylist_pagination_keyboard(locale, user_id, current_page, total_pages)
+
+
+def format_keylist_row(service: BotService, key: SubscriptionKey) -> str:
+    return (
+        f"{key.code} | {key.email_address} | "
+        f"{service.format_date(key.created_at)} - {service.format_date(key.expires_at)}"
+    )
+
+
+def keylist_pagination_keyboard(
+    locale: str,
+    user_id: int,
+    page: int,
+    total_pages: int,
+) -> InlineKeyboardMarkup | None:
+    if total_pages <= 1:
+        return None
+
+    buttons: list[InlineKeyboardButton] = []
+    if page > 0:
+        buttons.append(
+            InlineKeyboardButton(
+                text=translate(locale, "keylist_prev_button"),
+                callback_data=f"keylist:{user_id}:{page - 1}",
+            )
+        )
+
+    buttons.append(
+        InlineKeyboardButton(
+            text=translate(
+                locale,
+                "keylist_page_button",
+                page=str(page + 1),
+                total_pages=str(total_pages),
+            ),
+            callback_data=f"keylist:{user_id}:{page}",
+        )
+    )
+
+    if page + 1 < total_pages:
+        buttons.append(
+            InlineKeyboardButton(
+                text=translate(locale, "keylist_next_button"),
+                callback_data=f"keylist:{user_id}:{page + 1}",
+            )
+        )
+    return InlineKeyboardMarkup(inline_keyboard=[buttons])
+
+
+def normalize_keylist_page(page: int, total_items: int) -> tuple[int, int]:
+    total_pages = max(1, (total_items + KEYLIST_PAGE_SIZE - 1) // KEYLIST_PAGE_SIZE)
+    current_page = min(max(page, 0), total_pages - 1)
+    return current_page, total_pages
 
 
 async def send_chunks(message: Message, service: BotService, text: str) -> None:

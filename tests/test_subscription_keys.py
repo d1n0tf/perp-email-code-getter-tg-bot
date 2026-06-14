@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from aiogram.filters import CommandObject
 from aiogram.types import InlineKeyboardMarkup
 
-from src.handlers import build_router
+from src.handlers import KEYLIST_PAGE_SIZE, build_router
 from src.messages import translate
 from src.config import Settings
 from src.service import BotService
@@ -455,6 +455,111 @@ class SubscriptionRequestCancellationTests(unittest.IsolatedAsyncioTestCase):
                 await service.shutdown()
 
 
+class KeylistPaginationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.base_path = Path(self.temp_dir.name)
+        self.storage = JsonStorage(
+            email_store_path=self.base_path / "email.json",
+            taken_email_store_path=self.base_path / "email_taken.json",
+            subscription_key_store_path=self.base_path / "keys.json",
+            activated_key_store_path=self.base_path / "activated_keys.json",
+            legacy_user_store_path=self.base_path / "legacy_users.json",
+            user_locale_store_path=self.base_path / "user_locales.json",
+        )
+        self.service = BotService(
+            settings=Settings(
+                tg_admins=[1],
+                email_store_path=self.base_path / "email.json",
+                taken_email_store_path=self.base_path / "email_taken.json",
+                subscription_key_store_path=self.base_path / "keys.json",
+                activated_key_store_path=self.base_path / "activated_keys.json",
+                legacy_user_store_path=self.base_path / "legacy_users.json",
+                user_locale_store_path=self.base_path / "user_locales.json",
+                concurrent_mail_workers=1,
+            ),
+            storage=self.storage,
+        )
+        await self.service.set_locale(1, "ru")
+        await self.storage.upsert_account(
+            EmailAccount(
+                login_email="shared@example.com",
+                login_password="pass",
+                recovery_email="recovery@example.com",
+                recovery_password="recovery-pass",
+                refresh_token="refresh-token",
+                client_id="client-id",
+                raw="shared@example.com:pass:recovery@example.com:recovery-pass:refresh-token:client-id",
+            )
+        )
+        status, keys = await self.service.add_subscription_keys(
+            count=KEYLIST_PAGE_SIZE + 1,
+            duration_days=30,
+            email_address="shared@example.com",
+        )
+        self.assertEqual(status, "created")
+        self.assertIsNotNone(keys)
+
+    async def asyncTearDown(self) -> None:
+        await self.service.shutdown()
+        self.temp_dir.cleanup()
+
+    async def test_keylist_handler_renders_first_page_with_total_count_and_next_button(
+        self,
+    ) -> None:
+        message = FakeTelegramMessage(user_id=1, text="/keylist", chat_id=1001)
+        keylist_handler = get_message_handler(self.service, "keylist_handler")
+
+        await keylist_handler(message)
+
+        self.assertEqual(len(message.answers), 1)
+        text, reply_markup = message.answers[0]
+        self.assertEqual(
+            text.splitlines()[:3],
+            [
+                f"Общее количество: {KEYLIST_PAGE_SIZE + 1}",
+                "",
+                "КЛЮЧ | Почта | Дата начало - Дата конца",
+            ],
+        )
+
+        rows = text.splitlines()[3:]
+        self.assertEqual(len(rows), KEYLIST_PAGE_SIZE)
+        self.assertIsInstance(reply_markup, InlineKeyboardMarkup)
+        assert isinstance(reply_markup, InlineKeyboardMarkup)
+        buttons = reply_markup.inline_keyboard[0]
+        self.assertEqual([button.text for button in buttons], ["1/2", "Вперёд ›"])
+        self.assertEqual(buttons[1].callback_data, "keylist:1:1")
+
+    async def test_keylist_callback_renders_second_page_with_prev_button(self) -> None:
+        keys = await self.service.list_subscription_keys()
+        callback_message = FakeEditableMessage(chat_id=1001)
+        callback = FakeCallbackQuery(
+            user_id=1,
+            data="keylist:1:1",
+            message=callback_message,
+        )
+        keylist_callback_handler = get_callback_handler(
+            self.service,
+            "keylist_page_callback_handler",
+        )
+
+        await keylist_callback_handler(callback)
+
+        self.assertEqual(len(callback.answers), 1)
+        self.assertEqual(callback.answers[0], (None, False))
+        self.assertIsNotNone(callback_message.text)
+        assert callback_message.text is not None
+        self.assertIn(keys[-1].code, callback_message.text)
+        self.assertNotIn(keys[0].code, callback_message.text)
+
+        self.assertIsInstance(callback_message.reply_markup, InlineKeyboardMarkup)
+        assert isinstance(callback_message.reply_markup, InlineKeyboardMarkup)
+        buttons = callback_message.reply_markup.inline_keyboard[0]
+        self.assertEqual([button.text for button in buttons], ["‹ Назад", "2/2"])
+        self.assertEqual(buttons[0].callback_data, "keylist:1:0")
+
+
 class FakeTelegramMessage:
     def __init__(
         self,
@@ -477,6 +582,28 @@ class FakeTelegramMessage:
 
     async def answer(self, text: str, reply_markup=None) -> None:
         self.answers.append((text, reply_markup))
+
+
+class FakeEditableMessage:
+    def __init__(self, *, chat_id: int) -> None:
+        self.chat = SimpleNamespace(id=chat_id)
+        self.text: str | None = None
+        self.reply_markup = None
+
+    async def edit_text(self, text: str, reply_markup=None) -> None:
+        self.text = text
+        self.reply_markup = reply_markup
+
+
+class FakeCallbackQuery:
+    def __init__(self, *, user_id: int, data: str, message: FakeEditableMessage) -> None:
+        self.from_user = SimpleNamespace(id=user_id)
+        self.data = data
+        self.message = message
+        self.answers: list[tuple[str | None, bool]] = []
+
+    async def answer(self, text: str | None = None, show_alert: bool = False) -> None:
+        self.answers.append((text, show_alert))
 
 
 class FakeRouterService:
@@ -530,5 +657,14 @@ def get_message_handler(service, handler_name: str):
     raise AssertionError(f"Handler {handler_name} not found")
 
 
+def get_callback_handler(service, handler_name: str):
+    router = build_router(service)
+    for handler in router.callback_query.handlers:
+        if handler.callback.__name__ == handler_name:
+            return handler.callback
+    raise AssertionError(f"Handler {handler_name} not found")
+
+
 if __name__ == "__main__":
     unittest.main()
+

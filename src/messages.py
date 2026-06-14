@@ -47,6 +47,15 @@ MESSAGES = {
         "delkey_success": "Код `{code}` удалён.",
         "keylist_empty": "Список кодов пуст.",
         "keylist_header": "Список кодов (все коды многоразовые):\n{rows}",
+        "keylist_page_header": (
+            "Общее количество: {total_count}\n\n"
+            "КЛЮЧ | Почта | Дата начало - Дата конца\n"
+            "{rows}"
+        ),
+        "keylist_prev_button": "‹ Назад",
+        "keylist_next_button": "Вперёд ›",
+        "keylist_page_button": "{page}/{total_pages}",
+        "keylist_access_denied": "Эта кнопка не для вас.",
         "refresh_prompt": "Пришли client_id следующим сообщением.",
         "refresh_started": "Принял client_id `{client_id}`. Запрашиваю device_code.",
         "refresh_running": (
@@ -160,6 +169,15 @@ MESSAGES = {
         "delkey_success": "Code `{code}` has been deleted.",
         "keylist_empty": "The key list is empty.",
         "keylist_header": "Keys (all keys are reusable):\n{rows}",
+        "keylist_page_header": (
+            "Total count: {total_count}\n\n"
+            "KEY | Email | Start date - End date\n"
+            "{rows}"
+        ),
+        "keylist_prev_button": "‹ Prev",
+        "keylist_next_button": "Next ›",
+        "keylist_page_button": "{page}/{total_pages}",
+        "keylist_access_denied": "This button is not for you.",
         "refresh_prompt": "Send the client_id in your next message.",
         "refresh_started": "Accepted client_id `{client_id}`. Requesting device_code now.",
         "refresh_running": (
