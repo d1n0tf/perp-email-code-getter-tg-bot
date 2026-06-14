@@ -35,6 +35,7 @@ class BaseWebFlowTestCase(unittest.IsolatedAsyncioTestCase):
                 activated_key_store_path=self.base_path / "activated_keys.json",
                 legacy_user_store_path=self.base_path / "legacy_users.json",
                 user_locale_store_path=self.base_path / "user_locales.json",
+                web_admin_password="secret-password",
                 concurrent_mail_workers=1,
             ),
             storage=self.storage,
@@ -207,6 +208,118 @@ class WebFlowCancellationTests(BaseWebFlowTestCase):
 
         payload = status_response.json()
         self.assertEqual(payload["status"], "missing")
+
+
+class AdminControlTests(BaseWebFlowTestCase):
+    service_class = None  # type: ignore[assignment]
+
+    async def asyncSetUp(self) -> None:
+        self.service_class = ImmediateWebCodeService
+        await super().asyncSetUp()
+
+    async def login_admin(self, *, locale: str = "ru") -> httpx.Response:
+        return await self.client.post(
+            self.route("/admin_control/login"),
+            data={"lang": locale, "password": "secret-password"},
+            follow_redirects=False,
+        )
+
+    async def test_admin_control_requires_password_login(self) -> None:
+        response = await self.client.get(f"{self.route('/admin_control')}?lang=ru")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Вход в Admin Control", response.text)
+        self.assertIn("Пароль", response.text)
+        self.assertNotIn("Subscription term", response.text)
+
+    async def test_admin_control_shows_subscription_rows_and_account_details(self) -> None:
+        await self.activate_key(locale="ru")
+        login_response = await self.login_admin(locale="ru")
+
+        self.assertEqual(login_response.status_code, 303)
+        row_id = f"web:{self.client.cookies[WEB_USER_COOKIE_NAME]}|{self.key.code}"
+        page = await self.client.get(
+            self.route("/admin_control"),
+            params={"lang": "ru", "row": row_id, "panel": "details"},
+        )
+
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Управление активированными подписками", page.text)
+        self.assertIn(self.key.code, page.text)
+        self.assertIn("shared@example.com", page.text)
+        self.assertIn("refresh-token", page.text)
+        self.assertIn("Изменить", page.text)
+        self.assertIn("Удалить", page.text)
+
+    async def test_admin_control_can_add_and_update_account(self) -> None:
+        login_response = await self.login_admin(locale="ru")
+        self.assertEqual(login_response.status_code, 303)
+
+        add_response = await self.client.post(
+            self.route("/admin_control/accounts/add"),
+            data={
+                "lang": "ru",
+                "raw_account": (
+                    "new@example.com:new-pass:recovery2@example.com:"
+                    "recovery-pass-2:new-refresh:new-client"
+                ),
+            },
+        )
+        self.assertEqual(add_response.status_code, 200)
+        self.assertIn("Аккаунт добавлен", add_response.text)
+        stored = await self.storage.get_account("new@example.com")
+        self.assertIsNotNone(stored)
+
+        await self.activate_key(locale="ru")
+        update_response = await self.client.post(
+            self.route("/admin_control/accounts/update"),
+            data={
+                "lang": "ru",
+                "row_id": f"web:{self.client.cookies[WEB_USER_COOKIE_NAME]}|{self.key.code}",
+                "original_email": "shared@example.com",
+                "login_email": "shared-updated@example.com",
+                "login_password": "new-pass",
+                "recovery_email": "recovery-updated@example.com",
+                "recovery_password": "new-recovery-pass",
+                "refresh_token": "new-refresh-token",
+                "client_id": "new-client-id",
+            },
+        )
+        self.assertEqual(update_response.status_code, 200)
+        self.assertIn("Аккаунт сохранён", update_response.text)
+        self.assertIsNone(await self.storage.get_account("shared@example.com"))
+        updated_account = await self.storage.get_account("shared-updated@example.com")
+        self.assertIsNotNone(updated_account)
+        updated_key = await self.storage.get_subscription_key(self.key.code)
+        self.assertIsNotNone(updated_key)
+        assert updated_key is not None
+        self.assertEqual(updated_key.email_address, "shared-updated@example.com")
+
+    async def test_admin_control_delete_requires_confirmation_and_removes_account(self) -> None:
+        await self.activate_key(locale="ru")
+        login_response = await self.login_admin(locale="ru")
+        self.assertEqual(login_response.status_code, 303)
+
+        row_id = f"web:{self.client.cookies[WEB_USER_COOKIE_NAME]}|{self.key.code}"
+        confirm_page = await self.client.get(
+            self.route("/admin_control"),
+            params={"lang": "ru", "row": row_id, "panel": "delete"},
+        )
+        self.assertEqual(confirm_page.status_code, 200)
+        self.assertIn("Подтвердить удаление", confirm_page.text)
+        self.assertIn("Привязанные ключи останутся", confirm_page.text)
+
+        delete_response = await self.client.post(
+            self.route("/admin_control/accounts/delete"),
+            data={
+                "lang": "ru",
+                "row_id": row_id,
+                "email": "shared@example.com",
+            },
+        )
+        self.assertEqual(delete_response.status_code, 200)
+        self.assertIn("Аккаунт удалён", delete_response.text)
+        self.assertIsNone(await self.storage.get_account("shared@example.com"))
 
 
 class ImmediateWebCodeService(BotService):

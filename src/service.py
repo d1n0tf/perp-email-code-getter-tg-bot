@@ -97,6 +97,19 @@ class BotService:
         existed = await self.storage.upsert_account(account)
         return account, existed
 
+    async def update_account(
+        self,
+        original_email: str,
+        account: EmailAccount,
+    ) -> str:
+        return await self.storage.replace_account(original_email, account)
+
+    async def delete_account(self, email_address: str) -> bool:
+        return await self.storage.delete_account(email_address)
+
+    async def list_accounts(self) -> list[EmailAccount]:
+        return await self.storage.list_accounts()
+
     async def add_subscription_keys(
         self,
         *,
@@ -137,6 +150,32 @@ class BotService:
 
     async def list_subscription_keys(self) -> list[SubscriptionKey]:
         return await self.storage.list_subscription_keys()
+
+    async def list_activated_subscriptions(self) -> list[ActivatedSubscription]:
+        activations = await self.storage.list_user_activations()
+        if not activations:
+            return []
+
+        keys_by_code = {
+            key.code: key for key in await self.storage.list_subscription_keys()
+        }
+        accounts_by_email = {
+            account.login_email: account for account in await self.storage.list_accounts()
+        }
+
+        subscriptions: list[ActivatedSubscription] = []
+        for activation in activations:
+            key = keys_by_code.get(activation.code)
+            if key is None:
+                continue
+            subscriptions.append(
+                ActivatedSubscription(
+                    activation=activation,
+                    key=key,
+                    account=accounts_by_email.get(key.email_address),
+                )
+            )
+        return subscriptions
 
     async def get_user_activation(self, user_id: int) -> UserKeyActivation | None:
         return await self.storage.get_user_activation(f"tg:{user_id}")

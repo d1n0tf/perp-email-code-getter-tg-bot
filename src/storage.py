@@ -250,6 +250,81 @@ class JsonStorage:
                 return None
             return EmailAccount.from_dict(account_data)
 
+    async def list_accounts(self) -> list[EmailAccount]:
+        async with self._email_lock:
+            data = self._load_json(self.email_store_path, default={})
+
+        accounts: list[EmailAccount] = []
+        for raw_value in data.values():
+            if not isinstance(raw_value, dict):
+                continue
+            try:
+                accounts.append(EmailAccount.from_dict(raw_value))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        return sorted(accounts, key=lambda item: item.login_email)
+
+    async def replace_account(
+        self,
+        original_email: str,
+        account: EmailAccount,
+    ) -> str:
+        normalized_original_email = normalize_email(original_email)
+        normalized_target_email = normalize_email(account.login_email)
+
+        async with self._email_lock, self._key_lock:
+            email_data = self._load_json(self.email_store_path, default={}, strict=True)
+            existing_account = email_data.get(normalized_original_email)
+            if not isinstance(existing_account, dict):
+                return "missing"
+
+            if (
+                normalized_target_email != normalized_original_email
+                and normalized_target_email in email_data
+            ):
+                return "conflict"
+
+            if normalized_target_email != normalized_original_email:
+                email_data.pop(normalized_original_email, None)
+            email_data[normalized_target_email] = account.to_dict()
+
+            key_data = self._load_json(
+                self.subscription_key_store_path,
+                default={},
+                strict=True,
+            )
+            for code, raw_value in key_data.items():
+                if not isinstance(raw_value, dict):
+                    continue
+                try:
+                    key = SubscriptionKey.from_dict(raw_value)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if key.email_address != normalized_original_email:
+                    continue
+                key_data[code] = SubscriptionKey(
+                    code=key.code,
+                    email_address=normalized_target_email,
+                    duration_days=key.duration_days,
+                    created_at=key.created_at,
+                    expires_at=key.expires_at,
+                ).to_dict()
+
+            self._write_json(self.email_store_path, email_data)
+            self._write_json(self.subscription_key_store_path, key_data)
+            return "updated"
+
+    async def delete_account(self, email_address: str) -> bool:
+        normalized_email = normalize_email(email_address)
+        async with self._email_lock:
+            data = self._load_json(self.email_store_path, default={}, strict=True)
+            removed = data.pop(normalized_email, None)
+            if removed is None:
+                return False
+            self._write_json(self.email_store_path, data)
+            return True
+
     async def reserve_email(
         self,
         email_address: str,
@@ -396,6 +471,25 @@ class JsonStorage:
             if not isinstance(activation_data, dict):
                 return None
             return UserKeyActivation.from_dict(activation_data)
+
+    async def list_user_activations(self) -> list[UserKeyActivation]:
+        async with self._activation_lock:
+            data = self._load_json(self.activated_key_store_path, default={})
+
+        activations: list[UserKeyActivation] = []
+        for raw_value in data.values():
+            if not isinstance(raw_value, dict):
+                continue
+            try:
+                activations.append(UserKeyActivation.from_dict(raw_value))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+        return sorted(
+            activations,
+            key=lambda item: (item.activated_at, item.requester_id),
+            reverse=True,
+        )
 
     async def clear_user_activation(self, requester_id: str) -> bool:
         async with self._activation_lock:

@@ -36,6 +36,7 @@ class Settings(BaseSettings):
     web_host: str = "127.0.0.1"
     web_port: int = 8000
     web_base_path: str = "/perp-code-getter"
+    web_admin_password: str | None = None
 
     @field_validator("tg_admins", mode="before")
     @classmethod
