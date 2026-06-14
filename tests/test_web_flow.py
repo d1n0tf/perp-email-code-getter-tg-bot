@@ -235,6 +235,18 @@ class AdminControlTests(BaseWebFlowTestCase):
         self.assertNotIn("Subscription term", response.text)
         self.assertIn("__perpLiveNavEnabled", response.text)
 
+    async def test_admin_control_shows_available_key_without_activation(self) -> None:
+        login_response = await self.login_admin(locale="ru")
+        self.assertEqual(login_response.status_code, 303)
+
+        page = await self.client.get(
+            self.route("/admin_control"),
+            params={"lang": "ru"},
+        )
+        self.assertEqual(page.status_code, 200)
+        self.assertIn(self.key.code, page.text)
+        self.assertIn("shared@example.com", page.text)
+
     async def test_admin_control_shows_subscription_rows_and_account_details(self) -> None:
         await self.activate_key(locale="ru")
         login_response = await self.login_admin(locale="ru")

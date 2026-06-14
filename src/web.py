@@ -247,12 +247,19 @@ class AdminPageState:
 
 
 @dataclass(slots=True)
+class AdminSubscriptionEntry:
+    key: SubscriptionKey
+    account: EmailAccount
+    activation: UserKeyActivation | None
+
+
+@dataclass(slots=True)
 class AdminSubscriptionRow:
     row_id: str
     display_number: int
-    activation: UserKeyActivation
+    activation: UserKeyActivation | None
     key: SubscriptionKey
-    account: EmailAccount | None
+    account: EmailAccount
     days_left: int
 
 
@@ -1422,16 +1429,24 @@ async def build_admin_control_response(
     status_kind: str = "info",
     status_code: int = 200,
 ) -> HTMLResponse:
-    subscriptions = await service.list_activated_subscriptions()
+    keys = await service.list_subscription_keys()
+    accounts_by_email = {
+        account.login_email: account for account in await service.list_accounts()
+    }
+    latest_activation_by_code = build_latest_activation_by_code(
+        await service.list_user_activations()
+    )
+    subscriptions = [
+        AdminSubscriptionEntry(
+            key=key,
+            account=account,
+            activation=latest_activation_by_code.get(key.code),
+        )
+        for key in keys
+        if (account := accounts_by_email.get(key.email_address)) is not None
+    ]
     rows = build_admin_rows(
-        filter_admin_subscriptions(
-            [
-                subscription
-                for subscription in subscriptions
-                if subscription.account is not None
-            ],
-            state.search_query,
-        ),
+        filter_admin_subscriptions(subscriptions, state.search_query),
         sort_key=state.sort_key,
         sort_order=state.sort_order,
     )
@@ -2073,7 +2088,7 @@ def render_admin_table_row(
             <tr>
               <td>{row.display_number}</td>
               <td>{row.key.duration_days}</td>
-              <td>{html.escape(format_admin_datetime(row.activation.activated_at))}</td>
+              <td>{html.escape(format_admin_activation_datetime(row))}</td>
               <td>{html.escape(format_admin_datetime(row.key.expires_at, include_time=False))}</td>
               <td>{row.days_left}</td>
               <td class="mono">{html.escape(row.key.code)}</td>
@@ -2138,13 +2153,6 @@ def render_admin_detail_panel(
             "add": "1" if state.show_add_form else None,
         },
     )
-
-    if row.account is None:
-        return f"""
-      <p class="note">{html.escape(web_text(locale, "admin_account_missing"))}</p>
-      <div class="toolbar-actions">
-        <a class="button ghost" href="{html.escape(close_url, quote=True)}">{html.escape(web_text(locale, "admin_cancel_button"))}</a>
-      </div>"""
 
     if state.panel == "edit":
         values = state.edit_values or admin_row_to_form_values(row)
@@ -2523,14 +2531,14 @@ def admin_state_from_request(request: Request) -> AdminPageState:
 
 
 def build_admin_rows(
-    subscriptions: list[ActivatedSubscription],
+    subscriptions: list[AdminSubscriptionEntry],
     *,
     sort_key: str,
     sort_order: str,
 ) -> list[AdminSubscriptionRow]:
     now = datetime.now(timezone.utc).date()
     rows: list[AdminSubscriptionRow] = []
-    for subscription in deduplicate_admin_subscriptions(subscriptions):
+    for subscription in subscriptions:
         expires_on = subscription.key.expires_at.astimezone(timezone.utc).date()
         days_left = max(0, (expires_on - now).days)
         rows.append(
@@ -2550,19 +2558,21 @@ def build_admin_rows(
     return rows
 
 
-def build_admin_row_id(activation: UserKeyActivation, key: SubscriptionKey) -> str:
+def build_admin_row_id(activation: UserKeyActivation | None, key: SubscriptionKey) -> str:
+    if activation is None:
+        return f"key:{key.code}|{key.code}"
     return f"{activation.requester_id}|{key.code}"
 
 
-def deduplicate_admin_subscriptions(
-    subscriptions: list[ActivatedSubscription],
-) -> list[ActivatedSubscription]:
-    latest_by_key_code: dict[str, ActivatedSubscription] = {}
-    for subscription in subscriptions:
-        current = latest_by_key_code.get(subscription.key.code)
-        if current is None or admin_subscription_recency(subscription) > admin_subscription_recency(current):
-            latest_by_key_code[subscription.key.code] = subscription
-    return list(latest_by_key_code.values())
+def build_latest_activation_by_code(
+    activations: list[UserKeyActivation],
+) -> dict[str, UserKeyActivation]:
+    latest_by_code: dict[str, UserKeyActivation] = {}
+    for activation in activations:
+        current = latest_by_code.get(activation.code)
+        if current is None or admin_activation_recency(activation) > admin_activation_recency(current):
+            latest_by_code[activation.code] = activation
+    return latest_by_code
 
 
 def normalize_admin_sort_key(raw_value: str | None) -> str:
@@ -2584,21 +2594,21 @@ def normalize_admin_search_query(raw_value: str | None) -> str:
 
 
 def admin_sort_value(row: AdminSubscriptionRow, sort_key: str):
+    activated_at = admin_row_activated_at(row)
     if sort_key == "duration":
-        return (row.key.duration_days, row.activation.activated_at, row.row_id)
+        return (row.key.duration_days, activated_at, row.row_id)
     if sort_key == "expires":
-        return (row.key.expires_at, row.activation.activated_at, row.row_id)
+        return (row.key.expires_at, activated_at, row.row_id)
     if sort_key == "days_left":
         return (row.days_left, row.key.expires_at, row.row_id)
     if sort_key == "key":
-        return (row.key.code, row.activation.activated_at, row.row_id)
+        return (row.key.code, activated_at, row.row_id)
     if sort_key == "email":
-        return (row.key.email_address, row.activation.activated_at, row.row_id)
-    return (row.activation.activated_at, row.row_id)
+        return (row.key.email_address, activated_at, row.row_id)
+    return (activated_at, row.row_id)
 
 
-def admin_subscription_recency(subscription: ActivatedSubscription) -> tuple[datetime, datetime, str]:
-    activation = subscription.activation
+def admin_activation_recency(activation: UserKeyActivation) -> tuple[datetime, datetime, str]:
     return (
         activation.activated_at,
         activation.last_used_at,
@@ -2607,9 +2617,9 @@ def admin_subscription_recency(subscription: ActivatedSubscription) -> tuple[dat
 
 
 def filter_admin_subscriptions(
-    subscriptions: list[ActivatedSubscription],
+    subscriptions: list[AdminSubscriptionEntry],
     search_query: str,
-) -> list[ActivatedSubscription]:
+) -> list[AdminSubscriptionEntry]:
     needle = search_query.strip().lower()
     if not needle:
         return subscriptions
@@ -2627,6 +2637,18 @@ def format_admin_datetime(value: datetime, *, include_time: bool = True) -> str:
     if include_time:
         return normalized.strftime("%d.%m.%Y %H:%M")
     return normalized.strftime("%d.%m.%Y")
+
+
+def format_admin_activation_datetime(row: AdminSubscriptionRow) -> str:
+    if row.activation is None:
+        return "-"
+    return format_admin_datetime(row.activation.activated_at)
+
+
+def admin_row_activated_at(row: AdminSubscriptionRow) -> datetime:
+    if row.activation is None:
+        return datetime.min.replace(tzinfo=timezone.utc)
+    return row.activation.activated_at
 
 
 def extract_account_form_values(payload: dict[str, str]) -> dict[str, str]:
@@ -2660,12 +2682,12 @@ def account_to_form_values(account: EmailAccount) -> dict[str, str]:
 
 
 def admin_row_to_form_values(row: AdminSubscriptionRow) -> dict[str, str]:
-    if row.account is None:
-        raise ValueError("Account is required for edit form values")
     values = account_to_form_values(row.account)
     values["key_code"] = row.key.code
     values["duration_days"] = str(row.key.duration_days)
-    values["activated_at"] = format_admin_datetime_input(row.activation.activated_at)
+    values["activated_at"] = format_admin_datetime_input(
+        row.activation.activated_at if row.activation is not None else row.key.created_at
+    )
     return values
 
 

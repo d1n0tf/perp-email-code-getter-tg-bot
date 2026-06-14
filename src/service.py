@@ -146,6 +146,9 @@ class BotService:
     async def list_accounts(self) -> list[EmailAccount]:
         return await self.storage.list_accounts()
 
+    async def list_user_activations(self) -> list[UserKeyActivation]:
+        return await self.storage.list_user_activations()
+
     async def add_subscription_keys(
         self,
         *,
