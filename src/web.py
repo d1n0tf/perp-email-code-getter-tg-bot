@@ -25,7 +25,6 @@ ADMIN_CONTROL_PATH = "/admin_control"
 ADMIN_CONTROL_LOGIN_PATH = f"{ADMIN_CONTROL_PATH}/login"
 ADMIN_CONTROL_LOGOUT_PATH = f"{ADMIN_CONTROL_PATH}/logout"
 ADMIN_CONTROL_ADD_PATH = f"{ADMIN_CONTROL_PATH}/accounts/add"
-ADMIN_CONTROL_ADD_KEY_PATH = f"{ADMIN_CONTROL_PATH}/keys/add"
 ADMIN_CONTROL_UPDATE_PATH = f"{ADMIN_CONTROL_PATH}/accounts/update"
 ADMIN_CONTROL_DELETE_PATH = f"{ADMIN_CONTROL_PATH}/accounts/delete"
 ADMIN_SORT_KEYS = {
@@ -77,7 +76,13 @@ WEB_TEXTS = {
         "admin_add_button": "Добавить аккаунт",
         "admin_add_label": "Строка в формате /add",
         "admin_add_placeholder": "EMAIL:PASS:EMAIL:PASS:TOKEN:ID",
+        "admin_add_duration_label": "Срок подписки (дней)",
+        "admin_add_optional_key_label": "Ключ (необязательно)",
         "admin_add_submit": "Добавить",
+        "admin_add_duration_invalid": "Срок подписки должен быть положительным числом.",
+        "admin_add_key_conflict": "Ключ `{code}` уже существует.",
+        "admin_add_result_created": "Аккаунт `{email}` добавлен. Ключ `{code}` создан на `{duration_days}` дн. до `{end_date}`.",
+        "admin_add_result_updated": "Аккаунт `{email}` обновлён. Ключ `{code}` создан на `{duration_days}` дн. до `{end_date}`.",
         "admin_cancel_button": "Отмена",
         "admin_table_empty": "Активированных подписок пока нет.",
         "admin_col_id": "№",
@@ -129,12 +134,6 @@ WEB_TEXTS = {
         "admin_table_no_results": "По вашему запросу ничего не найдено.",
         "admin_edit_raw_label": "Полная строка /add",
         "admin_edit_raw_hint": "Если заполнить это поле, аккаунт обновится целиком из одной строки. Если оставить пустым, используются поля ниже.",
-        "admin_add_key_heading": "Создать ключ",
-        "admin_add_key_email_label": "Почта аккаунта",
-        "admin_add_key_duration_label": "Срок подписки (дней)",
-        "admin_add_key_submit": "Создать ключ",
-        "admin_add_key_invalid": "Срок подписки должен быть положительным числом.",
-        "admin_add_key_success": "Ключ `{code}` создан для `{email}` на `{duration_days}` дн. до `{end_date}`.",
     },
     "en": {
         "title": "Perplexity Access",
@@ -173,7 +172,13 @@ WEB_TEXTS = {
         "admin_add_button": "Add account",
         "admin_add_label": "Value in /add format",
         "admin_add_placeholder": "EMAIL:PASS:EMAIL:PASS:TOKEN:ID",
+        "admin_add_duration_label": "Subscription term (days)",
+        "admin_add_optional_key_label": "Key (optional)",
         "admin_add_submit": "Add",
+        "admin_add_duration_invalid": "Subscription term must be a positive integer.",
+        "admin_add_key_conflict": "A key with value `{code}` already exists.",
+        "admin_add_result_created": "Account `{email}` added. Key `{code}` was created for `{duration_days}` days until `{end_date}`.",
+        "admin_add_result_updated": "Account `{email}` updated. Key `{code}` was created for `{duration_days}` days until `{end_date}`.",
         "admin_cancel_button": "Cancel",
         "admin_table_empty": "There are no activated subscriptions yet.",
         "admin_col_id": "#",
@@ -225,12 +230,6 @@ WEB_TEXTS = {
         "admin_table_no_results": "No rows matched your search.",
         "admin_edit_raw_label": "Full /add string",
         "admin_edit_raw_hint": "If this field is filled, the account will be updated from the single string. If left empty, the fields below are used.",
-        "admin_add_key_heading": "Create key",
-        "admin_add_key_email_label": "Account email",
-        "admin_add_key_duration_label": "Subscription term (days)",
-        "admin_add_key_submit": "Create key",
-        "admin_add_key_invalid": "Subscription term must be a positive integer.",
-        "admin_add_key_success": "Key `{code}` was created for `{email}` for `{duration_days}` days until `{end_date}`.",
     },
 }
 
@@ -241,12 +240,12 @@ class AdminPageState:
     panel: str | None = None
     show_add_form: bool = False
     add_value: str = ""
+    add_duration: str = ""
+    add_key_code: str = ""
     edit_values: dict[str, str] | None = None
     sort_key: str = "activated"
     sort_order: str = "desc"
     search_query: str = ""
-    add_key_email: str = ""
-    add_key_duration: str = ""
 
 
 @dataclass(slots=True)
@@ -675,72 +674,19 @@ def create_web_app(service: BotService) -> FastAPI:
             return auth_response
 
         raw_value = payload.get("raw_account", "").strip()
+        duration_raw = payload.get("duration_days", "").strip()
+        key_code = payload.get("key_code", "").strip()
         sort_key = normalize_admin_sort_key(payload.get("sort"))
         sort_order = normalize_admin_sort_order(payload.get("order"))
         search_query = normalize_admin_search_query(payload.get("search"))
         state = AdminPageState(
             show_add_form=True,
             add_value=raw_value,
+            add_duration=duration_raw,
+            add_key_code=key_code,
             sort_key=sort_key,
             sort_order=sort_order,
             search_query=search_query,
-            add_key_email=payload.get("key_email", "").strip(),
-            add_key_duration=payload.get("duration_days", "").strip(),
-        )
-        try:
-            _, existed = await service.add_account(raw_value)
-        except ValueError:
-            return await build_admin_control_response(
-                locale=locale,
-                base_path=base_path,
-                service=service,
-                state=state,
-                status_message=web_text(locale, "admin_account_invalid"),
-                status_kind="error",
-                status_code=400,
-            )
-
-        return await build_admin_control_response(
-            locale=locale,
-            base_path=base_path,
-            service=service,
-            state=AdminPageState(
-                show_add_form=True,
-                sort_key=sort_key,
-                sort_order=sort_order,
-                search_query=search_query,
-            ),
-            status_message=web_text(
-                locale,
-                "admin_account_exists" if existed else "admin_account_added",
-            ),
-            status_kind="success",
-        )
-
-    async def admin_add_key(request: Request) -> HTMLResponse:
-        payload = await read_form_body(request)
-        locale = resolve_locale(payload.get("lang"))
-        auth_response = build_admin_auth_error_response(
-            request=request,
-            locale=locale,
-            base_path=base_path,
-            service=service,
-        )
-        if auth_response is not None:
-            return auth_response
-
-        sort_key = normalize_admin_sort_key(payload.get("sort"))
-        sort_order = normalize_admin_sort_order(payload.get("order"))
-        search_query = normalize_admin_search_query(payload.get("search"))
-        key_email = payload.get("key_email", "").strip()
-        duration_raw = payload.get("duration_days", "").strip()
-        state = AdminPageState(
-            show_add_form=True,
-            sort_key=sort_key,
-            sort_order=sort_order,
-            search_query=search_query,
-            add_key_email=key_email,
-            add_key_duration=duration_raw,
         )
 
         try:
@@ -753,38 +699,54 @@ def create_web_app(service: BotService) -> FastAPI:
                 base_path=base_path,
                 service=service,
                 state=state,
-                status_message=web_text(locale, "admin_add_key_invalid"),
+                status_message=web_text(locale, "admin_add_duration_invalid"),
                 status_kind="error",
                 status_code=400,
             )
 
-        status, keys = await service.add_subscription_keys(
-            count=1,
-            duration_days=duration_days,
-            email_address=key_email,
-        )
-        if status == "email_missing":
-            return await build_admin_control_response(
-                locale=locale,
-                base_path=base_path,
-                service=service,
-                state=state,
-                status_message=translate(locale, "addkey_email_missing", email=normalize_email(key_email)),
-                status_kind="error",
-                status_code=404,
+        try:
+            add_status, _, key = await service.add_account_with_subscription_key(
+                raw_value=raw_value,
+                duration_days=duration_days,
+                key_code=key_code or None,
             )
-        if not keys:
+        except ValueError:
             return await build_admin_control_response(
                 locale=locale,
                 base_path=base_path,
                 service=service,
                 state=state,
-                status_message=translate(locale, "code_failed", email=normalize_email(key_email)),
+                status_message=web_text(locale, "admin_account_invalid"),
+                status_kind="error",
+                status_code=400,
+            )
+
+        if add_status == "conflict_key":
+            return await build_admin_control_response(
+                locale=locale,
+                base_path=base_path,
+                service=service,
+                state=state,
+                status_message=web_text(
+                    locale,
+                    "admin_add_key_conflict",
+                    code=normalize_key_code(key_code),
+                ),
+                status_kind="error",
+                status_code=409,
+            )
+
+        if key is None:
+            return await build_admin_control_response(
+                locale=locale,
+                base_path=base_path,
+                service=service,
+                state=state,
+                status_message=translate(locale, "code_failed", email=""),
                 status_kind="error",
                 status_code=500,
             )
 
-        key = keys[0]
         return await build_admin_control_response(
             locale=locale,
             base_path=base_path,
@@ -797,9 +759,9 @@ def create_web_app(service: BotService) -> FastAPI:
             ),
             status_message=web_text(
                 locale,
-                "admin_add_key_success",
+                "admin_add_result_updated" if add_status == "updated" else "admin_add_result_created",
+                email=normalize_email(raw_value.split(":", 1)[0]),
                 code=key.code,
-                email=key.email_address,
                 duration_days=str(key.duration_days),
                 end_date=service.format_date(key.expires_at),
             ),
@@ -1049,14 +1011,6 @@ def create_web_app(service: BotService) -> FastAPI:
         app.add_api_route(
             route_path,
             admin_add_account,
-            methods=["POST"],
-            response_class=HTMLResponse,
-            response_model=None,
-        )
-    for route_path in route_variants(ADMIN_CONTROL_ADD_KEY_PATH, base_path):
-        app.add_api_route(
-            route_path,
-            admin_add_key,
             methods=["POST"],
             response_class=HTMLResponse,
             response_model=None,
@@ -1472,7 +1426,14 @@ async def build_admin_control_response(
 ) -> HTMLResponse:
     subscriptions = await service.list_activated_subscriptions()
     rows = build_admin_rows(
-        filter_admin_subscriptions(subscriptions, state.search_query),
+        filter_admin_subscriptions(
+            [
+                subscription
+                for subscription in subscriptions
+                if subscription.account is not None
+            ],
+            state.search_query,
+        ),
         sort_key=state.sort_key,
         sort_order=state.sort_order,
     )
@@ -1645,7 +1606,6 @@ def render_admin_control_page(
     safe_locale = html.escape(locale, quote=True)
     admin_home = build_web_path(base_path, ADMIN_CONTROL_PATH)
     add_action = build_web_path(base_path, ADMIN_CONTROL_ADD_PATH)
-    add_key_action = build_web_path(base_path, ADMIN_CONTROL_ADD_KEY_PATH)
     update_action = build_web_path(base_path, ADMIN_CONTROL_UPDATE_PATH)
     delete_action = build_web_path(base_path, ADMIN_CONTROL_DELETE_PATH)
     logout_action = build_web_path(base_path, ADMIN_CONTROL_LOGOUT_PATH)
@@ -1704,33 +1664,21 @@ def render_admin_control_page(
         <input type="hidden" name="lang" value="{safe_locale}">
         <label for="raw_account">{html.escape(web_text(locale, "admin_add_label"))}</label>
         <textarea id="raw_account" name="raw_account" rows="3" placeholder="{html.escape(web_text(locale, "admin_add_placeholder"), quote=True)}">{html.escape(state.add_value)}</textarea>
+        <div class="form-grid">
+          <label>
+            {html.escape(web_text(locale, "admin_add_duration_label"))}
+            <input type="number" name="duration_days" min="1" step="1" value="{html.escape(state.add_duration, quote=True)}">
+          </label>
+          <label>
+            {html.escape(web_text(locale, "admin_add_optional_key_label"))}
+            <input type="text" name="key_code" value="{html.escape(state.add_key_code, quote=True)}">
+          </label>
+        </div>
         <div class="toolbar-actions">
           <button type="submit">{html.escape(web_text(locale, "admin_add_submit"))}</button>
           <input type="hidden" name="sort" value="{html.escape(state.sort_key, quote=True)}">
           <input type="hidden" name="order" value="{html.escape(state.sort_order, quote=True)}">
           <input type="hidden" name="search" value="{html.escape(state.search_query, quote=True)}">
-          <a class="button ghost" href="{html.escape(reset_url, quote=True)}">{html.escape(web_text(locale, "admin_cancel_button"))}</a>
-        </div>
-      </form>
-      <hr class="section-divider">
-      <form action="{html.escape(add_key_action, quote=True)}" method="post" class="stack">
-        <input type="hidden" name="lang" value="{safe_locale}">
-        <input type="hidden" name="sort" value="{html.escape(state.sort_key, quote=True)}">
-        <input type="hidden" name="order" value="{html.escape(state.sort_order, quote=True)}">
-        <input type="hidden" name="search" value="{html.escape(state.search_query, quote=True)}">
-        <h2>{html.escape(web_text(locale, "admin_add_key_heading"))}</h2>
-        <div class="form-grid">
-          <label>
-            {html.escape(web_text(locale, "admin_add_key_email_label"))}
-            <input type="email" name="key_email" value="{html.escape(state.add_key_email, quote=True)}">
-          </label>
-          <label>
-            {html.escape(web_text(locale, "admin_add_key_duration_label"))}
-            <input type="number" name="duration_days" min="1" step="1" value="{html.escape(state.add_key_duration, quote=True)}">
-          </label>
-        </div>
-        <div class="toolbar-actions">
-          <button type="submit">{html.escape(web_text(locale, "admin_add_key_submit"))}</button>
           <a class="button ghost" href="{html.escape(reset_url, quote=True)}">{html.escape(web_text(locale, "admin_cancel_button"))}</a>
         </div>
       </form>

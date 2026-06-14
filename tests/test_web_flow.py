@@ -266,12 +266,20 @@ class AdminControlTests(BaseWebFlowTestCase):
                     "new@example.com:new-pass:recovery2@example.com:"
                     "recovery-pass-2:new-refresh:new-client"
                 ),
+                "duration_days": "30",
+                "key_code": "NEWCUSTOMKEY123",
             },
         )
         self.assertEqual(add_response.status_code, 200)
-        self.assertIn("Аккаунт добавлен", add_response.text)
+        self.assertIn("new@example.com", add_response.text)
+        self.assertIn("NEWCUSTOMKEY123", add_response.text)
         stored = await self.storage.get_account("new@example.com")
         self.assertIsNotNone(stored)
+        created_key = await self.storage.get_subscription_key("NEWCUSTOMKEY123")
+        self.assertIsNotNone(created_key)
+        assert created_key is not None
+        self.assertEqual(created_key.email_address, "new@example.com")
+        self.assertEqual(created_key.duration_days, 30)
 
         await self.activate_key(locale="ru")
         update_response = await self.client.post(
@@ -332,16 +340,19 @@ class AdminControlTests(BaseWebFlowTestCase):
             datetime(2026, 2, 10, 14, 30, tzinfo=timezone.utc),
         )
 
-    async def test_admin_control_can_create_key_from_add_panel(self) -> None:
+    async def test_admin_control_add_form_generates_key_when_it_is_not_provided(self) -> None:
         login_response = await self.login_admin(locale="ru")
         self.assertEqual(login_response.status_code, 303)
 
         before_keys = await self.storage.list_subscription_keys()
         response = await self.client.post(
-            self.route("/admin_control/keys/add"),
+            self.route("/admin_control/accounts/add"),
             data={
                 "lang": "ru",
-                "key_email": "shared@example.com",
+                "raw_account": (
+                    "autokey@example.com:auto-pass:autorecovery@example.com:"
+                    "auto-recovery-pass:auto-refresh:auto-client"
+                ),
                 "duration_days": "45",
             },
         )
@@ -350,12 +361,13 @@ class AdminControlTests(BaseWebFlowTestCase):
         self.assertEqual(len(after_keys), len(before_keys) + 1)
         created_keys = [key for key in after_keys if key.code not in {item.code for item in before_keys}]
         self.assertEqual(len(created_keys), 1)
-        self.assertEqual(created_keys[0].email_address, "shared@example.com")
+        self.assertEqual(created_keys[0].email_address, "autokey@example.com")
         self.assertEqual(created_keys[0].duration_days, 45)
-        self.assertIn('action="/perp-code-getter/admin_control/keys/add"', response.text)
+        self.assertIn('action="/perp-code-getter/admin_control/accounts/add"', response.text)
         self.assertIn('name="duration_days"', response.text)
+        self.assertIn('name="key_code"', response.text)
         self.assertIn(created_keys[0].code, response.text)
-        self.assertIn("shared@example.com", response.text)
+        self.assertIn("autokey@example.com", response.text)
 
     async def test_admin_control_deduplicates_rows_for_same_key(self) -> None:
         first_status, _ = await self.service.activate_requester_subscription_code(
@@ -448,6 +460,8 @@ class AdminControlTests(BaseWebFlowTestCase):
         self.assertIn("Аккаунт удалён", delete_response.text)
         self.assertIsNone(await self.storage.get_account("shared@example.com"))
         self.assertNotIn("Аккаунт для этой почты не найден", delete_response.text)
+        self.assertNotIn(f'<td class="mono">{self.key.code}</td>', delete_response.text)
+        self.assertNotIn('<td class="mono">shared@example.com</td>', delete_response.text)
 
     async def test_admin_control_sorts_rows_by_selected_column(self) -> None:
         await self.storage.upsert_account(

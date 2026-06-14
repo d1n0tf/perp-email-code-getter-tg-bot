@@ -97,6 +97,21 @@ class BotService:
         existed = await self.storage.upsert_account(account)
         return account, existed
 
+    async def add_account_with_subscription_key(
+        self,
+        *,
+        raw_value: str,
+        duration_days: int,
+        key_code: str | None = None,
+    ) -> tuple[str, EmailAccount, SubscriptionKey | None]:
+        account = EmailAccount.from_add_string(raw_value)
+        status, key = await self.storage.upsert_account_with_subscription_key(
+            account=account,
+            duration_days=duration_days,
+            key_code=key_code,
+        )
+        return status, account, key
+
     async def update_account(
         self,
         original_email: str,

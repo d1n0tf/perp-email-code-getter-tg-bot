@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import secrets
+import string
 import tempfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, time, timedelta, timezone
@@ -22,6 +24,14 @@ def normalize_email(value: str) -> str:
 
 def normalize_key_code(value: str) -> str:
     return value.strip().upper()
+
+
+def _generate_subscription_code(used_codes: set[str]) -> str:
+    alphabet = string.ascii_uppercase + string.digits
+    while True:
+        code = "".join(secrets.choice(alphabet) for _ in range(15))
+        if code not in used_codes:
+            return code
 
 
 def _looks_like_uuid(value: str) -> bool:
@@ -314,6 +324,47 @@ class JsonStorage:
             self._write_json(self.email_store_path, email_data)
             self._write_json(self.subscription_key_store_path, key_data)
             return "updated"
+
+    async def upsert_account_with_subscription_key(
+        self,
+        *,
+        account: EmailAccount,
+        duration_days: int,
+        key_code: str | None = None,
+    ) -> tuple[str, SubscriptionKey | None]:
+        normalized_key_code = normalize_key_code(key_code) if key_code and key_code.strip() else None
+
+        async with self._email_lock, self._key_lock:
+            email_data = self._load_json(self.email_store_path, default={}, strict=True)
+            key_data = self._load_json(
+                self.subscription_key_store_path,
+                default={},
+                strict=True,
+            )
+
+            if normalized_key_code and normalized_key_code in key_data:
+                return "conflict_key", None
+
+            existed = account.login_email in email_data
+            email_data[account.login_email] = account.to_dict()
+
+            used_codes = {normalize_key_code(code) for code in key_data}
+            final_key_code = normalized_key_code or _generate_subscription_code(used_codes)
+            created_at = datetime.now(timezone.utc)
+            expires_on = created_at.date() + timedelta(days=duration_days)
+            expires_at = datetime.combine(expires_on, time.max, tzinfo=timezone.utc)
+            key = SubscriptionKey(
+                code=final_key_code,
+                email_address=account.login_email,
+                duration_days=duration_days,
+                created_at=created_at,
+                expires_at=expires_at,
+            )
+
+            key_data[final_key_code] = key.to_dict()
+            self._write_json(self.email_store_path, email_data)
+            self._write_json(self.subscription_key_store_path, key_data)
+            return ("updated" if existed else "created"), key
 
     async def replace_subscription_bundle(
         self,
