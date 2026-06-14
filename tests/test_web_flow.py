@@ -447,6 +447,7 @@ class AdminControlTests(BaseWebFlowTestCase):
         self.assertEqual(delete_response.status_code, 200)
         self.assertIn("Аккаунт удалён", delete_response.text)
         self.assertIsNone(await self.storage.get_account("shared@example.com"))
+        self.assertNotIn("Аккаунт для этой почты не найден", delete_response.text)
 
     async def test_admin_control_sorts_rows_by_selected_column(self) -> None:
         await self.storage.upsert_account(

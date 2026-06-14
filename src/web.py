@@ -961,8 +961,6 @@ def create_web_app(service: BotService) -> FastAPI:
             base_path=base_path,
             service=service,
             state=AdminPageState(
-                selected_row_id=row_id,
-                panel="details",
                 sort_key=sort_key,
                 sort_order=sort_order,
                 search_query=search_query,
