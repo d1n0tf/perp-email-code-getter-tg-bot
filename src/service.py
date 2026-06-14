@@ -104,6 +104,27 @@ class BotService:
     ) -> str:
         return await self.storage.replace_account(original_email, account)
 
+    async def update_subscription_bundle(
+        self,
+        *,
+        original_email: str,
+        original_code: str,
+        account: EmailAccount,
+        key_code: str,
+        duration_days: int,
+        activated_at: datetime,
+        selected_requester_id: str | None = None,
+    ) -> str:
+        return await self.storage.replace_subscription_bundle(
+            original_email=original_email,
+            original_code=original_code,
+            account=account,
+            key_code=key_code,
+            duration_days=duration_days,
+            activated_at=activated_at,
+            selected_requester_id=selected_requester_id,
+        )
+
     async def delete_account(self, email_address: str) -> bool:
         return await self.storage.delete_account(email_address)
 

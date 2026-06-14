@@ -3,7 +3,7 @@ import json
 import os
 import tempfile
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -313,6 +313,120 @@ class JsonStorage:
 
             self._write_json(self.email_store_path, email_data)
             self._write_json(self.subscription_key_store_path, key_data)
+            return "updated"
+
+    async def replace_subscription_bundle(
+        self,
+        *,
+        original_email: str,
+        original_code: str,
+        account: EmailAccount,
+        key_code: str,
+        duration_days: int,
+        activated_at: datetime,
+        selected_requester_id: str | None = None,
+    ) -> str:
+        normalized_original_email = normalize_email(original_email)
+        normalized_target_email = normalize_email(account.login_email)
+        normalized_original_code = normalize_key_code(original_code)
+        normalized_target_code = normalize_key_code(key_code)
+        normalized_activated_at = _parse_datetime(activated_at)
+
+        async with self._email_lock, self._key_lock, self._activation_lock:
+            email_data = self._load_json(self.email_store_path, default={}, strict=True)
+            existing_account = email_data.get(normalized_original_email)
+            if not isinstance(existing_account, dict):
+                return "missing_account"
+
+            if (
+                normalized_target_email != normalized_original_email
+                and normalized_target_email in email_data
+            ):
+                return "conflict_account"
+
+            key_data = self._load_json(
+                self.subscription_key_store_path,
+                default={},
+                strict=True,
+            )
+            existing_key_data = key_data.get(normalized_original_code)
+            if not isinstance(existing_key_data, dict):
+                return "missing_key"
+
+            if (
+                normalized_target_code != normalized_original_code
+                and normalized_target_code in key_data
+            ):
+                return "conflict_key"
+
+            if normalized_target_email != normalized_original_email:
+                email_data.pop(normalized_original_email, None)
+            email_data[normalized_target_email] = account.to_dict()
+
+            SubscriptionKey.from_dict(existing_key_data)
+            expires_on = normalized_activated_at.date() + timedelta(days=duration_days)
+            expires_at = datetime.combine(expires_on, time.max, tzinfo=timezone.utc)
+            updated_key = SubscriptionKey(
+                code=normalized_target_code,
+                email_address=normalized_target_email,
+                duration_days=duration_days,
+                created_at=normalized_activated_at,
+                expires_at=expires_at,
+            )
+
+            if normalized_target_code != normalized_original_code:
+                key_data.pop(normalized_original_code, None)
+            key_data[normalized_target_code] = updated_key.to_dict()
+
+            activation_data = self._load_json(
+                self.activated_key_store_path,
+                default={},
+                strict=True,
+            )
+            updated_activations: dict[str, UserKeyActivation] = {}
+            max_last_used_at = normalized_activated_at
+            for requester_id, raw_value in activation_data.items():
+                if not isinstance(raw_value, dict):
+                    continue
+                try:
+                    activation = UserKeyActivation.from_dict(raw_value)
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if activation.code != normalized_original_code:
+                    continue
+
+                last_used_at = max(activation.last_used_at, normalized_activated_at)
+                max_last_used_at = max(max_last_used_at, last_used_at)
+                updated_activations[requester_id] = UserKeyActivation(
+                    requester_id=activation.requester_id,
+                    user_id=activation.user_id,
+                    chat_id=activation.chat_id,
+                    username=activation.username,
+                    full_name=activation.full_name,
+                    code=normalized_target_code,
+                    activated_at=normalized_activated_at,
+                    last_used_at=last_used_at,
+                )
+
+            if selected_requester_id and selected_requester_id in updated_activations:
+                selected_activation = updated_activations[selected_requester_id]
+                updated_activations[selected_requester_id] = UserKeyActivation(
+                    requester_id=selected_activation.requester_id,
+                    user_id=selected_activation.user_id,
+                    chat_id=selected_activation.chat_id,
+                    username=selected_activation.username,
+                    full_name=selected_activation.full_name,
+                    code=selected_activation.code,
+                    activated_at=selected_activation.activated_at,
+                    last_used_at=max_last_used_at + timedelta(microseconds=1),
+                )
+
+            for requester_id, activation in updated_activations.items():
+                activation_data[requester_id] = activation.to_dict()
+
+            self._write_json(self.email_store_path, email_data)
+            self._write_json(self.subscription_key_store_path, key_data)
+            self._write_json(self.activated_key_store_path, activation_data)
             return "updated"
 
     async def delete_account(self, email_address: str) -> bool:

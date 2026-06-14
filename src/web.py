@@ -102,6 +102,9 @@ WEB_TEXTS = {
         "admin_field_refresh_token": "Refresh token",
         "admin_field_client_id": "Client ID",
         "admin_field_raw": "Raw /add",
+        "admin_field_key_code": "Ключ",
+        "admin_field_duration_days": "Срок подписки (дней)",
+        "admin_field_activated_at": "Дата активации",
         "admin_account_added": "Аккаунт добавлен.",
         "admin_account_updated": "Аккаунт сохранён.",
         "admin_account_deleted": "Аккаунт удалён.",
@@ -109,6 +112,9 @@ WEB_TEXTS = {
         "admin_account_update_conflict": "Аккаунт с таким логином уже существует.",
         "admin_account_update_missing": "Исходный аккаунт не найден.",
         "admin_account_invalid": "Не удалось разобрать данные аккаунта.",
+        "admin_key_update_missing": "Исходный ключ не найден.",
+        "admin_key_update_conflict": "Ключ с таким значением уже существует.",
+        "admin_subscription_invalid": "Проверьте ключ, срок подписки и дату активации.",
         "admin_delete_confirm": (
             "Удалить аккаунт `{email}`? Привязанные ключи останутся, "
             "но перестанут выдавать данные аккаунта."
@@ -192,6 +198,9 @@ WEB_TEXTS = {
         "admin_field_refresh_token": "Refresh token",
         "admin_field_client_id": "Client ID",
         "admin_field_raw": "Raw /add",
+        "admin_field_key_code": "Key",
+        "admin_field_duration_days": "Subscription term (days)",
+        "admin_field_activated_at": "Activated at",
         "admin_account_added": "The account has been added.",
         "admin_account_updated": "The account has been saved.",
         "admin_account_deleted": "The account has been deleted.",
@@ -199,6 +208,9 @@ WEB_TEXTS = {
         "admin_account_update_conflict": "An account with this login already exists.",
         "admin_account_update_missing": "The source account was not found.",
         "admin_account_invalid": "Could not parse the account data.",
+        "admin_key_update_missing": "The source key was not found.",
+        "admin_key_update_conflict": "A key with this value already exists.",
+        "admin_subscription_invalid": "Check the key, subscription term, and activation date.",
         "admin_delete_confirm": (
             "Delete account `{email}`? Linked keys will stay in place, "
             "but they will stop returning account data."
@@ -807,6 +819,7 @@ def create_web_app(service: BotService) -> FastAPI:
             return auth_response
 
         row_id = payload.get("row_id", "").strip() or None
+        selected_requester_id, _ = parse_admin_row_id(row_id)
         sort_key = normalize_admin_sort_key(payload.get("sort"))
         sort_order = normalize_admin_sort_order(payload.get("order"))
         search_query = normalize_admin_search_query(payload.get("search"))
@@ -833,11 +846,41 @@ def create_web_app(service: BotService) -> FastAPI:
                 status_code=400,
             )
 
-        update_status = await service.update_account(
-            payload.get("original_email", ""),
-            account,
+        try:
+            duration_days = int(form_values["duration_days"])
+            activated_at = parse_admin_datetime_input(form_values["activated_at"])
+        except (TypeError, ValueError):
+            return await build_admin_control_response(
+                locale=locale,
+                base_path=base_path,
+                service=service,
+                state=state,
+                status_message=web_text(locale, "admin_subscription_invalid"),
+                status_kind="error",
+                status_code=400,
+            )
+
+        if duration_days <= 0 or not form_values["key_code"].strip():
+            return await build_admin_control_response(
+                locale=locale,
+                base_path=base_path,
+                service=service,
+                state=state,
+                status_message=web_text(locale, "admin_subscription_invalid"),
+                status_kind="error",
+                status_code=400,
+            )
+
+        update_status = await service.update_subscription_bundle(
+            original_email=payload.get("original_email", ""),
+            original_code=payload.get("original_code", ""),
+            account=account,
+            key_code=form_values["key_code"],
+            duration_days=duration_days,
+            activated_at=activated_at,
+            selected_requester_id=selected_requester_id,
         )
-        if update_status == "missing":
+        if update_status == "missing_account":
             return await build_admin_control_response(
                 locale=locale,
                 base_path=base_path,
@@ -847,7 +890,7 @@ def create_web_app(service: BotService) -> FastAPI:
                 status_kind="error",
                 status_code=404,
             )
-        if update_status == "conflict":
+        if update_status == "conflict_account":
             return await build_admin_control_response(
                 locale=locale,
                 base_path=base_path,
@@ -857,13 +900,36 @@ def create_web_app(service: BotService) -> FastAPI:
                 status_kind="error",
                 status_code=409,
             )
+        if update_status == "missing_key":
+            return await build_admin_control_response(
+                locale=locale,
+                base_path=base_path,
+                service=service,
+                state=state,
+                status_message=web_text(locale, "admin_key_update_missing"),
+                status_kind="error",
+                status_code=404,
+            )
+        if update_status == "conflict_key":
+            return await build_admin_control_response(
+                locale=locale,
+                base_path=base_path,
+                service=service,
+                state=state,
+                status_message=web_text(locale, "admin_key_update_conflict"),
+                status_kind="error",
+                status_code=409,
+            )
 
+        selected_row_id = row_id
+        if selected_requester_id is not None:
+            selected_row_id = f"{selected_requester_id}|{normalize_key_code(form_values['key_code'])}"
         return await build_admin_control_response(
             locale=locale,
             base_path=base_path,
             service=service,
             state=AdminPageState(
-                selected_row_id=row_id,
+                selected_row_id=selected_row_id,
                 panel="details",
                 sort_key=sort_key,
                 sort_order=sort_order,
@@ -2137,12 +2203,13 @@ def render_admin_detail_panel(
       </div>"""
 
     if state.panel == "edit":
-        values = state.edit_values or account_to_form_values(row.account)
+        values = state.edit_values or admin_row_to_form_values(row)
         return f"""
       <form action="{html.escape(update_action, quote=True)}" method="post" class="stack">
         <input type="hidden" name="lang" value="{html.escape(locale, quote=True)}">
         <input type="hidden" name="row_id" value="{html.escape(row.row_id, quote=True)}">
         <input type="hidden" name="original_email" value="{html.escape(row.account.login_email, quote=True)}">
+        <input type="hidden" name="original_code" value="{html.escape(row.key.code, quote=True)}">
         <input type="hidden" name="sort" value="{html.escape(state.sort_key, quote=True)}">
         <input type="hidden" name="order" value="{html.escape(state.sort_order, quote=True)}">
         <input type="hidden" name="search" value="{html.escape(state.search_query, quote=True)}">
@@ -2158,6 +2225,9 @@ def render_admin_detail_panel(
           {render_account_input(locale, "recovery_password", values["recovery_password"])}
           {render_account_input(locale, "refresh_token", values["refresh_token"])}
           {render_account_input(locale, "client_id", values["client_id"])}
+          {render_account_input(locale, "key_code", values["key_code"])}
+          {render_account_input(locale, "duration_days", values["duration_days"], input_type="number", min_value="1", step="1")}
+          {render_account_input(locale, "activated_at", values["activated_at"], input_type="datetime-local")}
         </div>
         <div class="toolbar-actions">
           <button type="submit">{html.escape(web_text(locale, "admin_save_button"))}</button>
@@ -2245,11 +2315,18 @@ def render_account_input(
     value: str,
     *,
     input_type: str = "text",
+    min_value: str | None = None,
+    step: str | None = None,
 ) -> str:
+    extra_attrs = ""
+    if min_value is not None:
+        extra_attrs += f' min="{html.escape(min_value, quote=True)}"'
+    if step is not None:
+        extra_attrs += f' step="{html.escape(step, quote=True)}"'
     return f"""
           <label>
             {html.escape(web_text(locale, f"admin_field_{field_name}"))}
-            <input type="{html.escape(input_type, quote=True)}" name="{html.escape(field_name, quote=True)}" value="{html.escape(value, quote=True)}">
+            <input type="{html.escape(input_type, quote=True)}" name="{html.escape(field_name, quote=True)}" value="{html.escape(value, quote=True)}"{extra_attrs}>
           </label>"""
 
 
@@ -2509,7 +2586,7 @@ def build_admin_rows(
 ) -> list[AdminSubscriptionRow]:
     now = datetime.now(timezone.utc).date()
     rows: list[AdminSubscriptionRow] = []
-    for subscription in subscriptions:
+    for subscription in deduplicate_admin_subscriptions(subscriptions):
         expires_on = subscription.key.expires_at.astimezone(timezone.utc).date()
         days_left = max(0, (expires_on - now).days)
         rows.append(
@@ -2531,6 +2608,17 @@ def build_admin_rows(
 
 def build_admin_row_id(activation: UserKeyActivation, key: SubscriptionKey) -> str:
     return f"{activation.requester_id}|{key.code}"
+
+
+def deduplicate_admin_subscriptions(
+    subscriptions: list[ActivatedSubscription],
+) -> list[ActivatedSubscription]:
+    latest_by_key_code: dict[str, ActivatedSubscription] = {}
+    for subscription in subscriptions:
+        current = latest_by_key_code.get(subscription.key.code)
+        if current is None or admin_subscription_recency(subscription) > admin_subscription_recency(current):
+            latest_by_key_code[subscription.key.code] = subscription
+    return list(latest_by_key_code.values())
 
 
 def normalize_admin_sort_key(raw_value: str | None) -> str:
@@ -2565,6 +2653,15 @@ def admin_sort_value(row: AdminSubscriptionRow, sort_key: str):
     return (row.activation.activated_at, row.row_id)
 
 
+def admin_subscription_recency(subscription: ActivatedSubscription) -> tuple[datetime, datetime, str]:
+    activation = subscription.activation
+    return (
+        activation.activated_at,
+        activation.last_used_at,
+        activation.requester_id,
+    )
+
+
 def filter_admin_subscriptions(
     subscriptions: list[ActivatedSubscription],
     search_query: str,
@@ -2597,6 +2694,9 @@ def extract_account_form_values(payload: dict[str, str]) -> dict[str, str]:
         "recovery_password": payload.get("recovery_password", ""),
         "refresh_token": payload.get("refresh_token", ""),
         "client_id": payload.get("client_id", ""),
+        "key_code": payload.get("key_code", "").strip(),
+        "duration_days": payload.get("duration_days", "").strip(),
+        "activated_at": payload.get("activated_at", "").strip(),
     }
 
 
@@ -2609,7 +2709,20 @@ def account_to_form_values(account: EmailAccount) -> dict[str, str]:
         "recovery_password": account.recovery_password,
         "refresh_token": account.refresh_token,
         "client_id": account.client_id,
+        "key_code": "",
+        "duration_days": "",
+        "activated_at": "",
     }
+
+
+def admin_row_to_form_values(row: AdminSubscriptionRow) -> dict[str, str]:
+    if row.account is None:
+        raise ValueError("Account is required for edit form values")
+    values = account_to_form_values(row.account)
+    values["key_code"] = row.key.code
+    values["duration_days"] = str(row.key.duration_days)
+    values["activated_at"] = format_admin_datetime_input(row.activation.activated_at)
+    return values
 
 
 def build_account_from_form_values(values: dict[str, str]) -> EmailAccount:
@@ -2653,3 +2766,27 @@ def build_account_from_form_values(values: dict[str, str]) -> EmailAccount:
         client_id=client_id,
         raw=raw,
     )
+
+
+def parse_admin_row_id(row_id: str | None) -> tuple[str | None, str | None]:
+    if not row_id:
+        return None, None
+    requester_id, separator, code = row_id.partition("|")
+    if not separator:
+        return None, None
+    return requester_id or None, normalize_key_code(code)
+
+
+def format_admin_datetime_input(value: datetime) -> str:
+    normalized = value.astimezone(timezone.utc)
+    return normalized.strftime("%Y-%m-%dT%H:%M")
+
+
+def parse_admin_datetime_input(raw_value: str) -> datetime:
+    candidate = raw_value.strip()
+    if not candidate:
+        raise ValueError("Activation date is required")
+    parsed = datetime.fromisoformat(candidate)
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)

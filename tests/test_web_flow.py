@@ -1,6 +1,7 @@
 import asyncio
 import tempfile
 import unittest
+from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
@@ -279,11 +280,15 @@ class AdminControlTests(BaseWebFlowTestCase):
                 "lang": "ru",
                 "row_id": f"web:{self.client.cookies[WEB_USER_COOKIE_NAME]}|{self.key.code}",
                 "original_email": "shared@example.com",
+                "original_code": self.key.code,
                 "raw_account": (
                     "shared-updated@example.com:new-pass:"
                     "recovery-updated@example.com:new-recovery-pass:"
                     "new-refresh-token:new-client-id"
                 ),
+                "key_code": "UPDATEDKEY12345",
+                "duration_days": "60",
+                "activated_at": "2026-02-10T14:30",
             },
         )
         self.assertEqual(update_response.status_code, 200)
@@ -298,10 +303,34 @@ class AdminControlTests(BaseWebFlowTestCase):
         self.assertEqual(updated_account.refresh_token, "new-refresh-token")
         self.assertEqual(updated_account.client_id, "new-client-id")
         self.assertIn("shared-updated@example.com:new-pass", updated_account.raw)
-        updated_key = await self.storage.get_subscription_key(self.key.code)
+        updated_key = await self.storage.get_subscription_key("UPDATEDKEY12345")
         self.assertIsNotNone(updated_key)
         assert updated_key is not None
         self.assertEqual(updated_key.email_address, "shared-updated@example.com")
+        self.assertEqual(updated_key.duration_days, 60)
+        self.assertEqual(
+            updated_key.created_at,
+            datetime(2026, 2, 10, 14, 30, tzinfo=timezone.utc),
+        )
+        self.assertEqual(
+            updated_key.expires_at,
+            datetime.combine(
+                datetime(2026, 2, 10, 14, 30, tzinfo=timezone.utc).date() + timedelta(days=60),
+                time.max,
+                tzinfo=timezone.utc,
+            ),
+        )
+        self.assertIsNone(await self.storage.get_subscription_key(self.key.code))
+        updated_activation = await self.storage.get_user_activation(
+            f"web:{self.client.cookies[WEB_USER_COOKIE_NAME]}",
+        )
+        self.assertIsNotNone(updated_activation)
+        assert updated_activation is not None
+        self.assertEqual(updated_activation.code, "UPDATEDKEY12345")
+        self.assertEqual(
+            updated_activation.activated_at,
+            datetime(2026, 2, 10, 14, 30, tzinfo=timezone.utc),
+        )
 
     async def test_admin_control_can_create_key_from_add_panel(self) -> None:
         login_response = await self.login_admin(locale="ru")
@@ -327,6 +356,71 @@ class AdminControlTests(BaseWebFlowTestCase):
         self.assertIn('name="duration_days"', response.text)
         self.assertIn(created_keys[0].code, response.text)
         self.assertIn("shared@example.com", response.text)
+
+    async def test_admin_control_deduplicates_rows_for_same_key(self) -> None:
+        first_status, _ = await self.service.activate_requester_subscription_code(
+            requester_id="web:one",
+            user_id=0,
+            chat_id=0,
+            username="web",
+            full_name="web:one",
+            code=self.key.code,
+        )
+        second_status, _ = await self.service.activate_requester_subscription_code(
+            requester_id="web:two",
+            user_id=0,
+            chat_id=0,
+            username="web",
+            full_name="web:two",
+            code=self.key.code,
+        )
+        third_status, _ = await self.service.activate_requester_subscription_code(
+            requester_id="tg:303",
+            user_id=303,
+            chat_id=303,
+            username="user303",
+            full_name="User 303",
+            code=self.key.code,
+        )
+        self.assertEqual(first_status, "activated")
+        self.assertEqual(second_status, "activated")
+        self.assertEqual(third_status, "activated")
+
+        status, extra_keys = await self.service.add_subscription_keys(
+            count=1,
+            duration_days=10,
+            email_address="shared@example.com",
+        )
+        self.assertEqual(status, "created")
+        self.assertIsNotNone(extra_keys)
+        assert extra_keys is not None
+
+        fourth_status, _ = await self.service.activate_requester_subscription_code(
+            requester_id="web:three",
+            user_id=0,
+            chat_id=0,
+            username="web",
+            full_name="web:three",
+            code=extra_keys[0].code,
+        )
+        self.assertEqual(fourth_status, "activated")
+
+        subscriptions = await self.service.list_activated_subscriptions()
+        self.assertEqual(
+            sum(1 for item in subscriptions if item.key.code == self.key.code),
+            3,
+        )
+
+        login_response = await self.login_admin(locale="en")
+        self.assertEqual(login_response.status_code, 303)
+
+        page = await self.client.get(
+            self.route("/admin_control"),
+            params={"lang": "en"},
+        )
+        self.assertEqual(page.status_code, 200)
+        self.assertEqual(page.text.count(f'<td class="mono">{self.key.code}</td>'), 1)
+        self.assertEqual(page.text.count(f'<td class="mono">{extra_keys[0].code}</td>'), 1)
 
     async def test_admin_control_delete_requires_confirmation_and_removes_account(self) -> None:
         await self.activate_key(locale="ru")
