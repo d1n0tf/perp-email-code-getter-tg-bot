@@ -446,7 +446,7 @@ class AdminControlTests(BaseWebFlowTestCase):
         )
         self.assertEqual(confirm_page.status_code, 200)
         self.assertIn("Подтвердить удаление", confirm_page.text)
-        self.assertIn("Привязанные ключи останутся", confirm_page.text)
+        self.assertIn("связанные ключи", confirm_page.text)
 
         delete_response = await self.client.post(
             self.route("/admin_control/accounts/delete"),
@@ -459,9 +459,33 @@ class AdminControlTests(BaseWebFlowTestCase):
         self.assertEqual(delete_response.status_code, 200)
         self.assertIn("Аккаунт удалён", delete_response.text)
         self.assertIsNone(await self.storage.get_account("shared@example.com"))
+        self.assertIsNone(await self.storage.get_subscription_key(self.key.code))
+        self.assertIsNone(
+            await self.storage.get_user_activation(
+                f"web:{self.client.cookies[WEB_USER_COOKIE_NAME]}",
+            )
+        )
         self.assertNotIn("Аккаунт для этой почты не найден", delete_response.text)
         self.assertNotIn(f'<td class="mono">{self.key.code}</td>', delete_response.text)
         self.assertNotIn('<td class="mono">shared@example.com</td>', delete_response.text)
+
+        readd_response = await self.client.post(
+            self.route("/admin_control/accounts/add"),
+            data={
+                "lang": "ru",
+                "raw_account": (
+                    "shared-reused@example.com:pass-2:recovery-reused@example.com:"
+                    "recovery-pass-2:refresh-reused:client-reused"
+                ),
+                "duration_days": "15",
+                "key_code": self.key.code,
+            },
+        )
+        self.assertEqual(readd_response.status_code, 200)
+        reused_key = await self.storage.get_subscription_key(self.key.code)
+        self.assertIsNotNone(reused_key)
+        assert reused_key is not None
+        self.assertEqual(reused_key.email_address, "shared-reused@example.com")
 
     async def test_admin_control_sorts_rows_by_selected_column(self) -> None:
         await self.storage.upsert_account(

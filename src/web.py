@@ -121,8 +121,7 @@ WEB_TEXTS = {
         "admin_key_update_conflict": "Ключ с таким значением уже существует.",
         "admin_subscription_invalid": "Проверьте ключ, срок подписки и дату активации.",
         "admin_delete_confirm": (
-            "Удалить аккаунт `{email}`? Привязанные ключи останутся, "
-            "но перестанут выдавать данные аккаунта."
+            "Удалить аккаунт `{email}`? Все связанные ключи и их активации тоже будут удалены."
         ),
         "admin_delete_confirm_button": "Подтвердить удаление",
         "admin_delete_missing": "Аккаунт уже удалён.",
@@ -217,8 +216,7 @@ WEB_TEXTS = {
         "admin_key_update_conflict": "A key with this value already exists.",
         "admin_subscription_invalid": "Check the key, subscription term, and activation date.",
         "admin_delete_confirm": (
-            "Delete account `{email}`? Linked keys will stay in place, "
-            "but they will stop returning account data."
+            "Delete account `{email}`? All linked keys and their activations will be deleted too."
         ),
         "admin_delete_confirm_button": "Confirm deletion",
         "admin_delete_missing": "The account has already been deleted.",

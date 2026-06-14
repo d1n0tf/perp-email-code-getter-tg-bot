@@ -482,12 +482,48 @@ class JsonStorage:
 
     async def delete_account(self, email_address: str) -> bool:
         normalized_email = normalize_email(email_address)
-        async with self._email_lock:
+        async with self._email_lock, self._key_lock, self._activation_lock:
             data = self._load_json(self.email_store_path, default={}, strict=True)
             removed = data.pop(normalized_email, None)
             if removed is None:
                 return False
+
+            key_data = self._load_json(
+                self.subscription_key_store_path,
+                default={},
+                strict=True,
+            )
+            removed_codes: set[str] = set()
+            filtered_key_data: dict[str, Any] = {}
+            for code, raw_value in key_data.items():
+                if not isinstance(raw_value, dict):
+                    filtered_key_data[code] = raw_value
+                    continue
+                try:
+                    key = SubscriptionKey.from_dict(raw_value)
+                except (KeyError, TypeError, ValueError):
+                    filtered_key_data[code] = raw_value
+                    continue
+                if key.email_address == normalized_email:
+                    removed_codes.add(key.code)
+                    continue
+                filtered_key_data[code] = raw_value
+
+            activation_data = self._load_json(
+                self.activated_key_store_path,
+                default={},
+                strict=True,
+            )
+            filtered_activation_data = {
+                requester_id: record
+                for requester_id, record in activation_data.items()
+                if not isinstance(record, dict)
+                or normalize_key_code(str(record.get("code") or "")) not in removed_codes
+            }
+
             self._write_json(self.email_store_path, data)
+            self._write_json(self.subscription_key_store_path, filtered_key_data)
+            self._write_json(self.activated_key_store_path, filtered_activation_data)
             return True
 
     async def reserve_email(
