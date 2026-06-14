@@ -124,6 +124,7 @@ class WebFlowTests(BaseWebFlowTestCase):
         self.assertIn("Seller code", response.text)
         self.assertNotIn("example@outlook.com", response.text)
         self.assertNotIn('type="email"', response.text)
+        self.assertIn("__perpLiveNavEnabled", response.text)
 
     async def test_activate_code_and_request_login_code_successfully(self) -> None:
         activate_response = await self.activate_key(locale="en")
@@ -231,6 +232,7 @@ class AdminControlTests(BaseWebFlowTestCase):
         self.assertIn("Вход в Admin Control", response.text)
         self.assertIn("Пароль", response.text)
         self.assertNotIn("Subscription term", response.text)
+        self.assertIn("__perpLiveNavEnabled", response.text)
 
     async def test_admin_control_shows_subscription_rows_and_account_details(self) -> None:
         await self.activate_key(locale="ru")
@@ -277,12 +279,11 @@ class AdminControlTests(BaseWebFlowTestCase):
                 "lang": "ru",
                 "row_id": f"web:{self.client.cookies[WEB_USER_COOKIE_NAME]}|{self.key.code}",
                 "original_email": "shared@example.com",
-                "login_email": "shared-updated@example.com",
-                "login_password": "new-pass",
-                "recovery_email": "recovery-updated@example.com",
-                "recovery_password": "new-recovery-pass",
-                "refresh_token": "new-refresh-token",
-                "client_id": "new-client-id",
+                "raw_account": (
+                    "shared-updated@example.com:new-pass:"
+                    "recovery-updated@example.com:new-recovery-pass:"
+                    "new-refresh-token:new-client-id"
+                ),
             },
         )
         self.assertEqual(update_response.status_code, 200)
@@ -290,10 +291,42 @@ class AdminControlTests(BaseWebFlowTestCase):
         self.assertIsNone(await self.storage.get_account("shared@example.com"))
         updated_account = await self.storage.get_account("shared-updated@example.com")
         self.assertIsNotNone(updated_account)
+        assert updated_account is not None
+        self.assertEqual(updated_account.login_password, "new-pass")
+        self.assertEqual(updated_account.recovery_email, "recovery-updated@example.com")
+        self.assertEqual(updated_account.recovery_password, "new-recovery-pass")
+        self.assertEqual(updated_account.refresh_token, "new-refresh-token")
+        self.assertEqual(updated_account.client_id, "new-client-id")
+        self.assertIn("shared-updated@example.com:new-pass", updated_account.raw)
         updated_key = await self.storage.get_subscription_key(self.key.code)
         self.assertIsNotNone(updated_key)
         assert updated_key is not None
         self.assertEqual(updated_key.email_address, "shared-updated@example.com")
+
+    async def test_admin_control_can_create_key_from_add_panel(self) -> None:
+        login_response = await self.login_admin(locale="ru")
+        self.assertEqual(login_response.status_code, 303)
+
+        before_keys = await self.storage.list_subscription_keys()
+        response = await self.client.post(
+            self.route("/admin_control/keys/add"),
+            data={
+                "lang": "ru",
+                "key_email": "shared@example.com",
+                "duration_days": "45",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        after_keys = await self.storage.list_subscription_keys()
+        self.assertEqual(len(after_keys), len(before_keys) + 1)
+        created_keys = [key for key in after_keys if key.code not in {item.code for item in before_keys}]
+        self.assertEqual(len(created_keys), 1)
+        self.assertEqual(created_keys[0].email_address, "shared@example.com")
+        self.assertEqual(created_keys[0].duration_days, 45)
+        self.assertIn('action="/perp-code-getter/admin_control/keys/add"', response.text)
+        self.assertIn('name="duration_days"', response.text)
+        self.assertIn(created_keys[0].code, response.text)
+        self.assertIn("shared@example.com", response.text)
 
     async def test_admin_control_delete_requires_confirmation_and_removes_account(self) -> None:
         await self.activate_key(locale="ru")
@@ -320,6 +353,126 @@ class AdminControlTests(BaseWebFlowTestCase):
         self.assertEqual(delete_response.status_code, 200)
         self.assertIn("Аккаунт удалён", delete_response.text)
         self.assertIsNone(await self.storage.get_account("shared@example.com"))
+
+    async def test_admin_control_sorts_rows_by_selected_column(self) -> None:
+        await self.storage.upsert_account(
+            EmailAccount(
+                login_email="alpha@example.com",
+                login_password="pass-2",
+                recovery_email="recovery-alpha@example.com",
+                recovery_password="recovery-pass-2",
+                refresh_token="refresh-token-2",
+                client_id="client-id-2",
+                raw=(
+                    "alpha@example.com:pass-2:recovery-alpha@example.com:"
+                    "recovery-pass-2:refresh-token-2:client-id-2"
+                ),
+            )
+        )
+        status, extra_keys = await self.service.add_subscription_keys(
+            count=1,
+            duration_days=10,
+            email_address="alpha@example.com",
+        )
+        self.assertEqual(status, "created")
+        self.assertIsNotNone(extra_keys)
+        assert extra_keys is not None
+
+        first_status, _ = await self.service.activate_requester_subscription_code(
+            requester_id="web:one",
+            user_id=0,
+            chat_id=0,
+            username="web",
+            full_name="web:one",
+            code=self.key.code,
+        )
+        second_status, _ = await self.service.activate_requester_subscription_code(
+            requester_id="web:two",
+            user_id=0,
+            chat_id=0,
+            username="web",
+            full_name="web:two",
+            code=extra_keys[0].code,
+        )
+        self.assertEqual(first_status, "activated")
+        self.assertEqual(second_status, "activated")
+
+        login_response = await self.login_admin(locale="en")
+        self.assertEqual(login_response.status_code, 303)
+
+        sorted_page = await self.client.get(
+            self.route("/admin_control"),
+            params={"lang": "en", "sort": "email", "order": "asc"},
+        )
+        self.assertEqual(sorted_page.status_code, 200)
+        self.assertLess(
+            sorted_page.text.find("alpha@example.com"),
+            sorted_page.text.find("shared@example.com"),
+        )
+        self.assertIn("sort=email&amp;order=desc", sorted_page.text)
+
+    async def test_admin_control_filters_rows_by_key_or_email_search(self) -> None:
+        await self.storage.upsert_account(
+            EmailAccount(
+                login_email="alpha@example.com",
+                login_password="pass-2",
+                recovery_email="recovery-alpha@example.com",
+                recovery_password="recovery-pass-2",
+                refresh_token="refresh-token-2",
+                client_id="client-id-2",
+                raw=(
+                    "alpha@example.com:pass-2:recovery-alpha@example.com:"
+                    "recovery-pass-2:refresh-token-2:client-id-2"
+                ),
+            )
+        )
+        status, extra_keys = await self.service.add_subscription_keys(
+            count=1,
+            duration_days=10,
+            email_address="alpha@example.com",
+        )
+        self.assertEqual(status, "created")
+        self.assertIsNotNone(extra_keys)
+        assert extra_keys is not None
+
+        first_status, _ = await self.service.activate_requester_subscription_code(
+            requester_id="web:one",
+            user_id=0,
+            chat_id=0,
+            username="web",
+            full_name="web:one",
+            code=self.key.code,
+        )
+        second_status, _ = await self.service.activate_requester_subscription_code(
+            requester_id="web:two",
+            user_id=0,
+            chat_id=0,
+            username="web",
+            full_name="web:two",
+            code=extra_keys[0].code,
+        )
+        self.assertEqual(first_status, "activated")
+        self.assertEqual(second_status, "activated")
+
+        login_response = await self.login_admin(locale="en")
+        self.assertEqual(login_response.status_code, 303)
+
+        search_page = await self.client.get(
+            self.route("/admin_control"),
+            params={"lang": "en", "search": "alpha@example.com"},
+        )
+        self.assertEqual(search_page.status_code, 200)
+        self.assertIn("alpha@example.com", search_page.text)
+        self.assertNotIn("shared@example.com", search_page.text)
+        self.assertIn("search=alpha%40example.com", search_page.text)
+
+        key_search_page = await self.client.get(
+            self.route("/admin_control"),
+            params={"lang": "en", "search": extra_keys[0].code},
+        )
+        self.assertEqual(key_search_page.status_code, 200)
+        self.assertIn(extra_keys[0].code, key_search_page.text)
+        self.assertNotIn(self.key.code, key_search_page.text)
 
 
 class ImmediateWebCodeService(BotService):

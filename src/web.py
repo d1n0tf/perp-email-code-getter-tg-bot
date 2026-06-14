@@ -25,8 +25,17 @@ ADMIN_CONTROL_PATH = "/admin_control"
 ADMIN_CONTROL_LOGIN_PATH = f"{ADMIN_CONTROL_PATH}/login"
 ADMIN_CONTROL_LOGOUT_PATH = f"{ADMIN_CONTROL_PATH}/logout"
 ADMIN_CONTROL_ADD_PATH = f"{ADMIN_CONTROL_PATH}/accounts/add"
+ADMIN_CONTROL_ADD_KEY_PATH = f"{ADMIN_CONTROL_PATH}/keys/add"
 ADMIN_CONTROL_UPDATE_PATH = f"{ADMIN_CONTROL_PATH}/accounts/update"
 ADMIN_CONTROL_DELETE_PATH = f"{ADMIN_CONTROL_PATH}/accounts/delete"
+ADMIN_SORT_KEYS = {
+    "duration": "duration",
+    "activated": "activated",
+    "expires": "expires",
+    "days_left": "days_left",
+    "key": "key",
+    "email": "email",
+}
 
 WEB_TEXTS = {
     "ru": {
@@ -71,7 +80,7 @@ WEB_TEXTS = {
         "admin_add_submit": "Добавить",
         "admin_cancel_button": "Отмена",
         "admin_table_empty": "Активированных подписок пока нет.",
-        "admin_col_id": "ID",
+        "admin_col_id": "№",
         "admin_col_duration": "Срок подписки",
         "admin_col_activated": "Дата активации",
         "admin_col_expires": "Дата окончания",
@@ -107,6 +116,19 @@ WEB_TEXTS = {
         "admin_delete_confirm_button": "Подтвердить удаление",
         "admin_delete_missing": "Аккаунт уже удалён.",
         "admin_id_web": "web",
+        "admin_search_label": "Поиск",
+        "admin_search_placeholder": "Ключ или почта",
+        "admin_search_button": "Найти",
+        "admin_search_reset_button": "Сбросить",
+        "admin_table_no_results": "По вашему запросу ничего не найдено.",
+        "admin_edit_raw_label": "Полная строка /add",
+        "admin_edit_raw_hint": "Если заполнить это поле, аккаунт обновится целиком из одной строки. Если оставить пустым, используются поля ниже.",
+        "admin_add_key_heading": "Создать ключ",
+        "admin_add_key_email_label": "Почта аккаунта",
+        "admin_add_key_duration_label": "Срок подписки (дней)",
+        "admin_add_key_submit": "Создать ключ",
+        "admin_add_key_invalid": "Срок подписки должен быть положительным числом.",
+        "admin_add_key_success": "Ключ `{code}` создан для `{email}` на `{duration_days}` дн. до `{end_date}`.",
     },
     "en": {
         "title": "Perplexity Access",
@@ -148,7 +170,7 @@ WEB_TEXTS = {
         "admin_add_submit": "Add",
         "admin_cancel_button": "Cancel",
         "admin_table_empty": "There are no activated subscriptions yet.",
-        "admin_col_id": "ID",
+        "admin_col_id": "#",
         "admin_col_duration": "Subscription term",
         "admin_col_activated": "Activated at",
         "admin_col_expires": "End date",
@@ -184,6 +206,19 @@ WEB_TEXTS = {
         "admin_delete_confirm_button": "Confirm deletion",
         "admin_delete_missing": "The account has already been deleted.",
         "admin_id_web": "web",
+        "admin_search_label": "Search",
+        "admin_search_placeholder": "Key or email",
+        "admin_search_button": "Search",
+        "admin_search_reset_button": "Reset",
+        "admin_table_no_results": "No rows matched your search.",
+        "admin_edit_raw_label": "Full /add string",
+        "admin_edit_raw_hint": "If this field is filled, the account will be updated from the single string. If left empty, the fields below are used.",
+        "admin_add_key_heading": "Create key",
+        "admin_add_key_email_label": "Account email",
+        "admin_add_key_duration_label": "Subscription term (days)",
+        "admin_add_key_submit": "Create key",
+        "admin_add_key_invalid": "Subscription term must be a positive integer.",
+        "admin_add_key_success": "Key `{code}` was created for `{email}` for `{duration_days}` days until `{end_date}`.",
     },
 }
 
@@ -195,12 +230,17 @@ class AdminPageState:
     show_add_form: bool = False
     add_value: str = ""
     edit_values: dict[str, str] | None = None
+    sort_key: str = "activated"
+    sort_order: str = "desc"
+    search_query: str = ""
+    add_key_email: str = ""
+    add_key_duration: str = ""
 
 
 @dataclass(slots=True)
 class AdminSubscriptionRow:
     row_id: str
-    display_id: str
+    display_number: int
     activation: UserKeyActivation
     key: SubscriptionKey
     account: EmailAccount | None
@@ -623,7 +663,18 @@ def create_web_app(service: BotService) -> FastAPI:
             return auth_response
 
         raw_value = payload.get("raw_account", "").strip()
-        state = AdminPageState(show_add_form=True, add_value=raw_value)
+        sort_key = normalize_admin_sort_key(payload.get("sort"))
+        sort_order = normalize_admin_sort_order(payload.get("order"))
+        search_query = normalize_admin_search_query(payload.get("search"))
+        state = AdminPageState(
+            show_add_form=True,
+            add_value=raw_value,
+            sort_key=sort_key,
+            sort_order=sort_order,
+            search_query=search_query,
+            add_key_email=payload.get("key_email", "").strip(),
+            add_key_duration=payload.get("duration_days", "").strip(),
+        )
         try:
             _, existed = await service.add_account(raw_value)
         except ValueError:
@@ -641,10 +692,104 @@ def create_web_app(service: BotService) -> FastAPI:
             locale=locale,
             base_path=base_path,
             service=service,
-            state=AdminPageState(),
+            state=AdminPageState(
+                show_add_form=True,
+                sort_key=sort_key,
+                sort_order=sort_order,
+                search_query=search_query,
+            ),
             status_message=web_text(
                 locale,
                 "admin_account_exists" if existed else "admin_account_added",
+            ),
+            status_kind="success",
+        )
+
+    async def admin_add_key(request: Request) -> HTMLResponse:
+        payload = await read_form_body(request)
+        locale = resolve_locale(payload.get("lang"))
+        auth_response = build_admin_auth_error_response(
+            request=request,
+            locale=locale,
+            base_path=base_path,
+            service=service,
+        )
+        if auth_response is not None:
+            return auth_response
+
+        sort_key = normalize_admin_sort_key(payload.get("sort"))
+        sort_order = normalize_admin_sort_order(payload.get("order"))
+        search_query = normalize_admin_search_query(payload.get("search"))
+        key_email = payload.get("key_email", "").strip()
+        duration_raw = payload.get("duration_days", "").strip()
+        state = AdminPageState(
+            show_add_form=True,
+            sort_key=sort_key,
+            sort_order=sort_order,
+            search_query=search_query,
+            add_key_email=key_email,
+            add_key_duration=duration_raw,
+        )
+
+        try:
+            duration_days = int(duration_raw)
+        except ValueError:
+            duration_days = 0
+        if duration_days <= 0:
+            return await build_admin_control_response(
+                locale=locale,
+                base_path=base_path,
+                service=service,
+                state=state,
+                status_message=web_text(locale, "admin_add_key_invalid"),
+                status_kind="error",
+                status_code=400,
+            )
+
+        status, keys = await service.add_subscription_keys(
+            count=1,
+            duration_days=duration_days,
+            email_address=key_email,
+        )
+        if status == "email_missing":
+            return await build_admin_control_response(
+                locale=locale,
+                base_path=base_path,
+                service=service,
+                state=state,
+                status_message=translate(locale, "addkey_email_missing", email=normalize_email(key_email)),
+                status_kind="error",
+                status_code=404,
+            )
+        if not keys:
+            return await build_admin_control_response(
+                locale=locale,
+                base_path=base_path,
+                service=service,
+                state=state,
+                status_message=translate(locale, "code_failed", email=normalize_email(key_email)),
+                status_kind="error",
+                status_code=500,
+            )
+
+        key = keys[0]
+        return await build_admin_control_response(
+            locale=locale,
+            base_path=base_path,
+            service=service,
+            state=AdminPageState(
+                show_add_form=True,
+                sort_key=sort_key,
+                sort_order=sort_order,
+                search_query=search_query,
+            ),
+            status_message=web_text(
+                locale,
+                "admin_add_key_success",
+                code=key.code,
+                email=key.email_address,
+                duration_days=str(key.duration_days),
+                end_date=service.format_date(key.expires_at),
             ),
             status_kind="success",
         )
@@ -662,11 +807,17 @@ def create_web_app(service: BotService) -> FastAPI:
             return auth_response
 
         row_id = payload.get("row_id", "").strip() or None
+        sort_key = normalize_admin_sort_key(payload.get("sort"))
+        sort_order = normalize_admin_sort_order(payload.get("order"))
+        search_query = normalize_admin_search_query(payload.get("search"))
         form_values = extract_account_form_values(payload)
         state = AdminPageState(
             selected_row_id=row_id,
             panel="edit",
             edit_values=form_values,
+            sort_key=sort_key,
+            sort_order=sort_order,
+            search_query=search_query,
         )
 
         try:
@@ -711,7 +862,13 @@ def create_web_app(service: BotService) -> FastAPI:
             locale=locale,
             base_path=base_path,
             service=service,
-            state=AdminPageState(selected_row_id=row_id, panel="details"),
+            state=AdminPageState(
+                selected_row_id=row_id,
+                panel="details",
+                sort_key=sort_key,
+                sort_order=sort_order,
+                search_query=search_query,
+            ),
             status_message=web_text(locale, "admin_account_updated"),
             status_kind="success",
         )
@@ -729,12 +886,21 @@ def create_web_app(service: BotService) -> FastAPI:
             return auth_response
 
         row_id = payload.get("row_id", "").strip() or None
+        sort_key = normalize_admin_sort_key(payload.get("sort"))
+        sort_order = normalize_admin_sort_order(payload.get("order"))
+        search_query = normalize_admin_search_query(payload.get("search"))
         deleted = await service.delete_account(payload.get("email", ""))
         return await build_admin_control_response(
             locale=locale,
             base_path=base_path,
             service=service,
-            state=AdminPageState(selected_row_id=row_id, panel="details"),
+            state=AdminPageState(
+                selected_row_id=row_id,
+                panel="details",
+                sort_key=sort_key,
+                sort_order=sort_order,
+                search_query=search_query,
+            ),
             status_message=web_text(
                 locale,
                 "admin_account_deleted" if deleted else "admin_delete_missing",
@@ -819,6 +985,14 @@ def create_web_app(service: BotService) -> FastAPI:
         app.add_api_route(
             route_path,
             admin_add_account,
+            methods=["POST"],
+            response_class=HTMLResponse,
+            response_model=None,
+        )
+    for route_path in route_variants(ADMIN_CONTROL_ADD_KEY_PATH, base_path):
+        app.add_api_route(
+            route_path,
+            admin_add_key,
             methods=["POST"],
             response_class=HTMLResponse,
             response_model=None,
@@ -991,6 +1165,7 @@ def render_page(
     {render_status_block(status_message, status_kind)}
     {content_block}
   </main>
+  {render_live_navigation_script()}
 </body>
 </html>"""
 
@@ -1216,6 +1391,7 @@ def render_wait_page(
 
     pollStatus();
   </script>
+  {render_live_navigation_script()}
 </body>
 </html>"""
 
@@ -1231,7 +1407,11 @@ async def build_admin_control_response(
     status_code: int = 200,
 ) -> HTMLResponse:
     subscriptions = await service.list_activated_subscriptions()
-    rows = build_admin_rows(subscriptions, locale=locale)
+    rows = build_admin_rows(
+        filter_admin_subscriptions(subscriptions, state.search_query),
+        sort_key=state.sort_key,
+        sort_order=state.sort_order,
+    )
     return HTMLResponse(
         render_admin_control_page(
             locale=locale,
@@ -1383,6 +1563,7 @@ def render_admin_login_page(
       <p><a class="subtle-link" href="{html.escape(admin_home, quote=True)}">{html.escape(web_text(locale, "admin_title"))}</a></p>
     </section>
   </main>
+  {render_live_navigation_script()}
 </body>
 </html>"""
 
@@ -1400,11 +1581,55 @@ def render_admin_control_page(
     safe_locale = html.escape(locale, quote=True)
     admin_home = build_web_path(base_path, ADMIN_CONTROL_PATH)
     add_action = build_web_path(base_path, ADMIN_CONTROL_ADD_PATH)
+    add_key_action = build_web_path(base_path, ADMIN_CONTROL_ADD_KEY_PATH)
     update_action = build_web_path(base_path, ADMIN_CONTROL_UPDATE_PATH)
     delete_action = build_web_path(base_path, ADMIN_CONTROL_DELETE_PATH)
     logout_action = build_web_path(base_path, ADMIN_CONTROL_LOGOUT_PATH)
-    lang_ru_path = build_query_url(admin_home, {"lang": "ru"})
-    lang_en_path = build_query_url(admin_home, {"lang": "en"})
+    lang_ru_path = build_query_url(
+        admin_home,
+        {
+            "lang": "ru",
+            "sort": state.sort_key,
+            "order": state.sort_order,
+            "search": state.search_query,
+        },
+    )
+    lang_en_path = build_query_url(
+        admin_home,
+        {
+            "lang": "en",
+            "sort": state.sort_key,
+            "order": state.sort_order,
+            "search": state.search_query,
+        },
+    )
+    reset_url = build_query_url(
+        admin_home,
+        {
+            "lang": locale,
+            "sort": state.sort_key,
+            "order": state.sort_order,
+            "search": state.search_query,
+        },
+    )
+    add_url = build_query_url(
+        admin_home,
+        {
+            "lang": locale,
+            "sort": state.sort_key,
+            "order": state.sort_order,
+            "search": state.search_query,
+            "add": "1",
+        },
+    )
+    clear_search_url = build_query_url(
+        admin_home,
+        {
+            "lang": locale,
+            "sort": state.sort_key,
+            "order": state.sort_order,
+        },
+    )
 
     add_section = ""
     if state.show_add_form:
@@ -1417,7 +1642,32 @@ def render_admin_control_page(
         <textarea id="raw_account" name="raw_account" rows="3" placeholder="{html.escape(web_text(locale, "admin_add_placeholder"), quote=True)}">{html.escape(state.add_value)}</textarea>
         <div class="toolbar-actions">
           <button type="submit">{html.escape(web_text(locale, "admin_add_submit"))}</button>
-          <a class="button ghost" href="{html.escape(build_query_url(admin_home, {"lang": locale}), quote=True)}">{html.escape(web_text(locale, "admin_cancel_button"))}</a>
+          <input type="hidden" name="sort" value="{html.escape(state.sort_key, quote=True)}">
+          <input type="hidden" name="order" value="{html.escape(state.sort_order, quote=True)}">
+          <input type="hidden" name="search" value="{html.escape(state.search_query, quote=True)}">
+          <a class="button ghost" href="{html.escape(reset_url, quote=True)}">{html.escape(web_text(locale, "admin_cancel_button"))}</a>
+        </div>
+      </form>
+      <hr class="section-divider">
+      <form action="{html.escape(add_key_action, quote=True)}" method="post" class="stack">
+        <input type="hidden" name="lang" value="{safe_locale}">
+        <input type="hidden" name="sort" value="{html.escape(state.sort_key, quote=True)}">
+        <input type="hidden" name="order" value="{html.escape(state.sort_order, quote=True)}">
+        <input type="hidden" name="search" value="{html.escape(state.search_query, quote=True)}">
+        <h2>{html.escape(web_text(locale, "admin_add_key_heading"))}</h2>
+        <div class="form-grid">
+          <label>
+            {html.escape(web_text(locale, "admin_add_key_email_label"))}
+            <input type="email" name="key_email" value="{html.escape(state.add_key_email, quote=True)}">
+          </label>
+          <label>
+            {html.escape(web_text(locale, "admin_add_key_duration_label"))}
+            <input type="number" name="duration_days" min="1" step="1" value="{html.escape(state.add_key_duration, quote=True)}">
+          </label>
+        </div>
+        <div class="toolbar-actions">
+          <button type="submit">{html.escape(web_text(locale, "admin_add_key_submit"))}</button>
+          <a class="button ghost" href="{html.escape(reset_url, quote=True)}">{html.escape(web_text(locale, "admin_cancel_button"))}</a>
         </div>
       </form>
     </section>"""
@@ -1435,9 +1685,10 @@ def render_admin_control_page(
             for row in rows
         )
     else:
+        empty_text_key = "admin_table_no_results" if state.search_query else "admin_table_empty"
         table_rows = f"""
           <tr>
-            <td colspan="8" class="empty">{html.escape(web_text(locale, "admin_table_empty"))}</td>
+            <td colspan="8" class="empty">{html.escape(web_text(locale, empty_text_key))}</td>
           </tr>"""
 
     return f"""<!DOCTYPE html>
@@ -1449,7 +1700,7 @@ def render_admin_control_page(
   <style>
     {common_base_styles()}
     main {{
-      max-width: 1440px;
+      max-width: 1760px;
       margin: 24px auto 40px;
       padding: 0 16px;
     }}
@@ -1502,6 +1753,24 @@ def render_admin_control_page(
     .toolbar-actions form {{
       margin: 0;
     }}
+    .section-divider {{
+      margin: 18px 0;
+      border: 0;
+      border-top: 1px solid #e2e8f0;
+    }}
+    .search-form {{
+      display: flex;
+      gap: 10px;
+      align-items: end;
+      flex-wrap: wrap;
+    }}
+    .search-form label {{
+      display: grid;
+      gap: 6px;
+      min-width: min(360px, 100%);
+      font-weight: 700;
+      font-size: 14px;
+    }}
     .button,
     button {{
       display: inline-flex;
@@ -1551,6 +1820,14 @@ def render_admin_control_page(
       background: #f8fafc;
       position: sticky;
       top: 0;
+    }}
+    .sort-link {{
+      color: inherit;
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
     }}
     tbody tr:hover > td {{
       background: #fbfdff;
@@ -1666,8 +1943,21 @@ def render_admin_control_page(
     {render_status_block(status_message, status_kind)}
     <section class="toolbar panel">
       <div class="toolbar-actions">
-        <a class="button" href="{html.escape(build_query_url(admin_home, {"lang": locale, "add": "1"}), quote=True)}">{html.escape(web_text(locale, "admin_add_button"))}</a>
+        <a class="button" href="{html.escape(add_url, quote=True)}">{html.escape(web_text(locale, "admin_add_button"))}</a>
       </div>
+      <form action="{html.escape(admin_home, quote=True)}" method="get" class="search-form">
+        <input type="hidden" name="lang" value="{safe_locale}">
+        <input type="hidden" name="sort" value="{html.escape(state.sort_key, quote=True)}">
+        <input type="hidden" name="order" value="{html.escape(state.sort_order, quote=True)}">
+        <label>
+          {html.escape(web_text(locale, "admin_search_label"))}
+          <input type="text" name="search" value="{html.escape(state.search_query, quote=True)}" placeholder="{html.escape(web_text(locale, "admin_search_placeholder"), quote=True)}">
+        </label>
+        <div class="toolbar-actions">
+          <button type="submit">{html.escape(web_text(locale, "admin_search_button"))}</button>
+          <a class="button ghost" href="{html.escape(clear_search_url, quote=True)}">{html.escape(web_text(locale, "admin_search_reset_button"))}</a>
+        </div>
+      </form>
     </section>
     {add_section}
     <section class="panel">
@@ -1676,12 +1966,12 @@ def render_admin_control_page(
           <thead>
             <tr>
               <th>{html.escape(web_text(locale, "admin_col_id"))}</th>
-              <th>{html.escape(web_text(locale, "admin_col_duration"))}</th>
-              <th>{html.escape(web_text(locale, "admin_col_activated"))}</th>
-              <th>{html.escape(web_text(locale, "admin_col_expires"))}</th>
-              <th>{html.escape(web_text(locale, "admin_col_days_left"))}</th>
-              <th>{html.escape(web_text(locale, "admin_col_key"))}</th>
-              <th>{html.escape(web_text(locale, "admin_col_email"))}</th>
+              <th>{render_sortable_admin_header(locale, admin_home, state, "duration", web_text(locale, "admin_col_duration"))}</th>
+              <th>{render_sortable_admin_header(locale, admin_home, state, "activated", web_text(locale, "admin_col_activated"))}</th>
+              <th>{render_sortable_admin_header(locale, admin_home, state, "expires", web_text(locale, "admin_col_expires"))}</th>
+              <th>{render_sortable_admin_header(locale, admin_home, state, "days_left", web_text(locale, "admin_col_days_left"))}</th>
+              <th>{render_sortable_admin_header(locale, admin_home, state, "key", web_text(locale, "admin_col_key"))}</th>
+              <th>{render_sortable_admin_header(locale, admin_home, state, "email", web_text(locale, "admin_col_email"))}</th>
               <th>{html.escape(web_text(locale, "admin_col_actions"))}</th>
             </tr>
           </thead>
@@ -1692,8 +1982,47 @@ def render_admin_control_page(
       </div>
     </section>
   </main>
+  {render_live_navigation_script()}
 </body>
 </html>"""
+
+
+def render_sortable_admin_header(
+    locale: str,
+    admin_home: str,
+    state: AdminPageState,
+    sort_key: str,
+    label: str,
+) -> str:
+    next_order = "asc"
+    indicator = ""
+    if state.sort_key == sort_key:
+        if state.sort_order == "asc":
+            next_order = "desc"
+            indicator = "↑"
+        else:
+            indicator = "↓"
+
+    url = build_query_url(
+        admin_home,
+        {
+            "lang": locale,
+            "sort": sort_key,
+            "order": next_order,
+            "search": state.search_query,
+            "row": state.selected_row_id,
+            "panel": state.panel,
+            "add": "1" if state.show_add_form else None,
+        },
+    )
+    safe_label = html.escape(label)
+    safe_indicator = html.escape(indicator)
+    return (
+        f'<a class="sort-link" href="{html.escape(url, quote=True)}">'
+        f"<span>{safe_label}</span>"
+        f"<span>{safe_indicator}</span>"
+        "</a>"
+    )
 
 
 def render_admin_table_row(
@@ -1710,12 +2039,29 @@ def render_admin_table_row(
     panel = state.panel if is_selected else None
     details_url = build_query_url(
         admin_home,
-        {"lang": locale, "row": row.row_id, "panel": "details"},
+        {
+            "lang": locale,
+            "row": row.row_id,
+            "panel": "details",
+            "sort": state.sort_key,
+            "order": state.sort_order,
+            "search": state.search_query,
+            "add": "1" if state.show_add_form else None,
+        },
     )
-    hide_url = build_query_url(admin_home, {"lang": locale})
+    hide_url = build_query_url(
+        admin_home,
+        {
+            "lang": locale,
+            "sort": state.sort_key,
+            "order": state.sort_order,
+            "search": state.search_query,
+            "add": "1" if state.show_add_form else None,
+        },
+    )
     row_html = f"""
             <tr>
-              <td class="mono">{html.escape(row.display_id)}</td>
+              <td>{row.display_number}</td>
               <td>{row.key.duration_days}</td>
               <td>{html.escape(format_admin_datetime(row.activation.activated_at))}</td>
               <td>{html.escape(format_admin_datetime(row.key.expires_at, include_time=False))}</td>
@@ -1762,9 +2108,26 @@ def render_admin_detail_panel(
     admin_home = build_web_path(base_path, ADMIN_CONTROL_PATH)
     cancel_url = build_query_url(
         admin_home,
-        {"lang": locale, "row": row.row_id, "panel": "details"},
+        {
+            "lang": locale,
+            "row": row.row_id,
+            "panel": "details",
+            "sort": state.sort_key,
+            "order": state.sort_order,
+            "search": state.search_query,
+            "add": "1" if state.show_add_form else None,
+        },
     )
-    close_url = build_query_url(admin_home, {"lang": locale})
+    close_url = build_query_url(
+        admin_home,
+        {
+            "lang": locale,
+            "sort": state.sort_key,
+            "order": state.sort_order,
+            "search": state.search_query,
+            "add": "1" if state.show_add_form else None,
+        },
+    )
 
     if row.account is None:
         return f"""
@@ -1780,6 +2143,14 @@ def render_admin_detail_panel(
         <input type="hidden" name="lang" value="{html.escape(locale, quote=True)}">
         <input type="hidden" name="row_id" value="{html.escape(row.row_id, quote=True)}">
         <input type="hidden" name="original_email" value="{html.escape(row.account.login_email, quote=True)}">
+        <input type="hidden" name="sort" value="{html.escape(state.sort_key, quote=True)}">
+        <input type="hidden" name="order" value="{html.escape(state.sort_order, quote=True)}">
+        <input type="hidden" name="search" value="{html.escape(state.search_query, quote=True)}">
+        <label class="detail-full">
+          {html.escape(web_text(locale, "admin_edit_raw_label"))}
+          <textarea name="raw_account" rows="3" placeholder="{html.escape(web_text(locale, "admin_add_placeholder"), quote=True)}">{html.escape(values["raw_account"])}</textarea>
+        </label>
+        <p class="note">{html.escape(web_text(locale, "admin_edit_raw_hint"))}</p>
         <div class="form-grid">
           {render_account_input(locale, "login_email", values["login_email"], input_type="email")}
           {render_account_input(locale, "login_password", values["login_password"])}
@@ -1802,6 +2173,9 @@ def render_admin_detail_panel(
           <input type="hidden" name="lang" value="{html.escape(locale, quote=True)}">
           <input type="hidden" name="row_id" value="{html.escape(row.row_id, quote=True)}">
           <input type="hidden" name="email" value="{html.escape(row.account.login_email, quote=True)}">
+          <input type="hidden" name="sort" value="{html.escape(state.sort_key, quote=True)}">
+          <input type="hidden" name="order" value="{html.escape(state.sort_order, quote=True)}">
+          <input type="hidden" name="search" value="{html.escape(state.search_query, quote=True)}">
           <button type="submit" class="danger">{html.escape(web_text(locale, "admin_delete_confirm_button"))}</button>
         </form>
         <a class="button ghost" href="{html.escape(cancel_url, quote=True)}">{html.escape(web_text(locale, "admin_cancel_button"))}</a>
@@ -1809,11 +2183,27 @@ def render_admin_detail_panel(
 
     edit_url = build_query_url(
         admin_home,
-        {"lang": locale, "row": row.row_id, "panel": "edit"},
+        {
+            "lang": locale,
+            "row": row.row_id,
+            "panel": "edit",
+            "sort": state.sort_key,
+            "order": state.sort_order,
+            "search": state.search_query,
+            "add": "1" if state.show_add_form else None,
+        },
     )
     delete_url = build_query_url(
         admin_home,
-        {"lang": locale, "row": row.row_id, "panel": "delete"},
+        {
+            "lang": locale,
+            "row": row.row_id,
+            "panel": "delete",
+            "sort": state.sort_key,
+            "order": state.sort_order,
+            "search": state.search_query,
+            "add": "1" if state.show_add_form else None,
+        },
     )
     return f"""
       <h3>{html.escape(web_text(locale, "admin_account_details_title"))}</h3>
@@ -1910,6 +2300,148 @@ def common_base_styles() -> str:
     """
 
 
+def render_live_navigation_script() -> str:
+    return """
+  <script>
+    if (!window.__perpLiveNavEnabled) {
+      window.__perpLiveNavEnabled = true;
+
+      async function renderHtmlResponse(url, options = {}) {
+        const fetchOptions = {
+          credentials: "same-origin",
+          redirect: "follow",
+          ...options,
+        };
+        const headers = new Headers(fetchOptions.headers || {});
+        headers.set("X-Requested-With", "perp-live-nav");
+        fetchOptions.headers = headers;
+
+        const response = await fetch(url, fetchOptions);
+        const contentType = response.headers.get("content-type") || "";
+        if (!contentType.includes("text/html")) {
+          window.location.assign(response.url || url);
+          return;
+        }
+
+        const html = await response.text();
+        const finalUrl = response.url || String(url);
+        if (options.replaceHistory) {
+          window.history.replaceState({}, "", finalUrl);
+        } else {
+          window.history.pushState({}, "", finalUrl);
+        }
+        document.open();
+        document.write(html);
+        document.close();
+      }
+
+      function shouldHandleAnchor(anchor, event) {
+        if (!anchor || anchor.hasAttribute("download")) {
+          return false;
+        }
+        if (anchor.target && anchor.target !== "_self") {
+          return false;
+        }
+        if (event.defaultPrevented || event.button !== 0) {
+          return false;
+        }
+        if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) {
+          return false;
+        }
+        const href = anchor.getAttribute("href") || "";
+        if (!href || href.startsWith("#")) {
+          return false;
+        }
+        const targetUrl = new URL(anchor.href, window.location.href);
+        if (targetUrl.origin !== window.location.origin) {
+          return false;
+        }
+        return true;
+      }
+
+      function shouldHandleForm(form) {
+        if (!form) {
+          return false;
+        }
+        if (form.target && form.target !== "_self") {
+          return false;
+        }
+        return true;
+      }
+
+      document.addEventListener("click", (event) => {
+        const anchor = event.target instanceof Element ? event.target.closest("a") : null;
+        if (!shouldHandleAnchor(anchor, event)) {
+          return;
+        }
+        event.preventDefault();
+        renderHtmlResponse(anchor.href).catch(() => {
+          window.location.assign(anchor.href);
+        });
+      });
+
+      document.addEventListener("submit", (event) => {
+        const form = event.target;
+        if (!(form instanceof HTMLFormElement) || !shouldHandleForm(form)) {
+          return;
+        }
+
+        event.preventDefault();
+        const method = (form.getAttribute("method") || "get").toUpperCase();
+        const action = form.getAttribute("action") || window.location.href;
+        const submitter = event.submitter instanceof HTMLElement ? event.submitter : null;
+        let formData;
+        try {
+          formData = submitter ? new FormData(form, submitter) : new FormData(form);
+        } catch (error) {
+          formData = new FormData(form);
+          if (
+            submitter instanceof HTMLButtonElement &&
+            submitter.name
+          ) {
+            formData.append(submitter.name, submitter.value);
+          }
+        }
+
+        if (method === "GET") {
+          const nextUrl = new URL(action, window.location.href);
+          nextUrl.search = "";
+          for (const [key, value] of formData.entries()) {
+            nextUrl.searchParams.append(key, String(value));
+          }
+          renderHtmlResponse(nextUrl.toString()).catch(() => {
+            window.location.assign(nextUrl.toString());
+          });
+          return;
+        }
+
+        const body = new URLSearchParams();
+        for (const [key, value] of formData.entries()) {
+          body.append(key, String(value));
+        }
+        renderHtmlResponse(action, {
+          method,
+          body: body.toString(),
+          headers: {
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+          },
+        }).catch(() => {
+          form.submit();
+        });
+      });
+
+      window.addEventListener("popstate", () => {
+        renderHtmlResponse(window.location.href, {
+          method: "GET",
+          replaceHistory: true,
+        }).catch(() => {
+          window.location.reload();
+        });
+      });
+    }
+  </script>"""
+
+
 def render_status_block(status_message: str, status_kind: str) -> str:
     if not status_message:
         return ""
@@ -1954,19 +2486,26 @@ def admin_state_from_request(request: Request) -> AdminPageState:
     if panel not in {"details", "edit", "delete"}:
         panel = None
     show_add_form = request.query_params.get("add", "").strip() == "1"
+    sort_key = normalize_admin_sort_key(request.query_params.get("sort"))
+    sort_order = normalize_admin_sort_order(request.query_params.get("order"))
+    search_query = normalize_admin_search_query(request.query_params.get("search"))
     if selected_row_id is None:
         panel = None
     return AdminPageState(
         selected_row_id=selected_row_id,
         panel=panel,
         show_add_form=show_add_form,
+        sort_key=sort_key,
+        sort_order=sort_order,
+        search_query=search_query,
     )
 
 
 def build_admin_rows(
     subscriptions: list[ActivatedSubscription],
     *,
-    locale: str,
+    sort_key: str,
+    sort_order: str,
 ) -> list[AdminSubscriptionRow]:
     now = datetime.now(timezone.utc).date()
     rows: list[AdminSubscriptionRow] = []
@@ -1976,13 +2515,17 @@ def build_admin_rows(
         rows.append(
             AdminSubscriptionRow(
                 row_id=build_admin_row_id(subscription.activation, subscription.key),
-                display_id=render_admin_id(locale, subscription.activation),
+                display_number=0,
                 activation=subscription.activation,
                 key=subscription.key,
                 account=subscription.account,
                 days_left=days_left,
             )
         )
+    reverse = sort_order == "desc"
+    rows.sort(key=lambda item: admin_sort_value(item, sort_key), reverse=reverse)
+    for index, row in enumerate(rows, start=1):
+        row.display_number = index
     return rows
 
 
@@ -1990,12 +2533,52 @@ def build_admin_row_id(activation: UserKeyActivation, key: SubscriptionKey) -> s
     return f"{activation.requester_id}|{key.code}"
 
 
-def render_admin_id(locale: str, activation: UserKeyActivation) -> str:
-    if activation.requester_id.startswith("tg:") and activation.user_id > 0:
-        return str(activation.user_id)
-    if activation.requester_id.startswith("web:"):
-        return f'{web_text(locale, "admin_id_web")}:{activation.requester_id[4:]}'
-    return activation.requester_id
+def normalize_admin_sort_key(raw_value: str | None) -> str:
+    candidate = (raw_value or "").strip().lower()
+    if candidate in ADMIN_SORT_KEYS:
+        return candidate
+    return "activated"
+
+
+def normalize_admin_sort_order(raw_value: str | None) -> str:
+    candidate = (raw_value or "").strip().lower()
+    if candidate in {"asc", "desc"}:
+        return candidate
+    return "desc"
+
+
+def normalize_admin_search_query(raw_value: str | None) -> str:
+    return (raw_value or "").strip()
+
+
+def admin_sort_value(row: AdminSubscriptionRow, sort_key: str):
+    if sort_key == "duration":
+        return (row.key.duration_days, row.activation.activated_at, row.row_id)
+    if sort_key == "expires":
+        return (row.key.expires_at, row.activation.activated_at, row.row_id)
+    if sort_key == "days_left":
+        return (row.days_left, row.key.expires_at, row.row_id)
+    if sort_key == "key":
+        return (row.key.code, row.activation.activated_at, row.row_id)
+    if sort_key == "email":
+        return (row.key.email_address, row.activation.activated_at, row.row_id)
+    return (row.activation.activated_at, row.row_id)
+
+
+def filter_admin_subscriptions(
+    subscriptions: list[ActivatedSubscription],
+    search_query: str,
+) -> list[ActivatedSubscription]:
+    needle = search_query.strip().lower()
+    if not needle:
+        return subscriptions
+
+    return [
+        subscription
+        for subscription in subscriptions
+        if needle in subscription.key.code.lower()
+        or needle in subscription.key.email_address.lower()
+    ]
 
 
 def format_admin_datetime(value: datetime, *, include_time: bool = True) -> str:
@@ -2007,6 +2590,7 @@ def format_admin_datetime(value: datetime, *, include_time: bool = True) -> str:
 
 def extract_account_form_values(payload: dict[str, str]) -> dict[str, str]:
     return {
+        "raw_account": payload.get("raw_account", "").strip(),
         "login_email": payload.get("login_email", "").strip(),
         "login_password": payload.get("login_password", ""),
         "recovery_email": payload.get("recovery_email", "").strip(),
@@ -2018,6 +2602,7 @@ def extract_account_form_values(payload: dict[str, str]) -> dict[str, str]:
 
 def account_to_form_values(account: EmailAccount) -> dict[str, str]:
     return {
+        "raw_account": "",
         "login_email": account.login_email,
         "login_password": account.login_password,
         "recovery_email": account.recovery_email,
@@ -2028,6 +2613,10 @@ def account_to_form_values(account: EmailAccount) -> dict[str, str]:
 
 
 def build_account_from_form_values(values: dict[str, str]) -> EmailAccount:
+    raw_account = values.get("raw_account", "").strip()
+    if raw_account:
+        return EmailAccount.from_add_string(raw_account)
+
     login_email = normalize_email(values["login_email"])
     recovery_email = normalize_email(values["recovery_email"])
     login_password = values["login_password"].strip()
