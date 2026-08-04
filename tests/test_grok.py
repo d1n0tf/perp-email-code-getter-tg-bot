@@ -4,7 +4,7 @@ from html.parser import HTMLParser
 import httpx
 from fastapi import FastAPI
 
-from src.grok import GrokOrder, create_grok_routes, extract_grok_user_id
+from src.grok import GrokOrder, create_grok_routes, extract_grok_user_id, translate_grok_api_error
 
 
 class FakeGrokClient:
@@ -61,24 +61,24 @@ class GrokPageTestCase(unittest.IsolatedAsyncioTestCase):
             "/ai/grok",
             data={
                 **form,
-                "code": "grk-ab12-cd34-ef56",
+                "code": "ab12-cd34-ef56-gh78",
                 "user_id": '{"userId":"12DA03B3-8380-4D02-9FDE-9C7FADF17CFA"}',
             },
             headers=headers,
         )
         self.assertEqual(response.status_code, 200)
         self.assertIn("Заявка №41", response.text)
-        self.assertEqual(self.api.calls, [("GRK-AB12-CD34-EF56", "12da03b3-8380-4d02-9fde-9c7fadf17cfa")])
+        self.assertEqual(self.api.calls, [("AB12-CD34-EF56-GH78", "12da03b3-8380-4d02-9fde-9c7fadf17cfa")])
 
     async def test_invalid_values_are_not_sent_to_api(self) -> None:
         form, headers = await self.csrf_data()
         response = await self.client.post("/ai/grok", data={**form, "code": "wrong", "user_id": "no id"}, headers=headers)
         self.assertEqual(response.status_code, 400)
-        self.assertIn("GRK-XXXX-XXXX-XXXX", response.text)
+        self.assertIn("XXXX-XXXX-XXXX-XXXX", response.text)
         self.assertEqual(self.api.calls, [])
 
     async def test_activation_requires_csrf_token(self) -> None:
-        response = await self.client.post("/ai/grok", data={"code": "GRK-AB12-CD34-EF56", "user_id": "12da03b3-8380-4d02-9fde-9c7fadf17cfa"})
+        response = await self.client.post("/ai/grok", data={"code": "AB12-CD34-EF56-GH78", "user_id": "12da03b3-8380-4d02-9fde-9c7fadf17cfa"})
         self.assertEqual(response.status_code, 403)
         self.assertEqual(self.api.calls, [])
 
@@ -89,6 +89,12 @@ class GrokPageTestCase(unittest.IsolatedAsyncioTestCase):
 
 
 class GrokUserIdTestCase(unittest.TestCase):
+    def test_translates_code_not_found_error(self) -> None:
+        self.assertEqual(
+            translate_grok_api_error("Code not found"),
+            "\u041a\u043b\u044e\u0447 не найден. Проверьте его и обратитесь к продавцу, если ошибка повторяется.",
+        )
+
     def test_extracts_uuid_from_session_json_and_text(self) -> None:
         user_id = "12DA03B3-8380-4D02-9FDE-9C7FADF17CFA"
         self.assertEqual(extract_grok_user_id('{"userId": "' + user_id + '"}'), user_id.lower())

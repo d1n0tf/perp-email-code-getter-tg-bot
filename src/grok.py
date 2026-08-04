@@ -18,7 +18,7 @@ UUID_RE = re.compile(
     r"(?<![0-9a-fA-F])[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
     r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}(?![0-9a-fA-F])"
 )
-GROK_CODE_RE = re.compile(r"^GRK-[A-Z0-9]{4}-[A-Z0-9]{4}-[A-Z0-9]{4}$")
+GROK_CODE_RE = re.compile(r"^[A-Z0-9]{4}(?:-[A-Z0-9]{4}){3}$")
 CSRF_COOKIE_NAME = "grok_activation_csrf"
 
 
@@ -79,12 +79,20 @@ class GrokActivationClient:
             raise GrokApiError("Сервис активации вернул некорректный ответ.")
         if response.status >= 400:
             detail = string_or_none(payload.get("detail")) or "Сервис активации отклонил запрос."
-            raise GrokApiError(detail, response.status)
+            raise GrokApiError(translate_grok_api_error(detail), response.status)
         return payload
 
 
 def string_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
+
+
+def translate_grok_api_error(detail: str) -> str:
+    """Convert known upstream errors into user-facing Russian messages."""
+    normalized = " ".join(detail.lower().split())
+    if normalized == "code not found":
+        return "\u041a\u043b\u044e\u0447 не найден. Проверьте его и обратитесь к продавцу, если ошибка повторяется."
+    return detail
 
 
 def normalize_grok_code(raw_code: str) -> str:
@@ -159,7 +167,7 @@ def create_grok_routes(app: FastAPI, *, client: GrokActivationClient) -> None:
         supplied_user_id = form.get("user_id", "").strip()
         user_id = extract_grok_user_id(supplied_user_id)
         if not is_valid_grok_code(code):
-            return render_with_csrf(code=code, error="Введите ключ в формате GRK-XXXX-XXXX-XXXX.", status_code=400)
+            return render_with_csrf(code=code, error="Введите ключ в формате XXXX-XXXX-XXXX-XXXX.", status_code=400)
         if user_id is None:
             return render_with_csrf(code=code, error="Не удалось найти корректный Grok User ID (UUID).", status_code=400)
         try:
@@ -221,4 +229,4 @@ poll();
 </script>'''
     return HTMLResponse(f'''<!doctype html><html lang="ru"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><style>
 body{{font-family:Arial,sans-serif;background:#f3f4f6;color:#172033;margin:0}} main{{max-width:680px;margin:40px auto;padding:0 18px 30px}} .card{{background:#fff;border-radius:14px;padding:26px;box-shadow:0 2px 14px #17203316;margin-bottom:18px}} h1{{margin-top:0}} label{{display:block;font-weight:700;margin:16px 0 7px}} .field-hint{{margin:-3px 0 8px;color:#526176;font-size:.94rem}} input{{box-sizing:border-box;width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:8px;font:inherit}} button{{box-sizing:border-box;width:100%;margin-top:18px;padding:12px 18px;border:0;border-radius:8px;background:#111827;color:#fff;font:inherit;font-weight:700;cursor:pointer}} .notice{{padding:13px;border-radius:8px;background:#e0e7ff;margin:0 0 16px}} .success{{background:#dcfce7}} .error{{background:#fee2e2}} ol{{padding-left:21px;line-height:1.6}} code{{word-break:break-all}} .faq-title{{margin:0 0 14px;font-size:1.15rem}} .faq-item{{border:1px solid #e2e8f0;border-radius:10px;margin:10px 0;overflow:hidden}} .faq-item summary{{padding:14px 16px;font-weight:700;cursor:pointer;list-style:none;display:flex;align-items:center;gap:9px}} .faq-item summary::-webkit-details-marker{{display:none}} .faq-item summary::after{{content:"+";margin-left:auto;font-size:1.3rem;color:#64748b}} .faq-item[open] summary{{border-bottom:1px solid #e2e8f0;background:#f8fafc}} .faq-item[open] summary::after{{content:"?"}} .faq-answer{{padding:14px 16px;line-height:1.55;color:#475569}} .faq-answer p{{margin:0}}
-</style></head><body><main><section class="card"><h1>Сервис активации SuperGrok</h1><p>Здесь вы сможете активировать подписку SuperGrok на своем аккаунте, для этого следуйте инструкциям ниже и читайте внимательно весь текст.</p></section><section class="card">{message}<form method="post" action="/ai/grok"><input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}"><label for="code">Одноразовый ключ</label><input id="code" name="code" value="{html.escape(code, quote=True)}" placeholder="GRK-XXXX-XXXX-XXXX" autocomplete="off" autocapitalize="characters" required><p class="field-hint">➥ Здесь вводите полученный ключ от продавца</p><label for="user_id">Ваш UserID</label><input id="user_id" name="user_id" autocomplete="off" required><p class="field-hint">➥ Введите userid вашей учетной записи или полный json ответ, инструкция ниже.</p><button type="submit">Активировать подписку</button></form></section><section class="card"><h2 class="faq-title">❗️ ВОЗМОЖНЫЕ ОШИБКИ</h2><details class="faq-item"><summary>❓ Что такое UserID и зачем он нужен?</summary><div class="faq-answer"><p>↪️ UserID - это ваш уникальный номер аккаунта Grok, он нужен для того чтобы сервис понимал кому именно отправлять подписку. С помощью userId нельзя войти в аккаунт или украсть какие-либо данные</p></div></details><details class="faq-item"><summary>❓ Как получить UserID?</summary><div class="faq-answer"><ol><li>1️⃣ Откройте сайт <a href="https://grok.com" target="_blank" rel="noreferrer">grok.com</a> и авторизуйтесь в аккаунт.</li><li>2️⃣ Откройте ссылку — <a href="https://grok.com/api/auth/session" target="_blank" rel="noreferrer">grok.com/api/auth/session</a>.</li><li>3️⃣ Скопируйте <code>userId</code>, либо всю информацию и вставьте в поле ввода UserID.</li></ol></div></details><details class="faq-item"><summary>❓ Выдает ошибку &quot;User: unauthenticated&quot;</summary><div class="faq-answer"><p>↪️ Вы не авторизовались в браузере где перешли по ссылки, авторизуйтесь в свой аккаунт Grok и попробуйте снова.</p></div></details></section></main>{polling}</body></html>''', status_code=status_code)
+</style></head><body><main><section class="card"><h1>Сервис активации SuperGrok</h1><p>Здесь вы сможете активировать подписку SuperGrok на своем аккаунте, для этого следуйте инструкциям ниже и читайте внимательно весь текст.</p></section><section class="card">{message}<form method="post" action="/ai/grok"><input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}"><label for="code">Одноразовый ключ</label><input id="code" name="code" value="{html.escape(code, quote=True)}" placeholder="XXXX-XXXX-XXXX-XXXX" autocomplete="off" autocapitalize="characters" required><p class="field-hint">➥ Здесь вводите полученный ключ от продавца</p><label for="user_id">Ваш UserID</label><input id="user_id" name="user_id" autocomplete="off" required><p class="field-hint">➥ Введите userid вашей учетной записи или полный json ответ, инструкция ниже.</p><button type="submit">Активировать подписку</button></form></section><section class="card"><h2 class="faq-title">❗️ ВОЗМОЖНЫЕ ОШИБКИ</h2><details class="faq-item"><summary>❓ Что такое UserID и зачем он нужен?</summary><div class="faq-answer"><p>↪️ UserID - это ваш уникальный номер аккаунта Grok, он нужен для того чтобы сервис понимал кому именно отправлять подписку. С помощью userId нельзя войти в аккаунт или украсть какие-либо данные</p></div></details><details class="faq-item"><summary>❓ Как получить UserID?</summary><div class="faq-answer"><ol><li>1️⃣ Откройте сайт <a href="https://grok.com" target="_blank" rel="noreferrer">grok.com</a> и авторизуйтесь в аккаунт.</li><li>2️⃣ Откройте ссылку — <a href="https://grok.com/api/auth/session" target="_blank" rel="noreferrer">grok.com/api/auth/session</a>.</li><li>3️⃣ Скопируйте <code>userId</code>, либо всю информацию и вставьте в поле ввода UserID.</li></ol></div></details><details class="faq-item"><summary>❓ Выдает ошибку &quot;User: unauthenticated&quot;</summary><div class="faq-answer"><p>↪️ Вы не авторизовались в браузере где перешли по ссылки, авторизуйтесь в свой аккаунт Grok и попробуйте снова.</p></div></details></section></main>{polling}</body></html>''', status_code=status_code)
