@@ -8,6 +8,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from src.config import settings
+from src.grok import GrokActivationClient, create_grok_routes
 from src.messages import DEFAULT_LOCALE, SUPPORTED_LOCALES, translate
 from src.service import ActivatedSubscription, BotService
 from src.storage import (
@@ -267,6 +268,13 @@ def create_web_app(service: BotService) -> FastAPI:
     app = FastAPI(title="Perp Mail Bot")
     app.state.service = service
     app.state.admin_sessions = set()
+    create_grok_routes(
+        app,
+        client=GrokActivationClient(
+            settings.grok_activation_api_url,
+            settings.grok_activation_timeout_seconds,
+        ),
+    )
     base_path = normalize_base_path(settings.web_base_path)
 
     async def index(request: Request) -> HTMLResponse:

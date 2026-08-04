@@ -37,6 +37,8 @@ class Settings(BaseSettings):
     web_port: int = 8000
     web_base_path: str = "/perp-code-getter"
     web_admin_password: str | None = None
+    grok_activation_api_url: str = "https://bypriceactivate.pro"
+    grok_activation_timeout_seconds: float = 30.0
 
     @field_validator("tg_admins", mode="before")
     @classmethod
