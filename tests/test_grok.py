@@ -67,8 +67,15 @@ class GrokPageTestCase(unittest.IsolatedAsyncioTestCase):
             headers=headers,
         )
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Заявка №41", response.text)
+        self.assertIn("Подписка активируется. Обычно это занимает 1–2 минуты…", response.text)
         self.assertEqual(self.api.calls, [("AB12-CD34-EF56-GH78", "12da03b3-8380-4d02-9fde-9c7fadf17cfa")])
+
+    async def test_english_page(self) -> None:
+        response = await self.client.get("/ai/grok?lang=en")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn('lang="en"', response.text)
+        self.assertIn("SuperGrok Activation Service", response.text)
+        self.assertIn('name="lang" value="en"', response.text)
 
     async def test_invalid_values_are_not_sent_to_api(self) -> None:
         form, headers = await self.csrf_data()
@@ -79,7 +86,8 @@ class GrokPageTestCase(unittest.IsolatedAsyncioTestCase):
 
     async def test_activation_requires_csrf_token(self) -> None:
         response = await self.client.post("/ai/grok", data={"code": "AB12-CD34-EF56-GH78", "user_id": "12da03b3-8380-4d02-9fde-9c7fadf17cfa"})
-        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response.status_code, 303)
+        self.assertEqual(response.headers["location"], "/ai/grok?lang=ru")
         self.assertEqual(self.api.calls, [])
 
     async def test_status_endpoint(self) -> None:
@@ -93,6 +101,12 @@ class GrokUserIdTestCase(unittest.TestCase):
         self.assertEqual(
             translate_grok_api_error("Code not found"),
             "\u041a\u043b\u044e\u0447 не найден. Проверьте его и обратитесь к продавцу, если ошибка повторяется.",
+        )
+
+    def test_translates_already_fulfilled_code_error(self) -> None:
+        self.assertEqual(
+            translate_grok_api_error("Code already fulfilled"),
+            "Этот ключ уже был использован для активации подписки.",
         )
 
     def test_extracts_uuid_from_session_json_and_text(self) -> None:
