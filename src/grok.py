@@ -110,13 +110,17 @@ def string_or_none(value: object) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
-def translate_grok_api_error(detail: str) -> str:
+def translate_grok_api_error(detail: str, locale: str = "ru") -> str:
     """Convert known upstream errors into user-facing Russian messages."""
     normalized = " ".join(detail.lower().split())
     if normalized == "code not found":
-        return "\u041a\u043b\u044e\u0447 не найден. Проверьте его и обратитесь к продавцу, если ошибка повторяется."
+        return ("Key not found. Check it and contact the seller if the error persists."
+                if locale == "en" else
+                "\u041a\u043b\u044eч не найден. Проверьте его и обратитесь к продавцу, если ошибка повторяется.")
     if normalized == "code already fulfilled":
-        return "Этот ключ уже был использован для активации подписки."
+        return ("This key has already been used to activate a subscription."
+                if locale == "en" else
+                "Этот ключ уже был использован для активации подписки.")
     return detail
 
 
@@ -198,17 +202,18 @@ def create_grok_routes(app: FastAPI, *, client: GrokActivationClient) -> None:
         supplied_user_id = form.get("user_id", "").strip()
         user_id = extract_grok_user_id(supplied_user_id)
         if not is_valid_grok_code(code):
-            return render_with_csrf(locale=locale, code=code, error="Введите ключ в формате XXXX-XXXX-XXXX-XXXX.", status_code=400)
+            return render_with_csrf(locale=locale, code=code, error=("Enter the key in XXXX-XXXX-XXXX-XXXX format." if locale == "en" else "Введите ключ в формате XXXX-XXXX-XXXX-XXXX."), status_code=400)
         if user_id is None:
-            return render_with_csrf(locale=locale, code=code, error="Не удалось найти корректный Grok User ID (UUID).", status_code=400)
+            return render_with_csrf(locale=locale, code=code, error=("Could not find a valid Grok User ID (UUID)." if locale == "en" else "Не удалось найти корректный Grok User ID (UUID)."), status_code=400)
         try:
             order = await request.app.state.grok_client.activate(code=code, user_id=user_id)
         except GrokApiError as exc:
-            return render_with_csrf(locale=locale, code=code, error=str(exc), status_code=map_upstream_status(exc.status_code))
+            return render_with_csrf(locale=locale, code=code, error=translate_grok_api_error(str(exc), locale), status_code=map_upstream_status(exc.status_code))
         request.app.state.grok_orders[order.order_id] = {"code": code, "user_id": user_id}
         return render_with_csrf(locale=locale, order_id=order.order_id)
 
     async def status(request: Request) -> JSONResponse:
+        locale = "en" if request.query_params.get("lang") == "en" else "ru"
         def status_response(payload: dict[str, object], status_code: int = 200) -> JSONResponse:
             return JSONResponse(payload, status_code=status_code, headers={"Cache-Control": "no-store"})
 
@@ -224,14 +229,19 @@ def create_grok_routes(app: FastAPI, *, client: GrokActivationClient) -> None:
                 status_code=map_upstream_status(exc.status_code),
             )
         waiting_message = (
-            "Подписка активируется. Обычно это занимает 1–2 минуты…\n"
-            "Данный текст автоматически изменится при успешной активации."
+            ("Subscription is being activated. This usually takes 1–2 minutes…\n"
+             "This text will change automatically when activation succeeds.")
+            if locale == "en" else
+            ("Подписка активируется. Обычно это занимает 1–2 минуты…\n"
+             "Данный текст автоматически изменится при успешной активации.")
         )
         order_data = request.app.state.grok_orders.get(order.order_id, {})
-        done_message = "Подписка SuperGrok Pro успешно активирована."
+        done_message = "SuperGrok Pro subscription activated successfully." if locale == "en" else "Подписка SuperGrok Pro успешно активирована."
         if order_data:
             done_message += (
-                f"\nКлюч: {order_data['code']} был активирован для аккаунта UserID: {order_data['user_id']}"
+                (f"\nKey: {order_data['code']} was activated for account UserID: {order_data['user_id']}"
+                 if locale == "en" else
+                 f"\nКлюч: {order_data['code']} был активирован для аккаунта UserID: {order_data['user_id']}")
             )
 
         messages = {
@@ -258,21 +268,24 @@ def render_grok_page(*, csrf_token: str, code: str = "", error: str = "", order_
     message = f'<div class="notice error">{html.escape(error)}</div>' if error else ""
     polling = ""
     if order_id is not None:
-        message = '<div id="activation-status" class="notice">Подписка активируется. Обычно это занимает 1–2 минуты…<br>Данный текст автоматически изменится при успешной активации.</div>'
+        waiting = ("Subscription is being activated. This usually takes 1–2 minutes…<br>"
+                   "This text will change automatically when activation succeeds.") if locale == "en" else ("Подписка активируется. Обычно это занимает 1–2 минуты…<br>Данный текст автоматически изменится при успешной активации.")
+        message = f'<div id="activation-status" class="notice">{waiting}</div>'
         polling = f'''<script>
 const target = document.getElementById("activation-status");
 async function poll() {{
   try {{
-    const response = await fetch("/ai/grok/status?order_id={order_id}", {{cache: "no-store"}});
+    const response = await fetch("/ai/grok/status?order_id={order_id}&lang={locale}", {{cache: "no-store"}});
     const data = await response.json();
-    target.textContent = data.message || "Проверяем статус…";
+    target.textContent = data.message || "{'Checking activation status…' if locale == 'en' else 'Проверяем статус…'}";
     if (data.status === "done") {{ target.className = "notice success"; return; }}
     if (data.status === "failed") {{ target.className = "notice error"; return; }}
-  }} catch (_) {{ target.textContent = "Нет связи с сервером. Повторяем проверку…"; }}
+  }} catch (_) {{ target.textContent = "{'Connection error. Retrying…' if locale == 'en' else 'Нет связи с сервером. Повторяем проверку…'}"; }}
   window.setTimeout(poll, 4000);
 }}
 poll();
 </script>'''
+    faq_html = ('<section class="card"><h2 class="faq-title">❗️ POSSIBLE ERRORS</h2><details class="faq-item"><summary>❓ What is UserID and why is it needed?</summary><div class="faq-answer"><p>↪️ UserID is your unique Grok account number. It tells the service where to send the subscription. UserID cannot be used to log in or steal your data.</p></div></details><details class="faq-item"><summary>❓ How do I get my UserID?</summary><div class="faq-answer"><ol><li>1️⃣ Open grok.com and sign in.</li><li>2️⃣ Open grok.com/api/auth/session.</li><li>3️⃣ Copy userId, or all the information, and paste it into the UserID field.</li></ol></div></details><details class="faq-item"><summary>❓ Error "User: unauthenticated"</summary><div class="faq-answer"><p>↪️ You are not signed in in the browser. Sign in to your Grok account and try again.</p></div></details></section>') if locale == "en" else '<section class="card"><h2 class="faq-title">❗️ ВОЗМОЖНЫЕ ОШИБКИ</h2><details class="faq-item"><summary>❓ Что такое UserID и зачем он нужен?</summary><div class="faq-answer"><p>↪️ UserID - это ваш уникальный номер аккаунта Grok, он нужен для того чтобы сервис понимал кому именно отправлять подписку. С помощью userId нельзя войти в аккаунт или украсть какие-либо данные</p></div></details><details class="faq-item"><summary>❓ Как получить UserID?</summary><div class="faq-answer"><ol><li>1️⃣ Откройте сайт <a href="https://grok.com" target="_blank" rel="noreferrer">grok.com</a> и авторизуйтесь в аккаунт.</li><li>2️⃣ Откройте ссылку — <a href="https://grok.com/api/auth/session" target="_blank" rel="noreferrer">grok.com/api/auth/session</a>.</li><li>3️⃣ Скопируйте <code>userId</code>, либо всю информацию и вставьте в поле ввода UserID.</li></ol></div></details><details class="faq-item"><summary>❓ Выдает ошибку &quot;User: unauthenticated&quot;</summary><div class="faq-answer"><p>↪️ Вы не авторизовались в браузере где перешли по ссылки, авторизуйтесь в свой аккаунт Grok и попробуйте снова.</p></div></details></section>'
     return HTMLResponse(f'''<!doctype html><html lang="{locale}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><style>
 body{{font-family:Arial,sans-serif;background:#f3f4f6;color:#172033;margin:0}} main{{max-width:680px;margin:40px auto;padding:0 18px 30px}} .lang-switch{{margin-bottom:16px}} .lang-switch a{{color:#0f766e;text-decoration:none;font-weight:700}} .card{{background:#fff;border-radius:14px;padding:26px;box-shadow:0 2px 14px #17203316;margin-bottom:18px}} h1{{margin-top:0}} label{{display:block;font-weight:700;margin:16px 0 7px}} .field-hint{{margin:-3px 0 8px;color:#526176;font-size:.94rem}} input{{box-sizing:border-box;width:100%;padding:12px;border:1px solid #cbd5e1;border-radius:8px;font:inherit}} button{{box-sizing:border-box;width:100%;margin-top:18px;padding:12px 18px;border:0;border-radius:8px;background:#111827;color:#fff;font:inherit;font-weight:700;cursor:pointer}} .notice{{padding:13px;border-radius:8px;background:#e0e7ff;margin:0 0 16px}} .success{{background:#dcfce7}} .error{{background:#fee2e2}} ol{{padding-left:21px;line-height:1.6}} code{{word-break:break-all}} .faq-title{{margin:0 0 14px;font-size:1.15rem}} .faq-item{{border:1px solid #e2e8f0;border-radius:10px;margin:10px 0;overflow:hidden}} .faq-item summary{{padding:14px 16px;font-weight:700;cursor:pointer;list-style:none;display:flex;align-items:center;gap:9px}} .faq-item summary::-webkit-details-marker{{display:none}} .faq-item summary::after{{content:"+";margin-left:auto;font-size:1.3rem;color:#64748b}} .faq-item[open] summary{{border-bottom:1px solid #e2e8f0;background:#f8fafc}} .faq-item[open] summary::after{{content:"?"}} .faq-answer{{padding:14px 16px;line-height:1.55;color:#475569}} .faq-answer p{{margin:0}}
-</style></head><body><main><div class="lang-switch"><a href="/ai/grok?lang={switch_locale}">{text['language']}</a></div><section class="card"><h1>{text['title']}</h1><p>{text['intro']}</p></section><section class="card">{message}<form method="post" action="/ai/grok"><input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}"><input type="hidden" name="lang" value="{locale}"><label for="code">{text['code']}</label><input id="code" name="code" value="{html.escape(code, quote=True)}" placeholder="XXXX-XXXX-XXXX-XXXX" autocomplete="off" autocapitalize="characters" required><p class="field-hint">{text['code_hint']}</p><label for="user_id">{text['user_id']}</label><input id="user_id" name="user_id" autocomplete="off" required><p class="field-hint">{text['user_hint']}</p><button type="submit">{text['activate']}</button></form></section><section class="card"><h2 class="faq-title">❗️ ВОЗМОЖНЫЕ ОШИБКИ</h2><details class="faq-item"><summary>❓ Что такое UserID и зачем он нужен?</summary><div class="faq-answer"><p>↪️ UserID - это ваш уникальный номер аккаунта Grok, он нужен для того чтобы сервис понимал кому именно отправлять подписку. С помощью userId нельзя войти в аккаунт или украсть какие-либо данные</p></div></details><details class="faq-item"><summary>❓ Как получить UserID?</summary><div class="faq-answer"><ol><li>1️⃣ Откройте сайт <a href="https://grok.com" target="_blank" rel="noreferrer">grok.com</a> и авторизуйтесь в аккаунт.</li><li>2️⃣ Откройте ссылку — <a href="https://grok.com/api/auth/session" target="_blank" rel="noreferrer">grok.com/api/auth/session</a>.</li><li>3️⃣ Скопируйте <code>userId</code>, либо всю информацию и вставьте в поле ввода UserID.</li></ol></div></details><details class="faq-item"><summary>❓ Выдает ошибку &quot;User: unauthenticated&quot;</summary><div class="faq-answer"><p>↪️ Вы не авторизовались в браузере где перешли по ссылки, авторизуйтесь в свой аккаунт Grok и попробуйте снова.</p></div></details></section></main>{polling}</body></html>''', status_code=status_code)
+</style></head><body><main><div class="lang-switch"><a href="/ai/grok?lang={switch_locale}">{text['language']}</a></div><section class="card"><h1>{text['title']}</h1><p>{text['intro']}</p></section><section class="card">{message}<form method="post" action="/ai/grok"><input type="hidden" name="csrf_token" value="{html.escape(csrf_token, quote=True)}"><input type="hidden" name="lang" value="{locale}"><label for="code">{text['code']}</label><input id="code" name="code" value="{html.escape(code, quote=True)}" placeholder="XXXX-XXXX-XXXX-XXXX" autocomplete="off" autocapitalize="characters" required><p class="field-hint">{text['code_hint']}</p><label for="user_id">{text['user_id']}</label><input id="user_id" name="user_id" autocomplete="off" required><p class="field-hint">{text['user_hint']}</p><button type="submit">{text['activate']}</button></form></section>{faq_html}</main>{polling}</body></html>''', status_code=status_code)
