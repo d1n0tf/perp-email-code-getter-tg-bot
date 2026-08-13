@@ -370,7 +370,7 @@ def create_tokens_routes(
             samesite="lax",
             secure=True,
             path="/ai/tokens/adm",
-            max_age=60 * 60 * 12,
+            max_age=60 * 60 * 24 * 30,
         )
         return response
 
@@ -774,7 +774,11 @@ def render_admin_rows(keys: list[TokenKey], csrf_token: str) -> tuple[str, str]:
         <tr><td>{key.id}</td><td>{format_datetime(key.created_at)}</td><td><code>{html.escape(key.access_code)}</code></td>
         <td class='copyable-api-key' data-copy-api-key='{html.escape(key.api_key, quote=True)}' role='button' tabindex='0' title='Нажмите, чтобы скопировать API key' aria-label='Скопировать API key'><code class='api-preview'>{html.escape(key.api_key)}</code></td><td>{format_tokens(key.token_limit)}</td>
         <td>{format_tokens(key.used_tokens)}</td><td>{status}</td>
-        <td><button type='button' class='secondary' data-edit='{edit_id}'>\u0423\u043f\u0440\u0430\u0432\u043b\u044f\u0442\u044c</button></td></tr>""")
+        <td><div class='management-actions'><button type='button' class='secondary' data-edit='{edit_id}'>\u0423\u043f\u0440\u0430\u0432\u043b\u044f\u0442\u044c</button>
+        <form method='post' action='/ai/tokens/adm/{key.id}/delete' class='inline-delete-form'>
+          <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
+          <button class='danger' type='submit' onclick="return confirm('\u0423\u0434\u0430\u043b\u0438\u0442\u044c \u043a\u043b\u044e\u0447 #{key.id}?')">\u0423\u0434\u0430\u043b\u0438\u0442\u044c</button>
+        </form></div></td></tr>""")
         options = "".join(
             f"<option value='{html.escape(service, quote=True)}' {'selected' if service == key.service else ''}>{html.escape(service)}</option>"
             for service in SERVICE_OPTIONS
@@ -797,10 +801,7 @@ def render_admin_rows(keys: list[TokenKey], csrf_token: str) -> tuple[str, str]:
           <div class='edit-actions'><button class='primary' type='submit'>\u0421\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c</button>
           <button class='secondary cancel-edit' type='button' data-edit='{edit_id}'>\u041e\u0442\u043c\u0435\u043d\u0430</button></div>
         </form>
-        <form class='delete-form' method='post' action='/ai/tokens/adm/{key.id}/delete'>
-          <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
-          <button class='danger' type='submit' onclick=\"return confirm('\u0423\u0434\u0430\u043b\u0438\u0442\u044c \u043a\u043b\u044e\u0447 #{key.id}?')\">\u0423\u0434\u0430\u043b\u0438\u0442\u044c \u043a\u043b\u044e\u0447 #{key.id}</button>
-        </form>""")
+""")
     return "".join(rows), "".join(forms)
 
 
@@ -819,7 +820,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 .details {{ display:grid; grid-template-columns:minmax(210px,auto) 1fr; gap:8px 18px; margin:0; }} .details dt {{ color:var(--muted); }} .details dd {{ margin:0; min-width:0; overflow-wrap:anywhere; }} code,pre {{ font-family:Consolas,'Courier New',monospace; }} .api-key {{ color:#b9d4ff; }}
 .choice-row {{ display:flex; flex-wrap:wrap; gap:8px; margin:14px 0; }} .instruction-apps .choice[hidden] {{ display:none; }} .instruction-card {{ margin-top:18px; }} .choice {{ color:var(--text); background:#1b2940; border:1px solid var(--line); }} .choice.active {{ color:#08101e; background:var(--accent); border-color:var(--accent); }} .selected-line {{ padding:12px; margin:16px 0; border-left:3px solid var(--accent); background:#0b1321; }} ol {{ padding-left:24px; }} pre {{ max-width:100%; overflow:auto; padding:14px; white-space:pre-wrap; overflow-wrap:anywhere; background:#080e18; border:1px solid var(--line); border-radius:9px; color:#d9e7ff; }}
 .title-row {{ display:flex; justify-content:space-between; gap:16px; align-items:start; }} .title-row form {{ margin:0; }} .create-form,.edit-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); column-gap:18px; }} .create-form .wide {{ grid-column:1 / -1; }}
-.table-wrap {{ overflow-x:auto; }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th {{ color:var(--muted); font-size:12px; }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-form {{ margin-top:16px; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
+.table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th {{ color:var(--muted); font-size:12px; }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-form {{ margin-top:16px; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
 @media(max-width:650px) {{ .page,.admin-page {{ width:min(100% - 20px,960px); margin-top:12px; }} .card {{ padding:18px; border-radius:12px; }} h1 {{ font-size:24px; }} .details,.create-form,.edit-grid {{ grid-template-columns:1fr; }} .title-row {{ display:block; }} .title-row form {{ margin-top:12px; }} }}
 </style></head><body>{content}<script>
 (function() {{
