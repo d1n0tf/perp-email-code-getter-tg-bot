@@ -39,6 +39,11 @@ class Settings(BaseSettings):
     web_admin_password: str | None = None
     grok_activation_api_url: str = "https://bypriceactivate.pro"
     grok_activation_timeout_seconds: float = 30.0
+    token_key_store_path: Path = Path("token_keys.json")
+    cvc_primary_api_key: str | None = None
+    cvc_api_base_url: str = "https://cheapvibecode.ru"
+    cvc_api_timeout_seconds: float = 30.0
+    tokens_admin_password: str | None = None
 
     @field_validator("tg_admins", mode="before")
     @classmethod

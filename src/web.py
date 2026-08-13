@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from src.config import settings
 from src.grok import GrokActivationClient, create_grok_routes
+from src.tokens import CheapVibeCodeClient, TokenKeyStore, create_tokens_routes
 from src.messages import DEFAULT_LOCALE, SUPPORTED_LOCALES, translate
 from src.service import ActivatedSubscription, BotService
 from src.storage import (
@@ -274,6 +275,16 @@ def create_web_app(service: BotService) -> FastAPI:
             settings.grok_activation_api_url,
             settings.grok_activation_timeout_seconds,
         ),
+    )
+    create_tokens_routes(
+        app,
+        store=TokenKeyStore(settings.token_key_store_path),
+        key_client=CheapVibeCodeClient(
+            settings.cvc_primary_api_key or "",
+            settings.cvc_api_base_url,
+            settings.cvc_api_timeout_seconds,
+        ),
+        admin_password=settings.tokens_admin_password,
     )
     base_path = normalize_base_path(settings.web_base_path)
 
