@@ -15,6 +15,7 @@ from src.tokens import (
     instruction_command,
     instruction_remove_command,
     instruction_steps,
+    trusted_secondary_remaining,
     utc_now,
 )
 
@@ -36,7 +37,9 @@ class FakeKeyClient:
         self.calls: list[tuple[str, int]] = []
         self.balance_calls: list[str] = []
         self.balance_value: int = 1_234_567
+        self.primary_balance_value: int = 10_000_000
         self.balance_error: Exception | None = None
+        self.primary_balance_error: Exception | None = None
 
     async def create_key(self, *, name: str, token_limit: int) -> str:
         self.calls.append((name, token_limit))
@@ -47,6 +50,11 @@ class FakeKeyClient:
         if self.balance_error is not None:
             raise self.balance_error
         return self.balance_value
+
+    async def get_primary_token_balance(self) -> int:
+        if self.primary_balance_error is not None:
+            raise self.primary_balance_error
+        return self.primary_balance_value
 
 
 class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
@@ -301,6 +309,69 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(stored)
         self.assertEqual(stored.used_tokens if stored else None, 765_433)
 
+    async def test_admin_does_not_treat_primary_balance_as_secondary_usage(self) -> None:
+        await self.store.add_many([
+            TokenKey(
+                id=8,
+                created_at=utc_now(),
+                access_code="ABCDEFGHIJKLMNOPQRST",
+                api_key="sk-cvc-capped",
+                service="Grok",
+                name="Grok capped",
+                token_limit=2_000_000,
+                used_tokens=42_000,
+            )
+        ])
+        self.key_client.balance_value = 50_000_000
+        self.key_client.primary_balance_value = 50_000_000
+        login_form, login_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        login = await self.client.post(
+            "/ai/tokens/adm/login",
+            data={**login_form, "password": "secret"},
+            headers=login_headers,
+            follow_redirects=False,
+        )
+        session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        response = await self.client.get("/ai/tokens/adm", headers={"Cookie": session_cookie})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("42 000", response.text)
+        stored = await self.store.get(8)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.used_tokens if stored else None, 42_000)
+
+    async def test_admin_uses_secondary_remaining_when_below_primary(self) -> None:
+        await self.store.add_many([
+            TokenKey(
+                id=9,
+                created_at=utc_now(),
+                access_code="ZYXWVUTSRQPONMLKJIHG",
+                api_key="sk-cvc-small",
+                service="Grok",
+                name="Grok small",
+                token_limit=2_000_000,
+                used_tokens=0,
+            )
+        ])
+        self.key_client.balance_value = 50_000
+        self.key_client.primary_balance_value = 10_000_000
+        login_form, login_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        login = await self.client.post(
+            "/ai/tokens/adm/login",
+            data={**login_form, "password": "secret"},
+            headers=login_headers,
+            follow_redirects=False,
+        )
+        session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        response = await self.client.get("/ai/tokens/adm", headers={"Cookie": session_cookie})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("1 950 000", response.text)
+        self.assertIn("ост. 50 000", response.text)
+        stored = await self.store.get(9)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.used_tokens if stored else None, 1_950_000)
+
 
 class TokenInstructionHelpersTestCase(unittest.TestCase):
     def test_grok_is_a_first_class_service_and_instruction_group(self) -> None:
@@ -327,6 +398,12 @@ class TokenInstructionHelpersTestCase(unittest.TestCase):
             instruction_steps("Grok Build", "macOS", "en"),
             ["Open the terminal.", "Run the command below.", "Restart the terminal and type grok."],
         )
+
+    def test_secondary_remaining_is_rejected_when_it_is_the_primary_balance(self) -> None:
+        self.assertIsNone(trusted_secondary_remaining(50_000_000, 2_000_000, 50_000_000))
+        self.assertIsNone(trusted_secondary_remaining(500_000, 2_000_000, 500_000))
+        self.assertEqual(trusted_secondary_remaining(50_000, 2_000_000, 10_000_000), 50_000)
+        self.assertEqual(trusted_secondary_remaining(2_000_000, 2_000_000, 10_000_000), 2_000_000)
 
 
 if __name__ == "__main__":

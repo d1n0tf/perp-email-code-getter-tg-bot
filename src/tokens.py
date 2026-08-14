@@ -217,7 +217,7 @@ class TokenKeyStore:
             for index, key in enumerate(keys):
                 if key.id != key_id:
                     continue
-                used_tokens = max(0, key.token_limit - max(0, remaining))
+                used_tokens = used_tokens_from_remaining(key.token_limit, remaining)
                 exhausted_at = key.exhausted_at or utc_now() if used_tokens >= key.token_limit else None
                 updated = replace(key, used_tokens=used_tokens, exhausted_at=exhausted_at)
                 if updated != key:
@@ -227,10 +227,40 @@ class TokenKeyStore:
         return None
 
 
+def used_tokens_from_remaining(token_limit: int, remaining: int) -> int:
+    return max(0, token_limit - max(0, remaining))
+
+
+def trusted_secondary_remaining(
+    reported: int,
+    token_limit: int,
+    primary_remaining: int | None = None,
+) -> int | None:
+    """Accept a live remaining value only when it belongs to the secondary key.
+
+    cheapvibecode.ru/v1/balance returns the secondary key remaining only while
+    that remaining does not exceed the primary key. Otherwise it returns the
+    primary remaining, which is usually larger than the secondary limit and
+    would zero out used tokens.
+    """
+    remaining = max(0, reported)
+    if remaining > token_limit:
+        return None
+    if (
+        primary_remaining is not None
+        and remaining >= primary_remaining
+        and token_limit > primary_remaining
+    ):
+        return None
+    return remaining
+
+
 class SecondaryKeyClient(Protocol):
     async def create_key(self, *, name: str, token_limit: int) -> str: ...
 
     async def get_token_balance(self, *, api_key: str) -> int: ...
+
+    async def get_primary_token_balance(self) -> int: ...
 
 
 class CheapVibeCodeClient:
@@ -293,6 +323,11 @@ class CheapVibeCodeClient:
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             raise RuntimeError("The balance service returned an invalid response.") from exc
 
+    async def get_primary_token_balance(self) -> int:
+        if not self.primary_key:
+            raise RuntimeError("CVC_PRIMARY_API_KEY is not configured.")
+        return await self.get_token_balance(api_key=self.primary_key)
+
 
 async def read_form(request: Request) -> dict[str, str]:
     payload = parse_qs((await request.body()).decode("utf-8", errors="replace"), keep_blank_values=True)
@@ -350,10 +385,22 @@ def create_tokens_routes(
         session = request.cookies.get(TOKENS_ADMIN_COOKIE, "")
         return bool(session and session in admin_sessions)
 
-    async def refresh_stored_balance(key: TokenKey) -> TokenKey:
+    async def read_primary_remaining() -> int | None:
         try:
-            remaining = await key_client.get_token_balance(api_key=key.api_key)
+            return await key_client.get_primary_token_balance()
         except RuntimeError:
+            return None
+
+    async def refresh_stored_balance(
+        key: TokenKey,
+        primary_remaining: int | None = None,
+    ) -> TokenKey:
+        try:
+            reported = await key_client.get_token_balance(api_key=key.api_key)
+        except RuntimeError:
+            return key
+        remaining = trusted_secondary_remaining(reported, key.token_limit, primary_remaining)
+        if remaining is None:
             return key
         updated = await store.apply_remaining(key.id, remaining)
         return updated or key
@@ -361,7 +408,10 @@ def create_tokens_routes(
     async def refresh_stored_balances(keys: list[TokenKey]) -> list[TokenKey]:
         if not keys:
             return keys
-        refreshed = await asyncio.gather(*(refresh_stored_balance(key) for key in keys))
+        primary_remaining = await read_primary_remaining()
+        refreshed = await asyncio.gather(
+            *(refresh_stored_balance(key, primary_remaining) for key in keys)
+        )
         return sorted(refreshed, key=lambda key: key.id, reverse=True)
 
     async def admin_response(
@@ -390,7 +440,7 @@ def create_tokens_routes(
         access_code = request.cookies.get(TOKENS_ACCESS_COOKIE, "")
         key = await store.get_by_code(access_code) if access_code else None
         if key is not None:
-            key = await refresh_stored_balance(key)
+            key = await refresh_stored_balance(key, await read_primary_remaining())
         error = exhausted_message(key, locale) if key is not None and key.is_exhausted else ""
         return user_response(locale=locale, key=key, error=error)
 
@@ -405,7 +455,7 @@ def create_tokens_routes(
         key = await store.activate(access_code)
         if key is None:
             return user_response(locale=locale, error=TOKEN_TEXT[locale]["missing"], submitted_code=access_code, status_code=404)
-        key = await refresh_stored_balance(key)
+        key = await refresh_stored_balance(key, await read_primary_remaining())
         if key.is_exhausted:
             response = user_response(locale=locale, key=key, error=exhausted_message(key, locale), submitted_code=access_code)
         else:
@@ -422,16 +472,21 @@ def create_tokens_routes(
         if key is None:
             return JSONResponse({"ok": False, "error": "access_key_missing"}, status_code=401, headers={"Cache-Control": "no-store"})
         try:
-            token_balance = await key_client.get_token_balance(api_key=key.api_key)
+            reported = await key_client.get_token_balance(api_key=key.api_key)
         except RuntimeError:
             return JSONResponse({"ok": False, "error": "balance_unavailable"}, status_code=502, headers={"Cache-Control": "no-store"})
-        updated = await store.apply_remaining(key.id, token_balance)
+        remaining = trusted_secondary_remaining(
+            reported, key.token_limit, await read_primary_remaining()
+        )
+        if remaining is None:
+            return JSONResponse({"ok": False, "error": "balance_unavailable"}, status_code=502, headers={"Cache-Control": "no-store"})
+        updated = await store.apply_remaining(key.id, remaining)
         key = updated or key
         return JSONResponse(
             {
                 "ok": True,
-                "token_balance": token_balance,
-                "formatted": format_tokens(token_balance),
+                "token_balance": remaining,
+                "formatted": format_tokens(remaining),
                 "token_limit": key.token_limit,
                 "token_limit_formatted": format_tokens(key.token_limit),
                 "used_tokens": key.used_tokens,
@@ -903,7 +958,7 @@ def render_admin_rows(keys: list[TokenKey], csrf_token: str) -> tuple[str, str]:
         rows.append(f"""
         <tr><td>{key.id}</td><td>{format_datetime(key.created_at)}</td><td>{html.escape(key.service)}</td><td><code>{html.escape(key.access_code)}</code></td>
         <td class='copyable-api-key' data-copy-api-key='{html.escape(key.api_key, quote=True)}' role='button' tabindex='0' title='Нажмите, чтобы скопировать API key' aria-label='Скопировать API key'><code class='api-preview'>{html.escape(key.api_key)}</code></td><td>{format_tokens(key.token_limit)}</td>
-        <td>{format_tokens(key.used_tokens)}</td><td>{status}</td>
+        <td>{format_tokens(key.used_tokens)}<br><span class='hint'>ост. {format_tokens(key.remaining_tokens)}</span></td><td>{status}</td>
         <td><div class='management-actions'><button type='button' class='secondary' data-edit='{edit_id}'>\u0423\u043f\u0440\u0430\u0432\u043b\u044f\u0442\u044c</button>
         <form method='post' action='/ai/tokens/adm/{key.id}/delete' class='inline-delete-form'>
           <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
@@ -991,7 +1046,7 @@ __all__ = [
     "CheapVibeCodeClient", "SecondaryKeyClient", "SERVICE_OPTIONS", "TokenKey", "TokenKeyStore",
     "create_tokens_routes", "default_instruction_choice", "generate_access_code",
     "instruction_command", "instruction_remove_command", "instruction_steps",
-    "normalize_access_code",
+    "normalize_access_code", "trusted_secondary_remaining", "used_tokens_from_remaining",
 ]
 
 
