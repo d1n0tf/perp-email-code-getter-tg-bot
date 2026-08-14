@@ -35,6 +35,8 @@ TOKEN_TEXT = {
         "instructions": "ИНСТРУКЦИЯ ПО ИСПОЛЬЗОВАНИЮ", "instructions_intro": "Если вы не знаете как использовать API ключ, мы поможем, для начала выберите через что вы будете использовать API",
         "choose_service": "1. Выберите сервис", "choose_app": "2. Выберите приложение", "choose_os": "3. Выберите операционную систему", "selected": "Выбрано:", "description": "Описание:", "os": "Операционная система:",
         "manual": "Ручная настройка с готовым скриптом", "shell_windows": "PowerShell", "shell_other": "Терминал", "open": "Откройте {shell} на машине, где запускается выбранное приложение.", "run": "Скопируйте и выполните скрипт ниже. API ключ уже подставлен автоматически.", "restart": "Перезапустите приложение после завершения настройки.", "warning": "⚠️ Копируйте скрипт полностью или воспользуйтесь кнопкой «Скопировать».", "copy": "Скопировать", "copied": "Скопировано", "remove_hint": "Для удаления настройки повторите инструкцию из документации сервиса или удалите добавленные строки из конфигурации.",
+        "remaining_sep": "из", "remove_script": "Скрипт удаления настройки",
+        "grok_open_windows": "Открой PowerShell.", "grok_open_other": "Открой терминал.", "grok_run": "Выполни команду ниже.", "grok_restart": "Перезапусти терминал и введи grok.",
         "required": "Введите ключ доступа.", "missing": "Ключ доступа не существует.", "success": "Ключ успешно активирован. API-ключ готов к использованию.",
         "balance_unavailable": "Не удалось обновить баланс токенов.",
     },
@@ -46,6 +48,8 @@ TOKEN_TEXT = {
         "instructions": "INSTRUCTIONS FOR USE", "instructions_intro": "If you do not know how to use the API key, we can help. First choose how you will use the API.",
         "choose_service": "1. Choose a service", "choose_app": "2. Choose an application", "choose_os": "3. Choose an operating system", "selected": "Selected:", "description": "Description:", "os": "Operating system:",
         "manual": "Manual setup with a ready-made script", "shell_windows": "PowerShell", "shell_other": "Terminal", "open": "Open {shell} on the machine where the selected application runs.", "run": "Copy and run the script below. The API key is already inserted automatically.", "restart": "Restart the application after setup is complete.", "warning": "⚠️ Copy the complete script or use the «Copy» button.", "copy": "Copy", "copied": "Copied", "remove_hint": "To remove the setup, follow the service documentation or remove the added configuration lines.",
+        "remaining_sep": "of", "remove_script": "Uninstall script",
+        "grok_open_windows": "Open PowerShell.", "grok_open_other": "Open the terminal.", "grok_run": "Run the command below.", "grok_restart": "Restart the terminal and type grok.",
         "required": "Enter an access key.", "missing": "The access key does not exist.", "success": "The key was activated successfully. The API key is ready to use.",
         "balance_unavailable": "Could not refresh the token balance.",
     },
@@ -207,6 +211,21 @@ class TokenKeyStore:
             self._write(kept)
             return True
 
+    async def apply_remaining(self, key_id: int, remaining: int) -> TokenKey | None:
+        async with self._lock:
+            keys = self._read()
+            for index, key in enumerate(keys):
+                if key.id != key_id:
+                    continue
+                used_tokens = max(0, key.token_limit - max(0, remaining))
+                exhausted_at = key.exhausted_at or utc_now() if used_tokens >= key.token_limit else None
+                updated = replace(key, used_tokens=used_tokens, exhausted_at=exhausted_at)
+                if updated != key:
+                    keys[index] = updated
+                    self._write(keys)
+                return updated
+        return None
+
 
 class SecondaryKeyClient(Protocol):
     async def create_key(self, *, name: str, token_limit: int) -> str: ...
@@ -331,6 +350,20 @@ def create_tokens_routes(
         session = request.cookies.get(TOKENS_ADMIN_COOKIE, "")
         return bool(session and session in admin_sessions)
 
+    async def refresh_stored_balance(key: TokenKey) -> TokenKey:
+        try:
+            remaining = await key_client.get_token_balance(api_key=key.api_key)
+        except RuntimeError:
+            return key
+        updated = await store.apply_remaining(key.id, remaining)
+        return updated or key
+
+    async def refresh_stored_balances(keys: list[TokenKey]) -> list[TokenKey]:
+        if not keys:
+            return keys
+        refreshed = await asyncio.gather(*(refresh_stored_balance(key) for key in keys))
+        return sorted(refreshed, key=lambda key: key.id, reverse=True)
+
     async def admin_response(
         request: Request,
         *,
@@ -340,7 +373,7 @@ def create_tokens_routes(
     ) -> HTMLResponse:
         csrf_token = secrets.token_urlsafe(32)
         authenticated = is_admin(request)
-        keys = await store.list() if authenticated else []
+        keys = await refresh_stored_balances(await store.list()) if authenticated else []
         response = render_tokens_admin(
             csrf_token=csrf_token,
             authenticated=authenticated,
@@ -356,6 +389,8 @@ def create_tokens_routes(
         locale = token_locale(request.query_params.get("lang"))
         access_code = request.cookies.get(TOKENS_ACCESS_COOKIE, "")
         key = await store.get_by_code(access_code) if access_code else None
+        if key is not None:
+            key = await refresh_stored_balance(key)
         error = exhausted_message(key, locale) if key is not None and key.is_exhausted else ""
         return user_response(locale=locale, key=key, error=error)
 
@@ -370,6 +405,7 @@ def create_tokens_routes(
         key = await store.activate(access_code)
         if key is None:
             return user_response(locale=locale, error=TOKEN_TEXT[locale]["missing"], submitted_code=access_code, status_code=404)
+        key = await refresh_stored_balance(key)
         if key.is_exhausted:
             response = user_response(locale=locale, key=key, error=exhausted_message(key, locale), submitted_code=access_code)
         else:
@@ -389,6 +425,8 @@ def create_tokens_routes(
             token_balance = await key_client.get_token_balance(api_key=key.api_key)
         except RuntimeError:
             return JSONResponse({"ok": False, "error": "balance_unavailable"}, status_code=502, headers={"Cache-Control": "no-store"})
+        updated = await store.apply_remaining(key.id, token_balance)
+        key = updated or key
         return JSONResponse(
             {
                 "ok": True,
@@ -396,6 +434,8 @@ def create_tokens_routes(
                 "formatted": format_tokens(token_balance),
                 "token_limit": key.token_limit,
                 "token_limit_formatted": format_tokens(key.token_limit),
+                "used_tokens": key.used_tokens,
+                "used_tokens_formatted": format_tokens(key.used_tokens),
             },
             headers={"Cache-Control": "no-store"},
         )
@@ -645,7 +685,7 @@ def render_key_information(key: TokenKey, locale: str = "ru") -> str:
       <dt>{html.escape(text['service'])}</dt><dd>{html.escape(key.service.upper())}</dd>
       <dt>{html.escape(text['activated'])}</dt><dd>{format_datetime(key.activated_at)}</dd>
       <dt>{html.escape(text['limit'])}</dt><dd>{format_tokens(key.token_limit)}</dd>
-      <dt>{html.escape(text['remaining'])}</dt><dd id='token-balance' data-fallback='{format_tokens(key.remaining_tokens)}'>{format_tokens(key.remaining_tokens)} / {format_tokens(key.token_limit)}</dd>
+      <dt>{html.escape(text['remaining'])}</dt><dd id='token-balance' data-separator='{html.escape(text['remaining_sep'], quote=True)}' data-fallback='{format_tokens(key.remaining_tokens)}'>{format_tokens(key.remaining_tokens)} {html.escape(text['remaining_sep'])} {format_tokens(key.token_limit)}</dd>
       <dt>{html.escape(text['status'])}</dt><dd>{html.escape(status)}</dd>
       <dt>{html.escape(text['api'])}</dt><dd><code class='api-key'>{html.escape(key.api_key)}</code></dd>
     </dl></section>"""
@@ -654,7 +694,8 @@ def render_key_information(key: TokenKey, locale: str = "ru") -> str:
 INSTRUCTION_GROUPS = (
     ("codex", "Codex", ("VS Code", "App", "CLI")),
     ("claude", "Claude", ("Claude Code CLI", "Claude App")),
-    ("other", "Другие", ("Hermes Desktop", "Cheap Code", "Grok Build", "Pi", "OpenCode", "Cursor")),
+    ("grok", "Grok", ("Grok Build",)),
+    ("other", "Другие", ("Hermes Desktop", "Cheap Code", "Pi", "OpenCode", "Cursor")),
 )
 INSTRUCTION_SYSTEMS = ("Windows", "macOS", "Linux")
 INSTRUCTION_SYSTEMS_BY_APP = {
@@ -677,6 +718,9 @@ INSTRUCTION_ENDPOINTS = {
     "OpenCode": {"Windows": "iow", "macOS": "iom", "Linux": "iol"},
     "Cursor": {"Windows": "icrw", "macOS": "icrm", "Linux": "icr"},
 }
+INSTRUCTION_REMOVE_ENDPOINTS = {
+    "Grok Build": {"Windows": "rgw", "macOS": "rgm", "Linux": "rgl"},
+}
 
 
 def instruction_slug(value: str) -> str:
@@ -693,41 +737,81 @@ def instruction_command(application: str, system: str, api_key: str, locale: str
     if application == "Cheap Code":
         message = "Set the API key in the application settings" if locale == "en" else "Установите API ключ в настройках приложения"
         return f"npm install -g @cheapcode/cli@latest && echo '{message}: {api_key}'"
+    if application == "Grok Build":
+        if system == "Windows":
+            return f"$env:CVC_API_KEY='{api_key}'; iex(irm '{url}')"
+        return f"bash <(curl -fsSL '{url}') '{api_key}'"
     if system == "Windows":
         return f"$env:CVC_API_KEY='{api_key}'; iex(irm '{url}')"
     return f"bash <(curl -fsSL '{url}') '{api_key}'"
 
 
+def instruction_remove_command(application: str, system: str) -> str | None:
+    endpoints = INSTRUCTION_REMOVE_ENDPOINTS.get(application)
+    if not endpoints:
+        return None
+    url = f"https://cheapvibecode.ru/{endpoints[system]}"
+    if system == "Windows":
+        return f"iex(irm '{url}')"
+    return f"bash <(curl -fsSL '{url}')"
+
+
+def instruction_steps(application: str, system: str, locale: str = "ru") -> list[str]:
+    text = TOKEN_TEXT[token_locale(locale)]
+    if application == "Grok Build":
+        opener = text["grok_open_windows"] if system == "Windows" else text["grok_open_other"]
+        return [opener, text["grok_run"], text["grok_restart"]]
+    shell = text["shell_windows"] if system == "Windows" else text["shell_other"]
+    return [text["open"].format(shell=shell), text["run"], text["restart"]]
+
+
+def default_instruction_choice(service: str) -> tuple[str, str]:
+    normalized = service.strip().lower()
+    if normalized == "grok":
+        return "grok", "Grok Build"
+    if normalized in {"openai", "codex"}:
+        return "codex", "CLI"
+    if normalized == "claude":
+        return "claude", "Claude Code CLI"
+    return "other", "Hermes Desktop"
+
+
 def render_instructions(key: TokenKey, locale: str = "ru") -> str:
     text = TOKEN_TEXT[token_locale(locale)]
+    default_provider, default_app = default_instruction_choice(key.service)
     cards: list[str] = []
     for _, _, applications in INSTRUCTION_GROUPS:
         for application in applications:
             for system in INSTRUCTION_SYSTEMS_BY_APP[application]:
                 slug = f"{instruction_slug(application)}-{instruction_slug(system)}"
                 command = html.escape(instruction_command(application, system, key.api_key, locale))
-                shell = text["shell_windows"] if system == "Windows" else text["shell_other"]
                 description = text["manual"]
+                steps = "".join(f"<li>{html.escape(step)}</li>" for step in instruction_steps(application, system, locale))
+                remove_command = instruction_remove_command(application, system)
+                remove_block = ""
+                if remove_command:
+                    remove_slug = f"{slug}-remove"
+                    remove_block = f"""
+                  <p class='hint'>{html.escape(text['remove_script'])}</p>
+                  <pre id='instruction-script-{remove_slug}'>{html.escape(remove_command)}</pre>
+                  <button type='button' class='secondary copy-instruction' data-copy-target='instruction-script-{remove_slug}' data-copy-label='{html.escape(text['copy'])}' data-copied-label='{html.escape(text['copied'])}'>{html.escape(text['copy'])}</button>"""
                 cards.append(f"""
                 <article class='instruction-card' id='instruction-card-{slug}' data-provider-app='{html.escape(application)}' data-instruction-system='{system}' hidden>
                   <h3>{html.escape(application)} · {html.escape(system)}</h3>
                   <p><strong>• {html.escape(text['selected'])}</strong> {html.escape(application)}<br><strong>• {html.escape(text['description'])}</strong> {html.escape(description)}<br><strong>• {html.escape(text['os'])}</strong> {html.escape(system)}</p>
-                  <ol>
-                    <li>{html.escape(text['open'].format(shell=shell))}</li>
-                    <li>{html.escape(text['run'])}</li>
-                    <li>{html.escape(text['restart'])}</li>
-                  </ol>
+                  <ol>{steps}</ol>
                   <p class='warning'>{html.escape(text['warning'])}</p>
                   <pre id='instruction-script-{slug}'>{command}</pre>
                   <button type='button' class='primary copy-instruction' data-copy-target='instruction-script-{slug}' data-copy-label='{html.escape(text['copy'])}' data-copied-label='{html.escape(text['copied'])}'>{html.escape(text['copy'])}</button>
+                  {remove_block}
                   <p class='hint'>{html.escape(text['remove_hint'])}</p>
                 </article>""")
     groups = "".join(
-        f"<button type='button' class='choice {'active' if index == 1 else ''}' data-instruction-provider='{key}'>{html.escape('Others' if key == 'other' and locale == 'en' else label)}</button>"
-        for index, (key, label, _) in enumerate(INSTRUCTION_GROUPS)
+        f"<button type='button' class='choice {'active' if group_key == default_provider else ''}' data-instruction-provider='{group_key}'>{html.escape('Others' if group_key == 'other' and locale == 'en' else label)}</button>"
+        for group_key, label, _ in INSTRUCTION_GROUPS
     )
     apps = "".join(
-        f"<button type='button' class='choice {'active' if app == 'Claude Code CLI' else ''}' data-instruction-app='{html.escape(app)}' data-provider='{group_key}'>{html.escape(app)}</button>"
+        f"<button type='button' class='choice {'active' if app == default_app else ''}' data-instruction-app='{html.escape(app)}' data-provider='{group_key}'>{html.escape(app)}</button>"
         for group_key, _, applications in INSTRUCTION_GROUPS for app in applications
     )
     systems = "".join(
@@ -735,7 +819,7 @@ def render_instructions(key: TokenKey, locale: str = "ru") -> str:
         for system in INSTRUCTION_SYSTEMS
     )
     return f"""
-    <section class='card instructions'>
+    <section class='card instructions' data-default-provider='{html.escape(default_provider, quote=True)}' data-default-app='{html.escape(default_app, quote=True)}'>
       <h2>{html.escape(text['instructions'])}</h2>
       <p>{html.escape(text['instructions_intro'])}</p>
       <h3 class='step-title'>{html.escape(text['choose_service'])}</h3>
@@ -744,7 +828,7 @@ def render_instructions(key: TokenKey, locale: str = "ru") -> str:
       <div class='choice-row instruction-apps' role='group' aria-label='{html.escape(text['choose_app'])}'>{apps}</div>
       <h3 class='step-title'>{html.escape(text['choose_os'])}</h3>
       <div class='choice-row' role='group' aria-label='{html.escape(text['choose_os'])}'>{systems}</div>
-      <div class='selected-line'>• {html.escape(text['selected'])} <strong id='selected-method'>Claude Code CLI</strong><br>• {html.escape(text['description'])} <strong id='selected-description'>{html.escape(text['manual'])}</strong><br>• {html.escape(text['os'])} <strong id='selected-os'>Windows</strong></div>
+      <div class='selected-line'>• {html.escape(text['selected'])} <strong id='selected-method'>{html.escape(default_app)}</strong><br>• {html.escape(text['description'])} <strong id='selected-description'>{html.escape(text['manual'])}</strong><br>• {html.escape(text['os'])} <strong id='selected-os'>Windows</strong></div>
       <div id='instruction-content'>{''.join(cards)}</div>
     </section>
     """
@@ -871,7 +955,10 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 @media(max-width:650px) {{ .page,.admin-page {{ width:min(100% - 20px,960px); margin-top:12px; }} .card {{ padding:18px; border-radius:12px; }} h1 {{ font-size:24px; }} .details,.create-form,.edit-grid {{ grid-template-columns:1fr; }} .title-row {{ display:block; }} .title-row form {{ margin-top:12px; }} }}
 </style></head><body>{content}<script>
 (function() {{
-  var provider='claude', app='Claude Code CLI', os='Windows';
+  var root=document.querySelector('.instructions');
+  var provider=(root && root.dataset.defaultProvider) || 'claude';
+  var app=(root && root.dataset.defaultApp) || 'Claude Code CLI';
+  var os='Windows';
   var descriptions={{'VS Code':'Настройка API в VS Code','App':'Настройка приложения','CLI':'Ручная CLI-настройка','Claude Code CLI':'Ручная CLI-настройка','Claude App':'Настройка Claude App','Hermes Desktop':'Настройка Hermes Desktop','Cheap Code':'Настройка Cheap Code','Grok Build':'Настройка Grok Build','Pi':'Настройка Pi','OpenCode':'Настройка OpenCode','Cursor':'Настройка Cursor'}};
   if(document.documentElement.lang==='en') descriptions={{'VS Code':'API setup in VS Code','App':'Application setup','CLI':'Manual CLI setup','Claude Code CLI':'Manual CLI setup','Claude App':'Claude App setup','Hermes Desktop':'Hermes Desktop setup','Cheap Code':'Cheap Code setup','Grok Build':'Grok Build setup','Pi':'Pi setup','OpenCode':'OpenCode setup','Cursor':'Cursor setup'}};
   function update() {{
@@ -891,7 +978,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
   document.querySelectorAll('[data-instruction-os]').forEach(function(button) {{ button.addEventListener('click',function() {{ os=button.dataset.instructionOs; update(); }}); }});
   document.querySelectorAll('.copy-instruction').forEach(function(button) {{ button.addEventListener('click',function() {{ var target=document.getElementById(button.dataset.copyTarget); if(!target) return; navigator.clipboard.writeText(target.textContent).then(function() {{ button.textContent=button.dataset.copiedLabel; setTimeout(function() {{ button.textContent=button.dataset.copyLabel; }},1500); }}); }}); }});
   var balance=document.getElementById('token-balance');
-  if(balance) fetch('/ai/tokens/balance',{{cache:'no-store'}}).then(function(response) {{ return response.ok ? response.json() : Promise.reject(); }}).then(function(data) {{ if(data.ok) balance.textContent=data.formatted+' / '+data.token_limit_formatted; }}).catch(function() {{ /* Keep the locally saved balance visible. */ }});
+  if(balance) fetch('/ai/tokens/balance',{{cache:'no-store'}}).then(function(response) {{ return response.ok ? response.json() : Promise.reject(); }}).then(function(data) {{ if(data.ok) balance.textContent=data.formatted+' '+(balance.dataset.separator||'/')+' '+data.token_limit_formatted; }}).catch(function() {{ /* Keep the locally saved balance visible. */ }});
   function copyApiKey(cell) {{ var value=cell.dataset.copyApiKey; if(!value) return; navigator.clipboard.writeText(value).then(function() {{ var old=cell.title; cell.title='API key скопирован'; setTimeout(function() {{ cell.title=old; }},1500); }}); }}
   document.querySelectorAll('.copyable-api-key').forEach(function(cell) {{ cell.addEventListener('click',function() {{ copyApiKey(cell); }}); cell.addEventListener('keydown',function(event) {{ if(event.key==='Enter'||event.key===' ') {{ event.preventDefault(); copyApiKey(cell); }} }}); }});
   document.querySelectorAll('[data-edit]').forEach(function(button) {{ button.addEventListener('click',function() {{ var form=document.getElementById(button.dataset.edit); if(form) form.hidden=!form.hidden; }}); }});
@@ -901,8 +988,10 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 
 
 __all__ = [
-    "CheapVibeCodeClient", "SecondaryKeyClient", "TokenKey", "TokenKeyStore",
-    "create_tokens_routes", "generate_access_code", "normalize_access_code",
+    "CheapVibeCodeClient", "SecondaryKeyClient", "SERVICE_OPTIONS", "TokenKey", "TokenKeyStore",
+    "create_tokens_routes", "default_instruction_choice", "generate_access_code",
+    "instruction_command", "instruction_remove_command", "instruction_steps",
+    "normalize_access_code",
 ]
 
 

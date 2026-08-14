@@ -6,7 +6,17 @@ from pathlib import Path
 import httpx
 from fastapi import FastAPI
 
-from src.tokens import TokenKey, TokenKeyStore, create_tokens_routes, utc_now
+from src.tokens import (
+    SERVICE_OPTIONS,
+    TokenKey,
+    TokenKeyStore,
+    create_tokens_routes,
+    default_instruction_choice,
+    instruction_command,
+    instruction_remove_command,
+    instruction_steps,
+    utc_now,
+)
 
 
 class HiddenInputParser(HTMLParser):
@@ -25,6 +35,8 @@ class FakeKeyClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []
         self.balance_calls: list[str] = []
+        self.balance_value: int = 1_234_567
+        self.balance_error: Exception | None = None
 
     async def create_key(self, *, name: str, token_limit: int) -> str:
         self.calls.append((name, token_limit))
@@ -32,7 +44,9 @@ class FakeKeyClient:
 
     async def get_token_balance(self, *, api_key: str) -> int:
         self.balance_calls.append(api_key)
-        return 1_234_567
+        if self.balance_error is not None:
+            raise self.balance_error
+        return self.balance_value
 
 
 class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
@@ -128,7 +142,11 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["token_balance"], 1_234_567)
         self.assertEqual(response.json()["formatted"], "1 234 567")
+        self.assertEqual(response.json()["used_tokens"], 765_433)
         self.assertEqual(self.key_client.balance_calls, ["sk-cvc-balance-test"])
+        stored = await self.store.get_by_code(access_code)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.used_tokens if stored else None, 765_433)
 
     async def test_admin_creates_secondary_access_keys(self) -> None:
         login_form, login_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
@@ -159,6 +177,156 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(keys), 2)
         self.assertEqual({key.api_key for key in keys}, {"sk-test-1", "sk-test-2"})
         self.assertTrue(all(len(key.access_code) == 20 and key.access_code.isalnum() for key in keys))
+        self.assertIn("value='Grok'", response.text)
+
+    async def test_page_refreshes_remaining_tokens_from_balance_api(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(
+                id=1,
+                created_at=utc_now(),
+                access_code=access_code,
+                api_key="sk-cvc-live",
+                service="Grok",
+                name="Grok key",
+                token_limit=2_000_000,
+                used_tokens=0,
+                activated_at=utc_now(),
+            )
+        ])
+
+        response = await self.client.get(
+            "/ai/tokens",
+            headers={"Cookie": f"tokens_access_key={access_code}"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("1 234 567 из 2 000 000", response.text)
+        self.assertIn("GROK", response.text)
+        stored = await self.store.get_by_code(access_code)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.used_tokens if stored else None, 765_433)
+        self.assertEqual(self.key_client.balance_calls, ["sk-cvc-live"])
+
+    async def test_balance_failure_keeps_stored_used_tokens(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(
+                id=1,
+                created_at=utc_now(),
+                access_code=access_code,
+                api_key="sk-cvc-stale",
+                service="Claude",
+                name="Claude key",
+                token_limit=2_000_000,
+                used_tokens=10,
+                activated_at=utc_now(),
+            )
+        ])
+        self.key_client.balance_error = RuntimeError("down")
+
+        response = await self.client.get(
+            "/ai/tokens",
+            headers={"Cookie": f"tokens_access_key={access_code}"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("1 999 990 из 2 000 000", response.text)
+        stored = await self.store.get_by_code(access_code)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.used_tokens if stored else None, 10)
+
+    async def test_grok_instructions_use_html_scripts_and_top_level_service(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(
+                id=1,
+                created_at=utc_now(),
+                access_code=access_code,
+                api_key="sk-cvc-grok",
+                service="Grok",
+                name="Grok key",
+                token_limit=2_000_000,
+                activated_at=utc_now(),
+            )
+        ])
+
+        response = await self.client.get(
+            "/ai/tokens",
+            headers={"Cookie": f"tokens_access_key={access_code}"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("data-instruction-provider='grok'", response.text)
+        self.assertIn("data-default-provider='grok'", response.text)
+        self.assertIn("data-default-app='Grok Build'", response.text)
+        self.assertIn("Grok Build", response.text)
+        self.assertIn("Открой PowerShell.", response.text)
+        self.assertIn("Перезапусти терминал и введи grok.", response.text)
+        self.assertIn("https://cheapvibecode.ru/igw", response.text)
+        self.assertIn("https://cheapvibecode.ru/rgw", response.text)
+        self.assertIn("https://cheapvibecode.ru/igm", response.text)
+        self.assertIn("$env:CVC_API_KEY=", response.text)
+        self.assertIn("sk-cvc-grok", response.text)
+        self.assertIn("data-instruction-app='Claude Code CLI'", response.text)
+
+    async def test_admin_table_refreshes_used_tokens_from_balance_api(self) -> None:
+        await self.store.add_many([
+            TokenKey(
+                id=7,
+                created_at=utc_now(),
+                access_code="ABCDEFGHIJKLMNOPQRST",
+                api_key="sk-cvc-admin",
+                service="Grok",
+                name="Grok admin",
+                token_limit=2_000_000,
+                used_tokens=0,
+            )
+        ])
+        login_form, login_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        login = await self.client.post(
+            "/ai/tokens/adm/login",
+            data={**login_form, "password": "secret"},
+            headers=login_headers,
+            follow_redirects=False,
+        )
+        session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        response = await self.client.get("/ai/tokens/adm", headers={"Cookie": session_cookie})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("Grok", response.text)
+        self.assertIn("765 433", response.text)
+        self.assertEqual(self.key_client.balance_calls, ["sk-cvc-admin"])
+        stored = await self.store.get(7)
+        self.assertIsNotNone(stored)
+        self.assertEqual(stored.used_tokens if stored else None, 765_433)
+
+
+class TokenInstructionHelpersTestCase(unittest.TestCase):
+    def test_grok_is_a_first_class_service_and_instruction_group(self) -> None:
+        self.assertIn("Grok", SERVICE_OPTIONS)
+        self.assertEqual(default_instruction_choice("Grok"), ("grok", "Grok Build"))
+        self.assertEqual(
+            instruction_command("Grok Build", "Windows", "sk-cvc-example"),
+            "$env:CVC_API_KEY='sk-cvc-example'; iex(irm 'https://cheapvibecode.ru/igw')",
+        )
+        self.assertEqual(
+            instruction_command("Grok Build", "macOS", "sk-cvc-example"),
+            "bash <(curl -fsSL 'https://cheapvibecode.ru/igm') 'sk-cvc-example'",
+        )
+        self.assertEqual(
+            instruction_command("Grok Build", "Linux", "sk-cvc-example"),
+            "bash <(curl -fsSL 'https://cheapvibecode.ru/igl') 'sk-cvc-example'",
+        )
+        self.assertEqual(instruction_remove_command("Grok Build", "Windows"), "iex(irm 'https://cheapvibecode.ru/rgw')")
+        self.assertEqual(
+            instruction_steps("Grok Build", "Windows", "ru"),
+            ["Открой PowerShell.", "Выполни команду ниже.", "Перезапусти терминал и введи grok."],
+        )
+        self.assertEqual(
+            instruction_steps("Grok Build", "macOS", "en"),
+            ["Open the terminal.", "Run the command below.", "Restart the terminal and type grok."],
+        )
 
 
 if __name__ == "__main__":
