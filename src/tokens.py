@@ -22,7 +22,7 @@ TOKENS_USER_CSRF_COOKIE = "tokens_user_csrf"
 TOKENS_ADMIN_CSRF_COOKIE = "tokens_admin_csrf"
 TOKEN_CODE_ALPHABET = string.ascii_uppercase + string.digits
 SERVICE_OPTIONS = (
-    "Claude", "OpenAI", "Google", "DeepSeek", "Alibaba Cloud",
+    "Claude", "OpenAI", "Google", "Grok", "DeepSeek", "Alibaba Cloud",
     "Z.AI (GLM)", "KIMI", "Xiaomi", "NVIDIA",
 )
 
