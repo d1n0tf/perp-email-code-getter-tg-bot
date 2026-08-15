@@ -784,7 +784,7 @@ def instruction_slug(value: str) -> str:
 
 def instruction_command(application: str, system: str, api_key: str, locale: str = "ru") -> str:
     endpoint = INSTRUCTION_ENDPOINTS[application][system]
-    url = f"https://cheapvibecode.ru/{endpoint}"
+    url = f"https://starimg.ru/ai/common/{endpoint}"
     if application == "Claude Code CLI":
         if system == "Windows":
             return f"$h=@{{Authorization='Bearer {api_key}'}}; iex(irm -Headers $h '{url}')"
@@ -805,7 +805,7 @@ def instruction_remove_command(application: str, system: str) -> str | None:
     endpoints = INSTRUCTION_REMOVE_ENDPOINTS.get(application)
     if not endpoints:
         return None
-    url = f"https://cheapvibecode.ru/{endpoints[system]}"
+    url = f"https://starimg.ru/ai/common/{endpoints[system]}"
     if system == "Windows":
         return f"iex(irm '{url}')"
     return f"bash <(curl -fsSL '{url}')"
