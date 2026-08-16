@@ -429,51 +429,26 @@ class JsonStorage:
                 key_data.pop(normalized_original_code, None)
             key_data[normalized_target_code] = updated_key.to_dict()
 
+            original_account = EmailAccount.from_dict(existing_account)
+            access_changed = (
+                normalized_target_code != normalized_original_code
+                or account != original_account
+            )
             activation_data = self._load_json(
                 self.activated_key_store_path,
                 default={},
                 strict=True,
             )
-            updated_activations: dict[str, UserKeyActivation] = {}
-            max_last_used_at = normalized_activated_at
-            for requester_id, raw_value in activation_data.items():
-                if not isinstance(raw_value, dict):
-                    continue
-                try:
-                    activation = UserKeyActivation.from_dict(raw_value)
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if activation.code != normalized_original_code:
-                    continue
-
-                last_used_at = max(activation.last_used_at, normalized_activated_at)
-                max_last_used_at = max(max_last_used_at, last_used_at)
-                updated_activations[requester_id] = UserKeyActivation(
-                    requester_id=activation.requester_id,
-                    user_id=activation.user_id,
-                    chat_id=activation.chat_id,
-                    username=activation.username,
-                    full_name=activation.full_name,
-                    code=normalized_target_code,
-                    activated_at=normalized_activated_at,
-                    last_used_at=last_used_at,
-                )
-
-            if selected_requester_id and selected_requester_id in updated_activations:
-                selected_activation = updated_activations[selected_requester_id]
-                updated_activations[selected_requester_id] = UserKeyActivation(
-                    requester_id=selected_activation.requester_id,
-                    user_id=selected_activation.user_id,
-                    chat_id=selected_activation.chat_id,
-                    username=selected_activation.username,
-                    full_name=selected_activation.full_name,
-                    code=selected_activation.code,
-                    activated_at=selected_activation.activated_at,
-                    last_used_at=max_last_used_at + timedelta(microseconds=1),
-                )
-
-            for requester_id, activation in updated_activations.items():
-                activation_data[requester_id] = activation.to_dict()
+            if access_changed:
+                # A browser cookie identifies the requester, not a specific
+                # subscription version. Do not transfer its old activation to
+                # a replacement code or account.
+                activation_data = {
+                    requester_id: record
+                    for requester_id, record in activation_data.items()
+                    if not isinstance(record, dict)
+                    or normalize_key_code(str(record.get("code") or "")) != normalized_original_code
+                }
 
             self._write_json(self.email_store_path, email_data)
             self._write_json(self.subscription_key_store_path, key_data)

@@ -341,16 +341,15 @@ class AdminControlTests(BaseWebFlowTestCase):
             ),
         )
         self.assertIsNone(await self.storage.get_subscription_key(self.key.code))
-        updated_activation = await self.storage.get_user_activation(
+        old_activation = await self.storage.get_user_activation(
             f"web:{self.client.cookies[WEB_USER_COOKIE_NAME]}",
         )
-        self.assertIsNotNone(updated_activation)
-        assert updated_activation is not None
-        self.assertEqual(updated_activation.code, "UPDATEDKEY12345")
-        self.assertEqual(
-            updated_activation.activated_at,
-            datetime(2026, 2, 10, 14, 30, tzinfo=timezone.utc),
-        )
+        self.assertIsNone(old_activation)
+
+        old_cookie_page = await self.client.get(f"{self.route('/')}?lang=en")
+        self.assertEqual(old_cookie_page.status_code, 200)
+        self.assertIn("Activate code", old_cookie_page.text)
+        self.assertNotIn("shared-updated@example.com", old_cookie_page.text)
 
     async def test_admin_control_add_form_generates_key_when_it_is_not_provided(self) -> None:
         login_response = await self.login_admin(locale="ru")
