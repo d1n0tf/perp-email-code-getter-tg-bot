@@ -363,6 +363,31 @@ class AdminControlTests(BaseWebFlowTestCase):
         self.assertIn("Activate code", old_cookie_page.text)
         self.assertNotIn("shared-updated@example.com", old_cookie_page.text)
 
+    async def test_admin_add_replacing_account_invalidates_old_cookie_activation(self) -> None:
+        await self.activate_key(locale="en")
+        old_cookie = self.client.cookies[WEB_USER_COOKIE_NAME]
+        login_response = await self.login_admin(locale="en")
+        self.assertEqual(login_response.status_code, 303)
+
+        response = await self.client.post(
+            self.route("/admin_control/accounts/add"),
+            data={
+                "lang": "en",
+                "raw_account": (
+                    "shared@example.com:new-pass:recovery@example.com:"
+                    "new-recovery-pass:new-refresh-token:new-client-id"
+                ),
+                "duration_days": "30",
+                "key_code": "REPLACEMENTKEY1",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(await self.storage.get_user_activation(f"web:{old_cookie}"))
+        old_cookie_page = await self.client.get(f"{self.route('/')}?lang=en")
+        self.assertIn("Activate code", old_cookie_page.text)
+        self.assertNotIn("new-refresh-token", old_cookie_page.text)
+
     async def test_admin_control_add_form_generates_key_when_it_is_not_provided(self) -> None:
         login_response = await self.login_admin(locale="ru")
         self.assertEqual(login_response.status_code, 303)

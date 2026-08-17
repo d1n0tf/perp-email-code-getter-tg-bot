@@ -206,7 +206,7 @@ class BotService:
         subscriptions: list[ActivatedSubscription] = []
         for activation in activations:
             key = keys_by_code.get(activation.code)
-            if key is None:
+            if key is None or activation.access_version != key.access_version:
                 continue
             subscriptions.append(
                 ActivatedSubscription(
@@ -229,7 +229,7 @@ class BotService:
             return None
 
         key = await self.storage.get_subscription_key(activation.code)
-        if key is None:
+        if key is None or activation.access_version != key.access_version:
             return None
 
         account = await self.storage.get_account(key.email_address)
@@ -354,6 +354,7 @@ class BotService:
             username=username,
             full_name=full_name,
             code=normalized_code,
+            access_version=key.access_version,
         )
         return (
             "activated",

@@ -125,6 +125,7 @@ class SubscriptionKey:
     duration_days: int
     created_at: datetime
     expires_at: datetime
+    access_version: int = 1
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "SubscriptionKey":
@@ -134,6 +135,9 @@ class SubscriptionKey:
             duration_days=int(data["duration_days"]),
             created_at=_parse_datetime(data["created_at"]),
             expires_at=_parse_datetime(data["expires_at"]),
+            # Keys written before access versioning are upgraded on read. Their
+            # old activations intentionally do not get this version.
+            access_version=max(1, int(data.get("access_version", 1))),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -143,6 +147,7 @@ class SubscriptionKey:
             "duration_days": self.duration_days,
             "created_at": self.created_at.astimezone(timezone.utc).isoformat(),
             "expires_at": self.expires_at.astimezone(timezone.utc).isoformat(),
+            "access_version": self.access_version,
         }
 
     def is_expired(self, now: datetime | None = None) -> bool:
@@ -160,6 +165,7 @@ class UserKeyActivation:
     code: str
     activated_at: datetime
     last_used_at: datetime
+    access_version: int | None = None
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "UserKeyActivation":
@@ -172,6 +178,11 @@ class UserKeyActivation:
             code=normalize_key_code(str(data["code"])),
             activated_at=_parse_datetime(data["activated_at"]),
             last_used_at=_parse_datetime(data.get("last_used_at") or data["activated_at"]),
+            access_version=(
+                int(data["access_version"])
+                if data.get("access_version") is not None
+                else None
+            ),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -184,6 +195,7 @@ class UserKeyActivation:
             "code": self.code,
             "activated_at": self.activated_at.astimezone(timezone.utc).isoformat(),
             "last_used_at": self.last_used_at.astimezone(timezone.utc).isoformat(),
+            "access_version": self.access_version,
         }
 
 
@@ -245,11 +257,94 @@ class JsonStorage:
         self._legacy_lock = asyncio.Lock()
         self._locale_lock = asyncio.Lock()
 
+    @staticmethod
+    def _remove_activations_for_email_locked(
+        *,
+        key_data: dict[str, Any],
+        activation_data: dict[str, Any],
+        email_address: str,
+    ) -> None:
+        """Remove bindings for every key that can disclose this account.
+
+        The caller must hold the email, key, and activation locks.  Account
+        credentials are mutable while an activation is merely a browser or
+        Telegram requester binding, so retaining that binding after a
+        credential change would give old key holders the replacement account.
+        """
+        protected_codes: set[str] = set()
+        for raw_key in key_data.values():
+            if not isinstance(raw_key, dict):
+                continue
+            try:
+                key = SubscriptionKey.from_dict(raw_key)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if key.email_address == email_address:
+                protected_codes.add(key.code)
+
+        for requester_id, record in list(activation_data.items()):
+            if (
+                isinstance(record, dict)
+                and normalize_key_code(str(record.get("code") or "")) in protected_codes
+            ):
+                activation_data.pop(requester_id, None)
+
+    @staticmethod
+    def _bump_key_access_versions_for_email_locked(
+        *,
+        key_data: dict[str, Any],
+        email_address: str,
+    ) -> None:
+        """Revoke all existing bindings for an account without trusting cleanup."""
+        for code, raw_key in key_data.items():
+            if not isinstance(raw_key, dict):
+                continue
+            try:
+                key = SubscriptionKey.from_dict(raw_key)
+            except (KeyError, TypeError, ValueError):
+                continue
+            if key.email_address != email_address:
+                continue
+            key_data[code] = SubscriptionKey(
+                code=key.code,
+                email_address=key.email_address,
+                duration_days=key.duration_days,
+                created_at=key.created_at,
+                expires_at=key.expires_at,
+                access_version=key.access_version + 1,
+            ).to_dict()
+
     async def upsert_account(self, account: EmailAccount) -> bool:
-        async with self._email_lock:
+        async with self._email_lock, self._key_lock, self._activation_lock:
             data = self._load_json(self.email_store_path, default={}, strict=True)
-            existed = account.login_email in data
+            existing_account_data = data.get(account.login_email)
+            existed = existing_account_data is not None
+            account_changed = existing_account_data != account.to_dict()
             data[account.login_email] = account.to_dict()
+
+            if existed and account_changed:
+                key_data = self._load_json(
+                    self.subscription_key_store_path,
+                    default={},
+                    strict=True,
+                )
+                activation_data = self._load_json(
+                    self.activated_key_store_path,
+                    default={},
+                    strict=True,
+                )
+                self._bump_key_access_versions_for_email_locked(
+                    key_data=key_data,
+                    email_address=account.login_email,
+                )
+                self._remove_activations_for_email_locked(
+                    key_data=key_data,
+                    activation_data=activation_data,
+                    email_address=account.login_email,
+                )
+                self._write_json(self.activated_key_store_path, activation_data)
+                self._write_json(self.subscription_key_store_path, key_data)
+
             self._write_json(self.email_store_path, data)
             return existed
 
@@ -285,7 +380,7 @@ class JsonStorage:
         normalized_original_email = normalize_email(original_email)
         normalized_target_email = normalize_email(account.login_email)
 
-        async with self._email_lock, self._key_lock:
+        async with self._email_lock, self._key_lock, self._activation_lock:
             email_data = self._load_json(self.email_store_path, default={}, strict=True)
             existing_account = email_data.get(normalized_original_email)
             if not isinstance(existing_account, dict):
@@ -321,7 +416,25 @@ class JsonStorage:
                     duration_days=key.duration_days,
                     created_at=key.created_at,
                     expires_at=key.expires_at,
+                    access_version=key.access_version,
                 ).to_dict()
+
+            if EmailAccount.from_dict(existing_account) != account:
+                activation_data = self._load_json(
+                    self.activated_key_store_path,
+                    default={},
+                    strict=True,
+                )
+                self._remove_activations_for_email_locked(
+                    key_data=key_data,
+                    activation_data=activation_data,
+                    email_address=normalized_target_email,
+                )
+                self._bump_key_access_versions_for_email_locked(
+                    key_data=key_data,
+                    email_address=normalized_target_email,
+                )
+                self._write_json(self.activated_key_store_path, activation_data)
 
             self._write_json(self.email_store_path, email_data)
             self._write_json(self.subscription_key_store_path, key_data)
@@ -336,7 +449,7 @@ class JsonStorage:
     ) -> tuple[str, SubscriptionKey | None]:
         normalized_key_code = normalize_key_code(key_code) if key_code and key_code.strip() else None
 
-        async with self._email_lock, self._key_lock:
+        async with self._email_lock, self._key_lock, self._activation_lock:
             email_data = self._load_json(self.email_store_path, default={}, strict=True)
             key_data = self._load_json(
                 self.subscription_key_store_path,
@@ -347,7 +460,9 @@ class JsonStorage:
             if normalized_key_code and normalized_key_code in key_data:
                 return "conflict_key", None
 
-            existed = account.login_email in email_data
+            existing_account_data = email_data.get(account.login_email)
+            existed = existing_account_data is not None
+            account_changed = existing_account_data != account.to_dict()
             email_data[account.login_email] = account.to_dict()
 
             used_codes = {normalize_key_code(code) for code in key_data}
@@ -355,6 +470,23 @@ class JsonStorage:
             created_at = datetime.now(timezone.utc)
             expires_on = to_moscow(created_at).date() + timedelta(days=duration_days)
             expires_at = moscow_end_of_day(expires_on)
+            if existed and account_changed:
+                activation_data = self._load_json(
+                    self.activated_key_store_path,
+                    default={},
+                    strict=True,
+                )
+                self._bump_key_access_versions_for_email_locked(
+                    key_data=key_data,
+                    email_address=account.login_email,
+                )
+                self._remove_activations_for_email_locked(
+                    key_data=key_data,
+                    activation_data=activation_data,
+                    email_address=account.login_email,
+                )
+                self._write_json(self.activated_key_store_path, activation_data)
+
             key = SubscriptionKey(
                 code=final_key_code,
                 email_address=account.login_email,
@@ -362,8 +494,8 @@ class JsonStorage:
                 created_at=created_at,
                 expires_at=expires_at,
             )
-
             key_data[final_key_code] = key.to_dict()
+
             self._write_json(self.email_store_path, email_data)
             self._write_json(self.subscription_key_store_path, key_data)
             return ("updated" if existed else "created"), key
@@ -416,7 +548,12 @@ class JsonStorage:
                 email_data.pop(normalized_original_email, None)
             email_data[normalized_target_email] = account.to_dict()
 
-            SubscriptionKey.from_dict(existing_key_data)
+            original_key = SubscriptionKey.from_dict(existing_key_data)
+            original_account = EmailAccount.from_dict(existing_account)
+            access_changed = (
+                normalized_target_code != normalized_original_code
+                or account != original_account
+            )
             expires_on = to_moscow(normalized_activated_at).date() + timedelta(days=duration_days)
             expires_at = moscow_end_of_day(expires_on)
             updated_key = SubscriptionKey(
@@ -425,17 +562,17 @@ class JsonStorage:
                 duration_days=duration_days,
                 created_at=normalized_activated_at,
                 expires_at=expires_at,
+                access_version=(
+                    original_key.access_version + 1
+                    if access_changed
+                    else original_key.access_version
+                ),
             )
 
             if normalized_target_code != normalized_original_code:
                 key_data.pop(normalized_original_code, None)
             key_data[normalized_target_code] = updated_key.to_dict()
 
-            original_account = EmailAccount.from_dict(existing_account)
-            access_changed = (
-                normalized_target_code != normalized_original_code
-                or account != original_account
-            )
             activation_data = self._load_json(
                 self.activated_key_store_path,
                 default={},
@@ -619,6 +756,7 @@ class JsonStorage:
         username: str | None,
         full_name: str | None,
         code: str,
+        access_version: int,
     ) -> UserKeyActivation:
         activation = UserKeyActivation(
             requester_id=requester_id,
@@ -629,6 +767,7 @@ class JsonStorage:
             code=normalize_key_code(code),
             activated_at=datetime.now(timezone.utc),
             last_used_at=datetime.now(timezone.utc),
+            access_version=access_version,
         )
         async with self._activation_lock:
             data = self._load_json(

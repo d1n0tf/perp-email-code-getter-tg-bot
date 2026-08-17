@@ -20,6 +20,7 @@ from src.tokens import (
     instruction_remove_command,
     instruction_steps,
     manual_instruction_command,
+    manual_instruction_notes,
     trusted_secondary_remaining,
     utc_now,
 )
@@ -129,7 +130,7 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/ai/tokens?lang=en")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Activation Service", response.text)
+        self.assertNotIn("<h1>Activation Service</h1>", response.text)
         self.assertIn("/ai/tokens?lang=ru", response.text)
         self.assertIn("name='lang' value='en'", response.text)
 
@@ -415,6 +416,9 @@ class TokenInstructionHelpersTestCase(unittest.TestCase):
         self.assertIn("~/.grok/config.toml", manual)
         self.assertIn('api_key = "sk-cvc-example"', manual)
         self.assertIn("api_backend = \"chat_completions\"", manual)
+        notes = manual_instruction_notes("Grok Build", "Windows", "ru")
+        self.assertEqual(len(notes), 3)
+        self.assertFalse(any("?" in note for note in notes))
         applications = " ".join(app for _, _, apps in INSTRUCTION_GROUPS for app in apps)
         self.assertIn("Kimi Code CLI", applications)
         self.assertIn("ZCode", applications)
@@ -426,6 +430,8 @@ class TokenInstructionHelpersTestCase(unittest.TestCase):
                     self.assertIn(system, INSTRUCTION_ENDPOINTS[application])
                     self.assertIn(system, INSTRUCTION_REMOVE_ENDPOINTS[application])
                     self.assertTrue(manual_instruction_command(application, system, "sk-cvc-example"))
+                    self.assertTrue(manual_instruction_notes(application, system, "ru"))
+                    self.assertTrue(manual_instruction_notes(application, system, "en"))
 
     def test_secondary_remaining_is_rejected_when_it_is_the_primary_balance(self) -> None:
         self.assertIsNone(trusted_secondary_remaining(50_000_000, 2_000_000, 50_000_000))

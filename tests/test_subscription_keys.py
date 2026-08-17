@@ -97,6 +97,105 @@ class SubscriptionKeyReuseTests(unittest.IsolatedAsyncioTestCase):
         for requester_id in activation_data:
             self.assertEqual(activation_data[requester_id]["code"], self.key.code)
 
+    async def test_replacing_account_through_add_invalidates_existing_key_activations(
+        self,
+    ) -> None:
+        status, _ = await self.service.activate_subscription_code(
+            user_id=101,
+            chat_id=1001,
+            username="user101",
+            full_name="User 101",
+            code=self.key.code,
+        )
+        self.assertEqual(status, "activated")
+
+        account, existed = await self.service.add_account(
+            "shared@example.com:new-pass:recovery@example.com:"
+            "new-recovery-pass:new-refresh-token:new-client-id"
+        )
+
+        self.assertTrue(existed)
+        self.assertEqual(account.login_email, "shared@example.com")
+        self.assertIsNone(await self.service.get_activated_subscription(101))
+        self.assertIsNone(await self.storage.get_user_activation("tg:101"))
+
+    async def test_replacing_account_with_new_subscription_invalidates_old_activations(
+        self,
+    ) -> None:
+        status, _ = await self.service.activate_subscription_code(
+            user_id=101,
+            chat_id=1001,
+            username="user101",
+            full_name="User 101",
+            code=self.key.code,
+        )
+        self.assertEqual(status, "activated")
+
+        status, _, new_key = await self.service.add_account_with_subscription_key(
+            raw_value=(
+                "shared@example.com:new-pass:recovery@example.com:"
+                "new-recovery-pass:new-refresh-token:new-client-id"
+            ),
+            duration_days=30,
+        )
+
+        self.assertEqual(status, "updated")
+        self.assertIsNotNone(new_key)
+        self.assertIsNone(await self.service.get_activated_subscription(101))
+        self.assertIsNone(await self.storage.get_user_activation("tg:101"))
+
+    async def test_legacy_activation_without_access_version_is_not_authorized(self) -> None:
+        await self.storage.activate_subscription_key(
+            requester_id="tg:101",
+            user_id=101,
+            chat_id=1001,
+            username="user101",
+            full_name="User 101",
+            code=self.key.code,
+            access_version=self.key.access_version,
+        )
+        activation_path = self.base_path / "activated_keys.json"
+        activation_data = json.loads(activation_path.read_text(encoding="utf-8"))
+        activation_data["tg:101"].pop("access_version")
+        activation_path.write_text(json.dumps(activation_data), encoding="utf-8")
+
+        self.assertIsNone(await self.service.get_activated_subscription(101))
+
+    async def test_access_version_mismatch_does_not_disclose_updated_account(self) -> None:
+        status, _ = await self.service.activate_subscription_code(
+            user_id=101,
+            chat_id=1001,
+            username="user101",
+            full_name="User 101",
+            code=self.key.code,
+        )
+        self.assertEqual(status, "activated")
+
+        await self.service.add_account(
+            "shared@example.com:new-pass:recovery@example.com:"
+            "new-recovery-pass:new-refresh-token:new-client-id"
+        )
+        activation_data = json.loads(
+            (self.base_path / "activated_keys.json").read_text(encoding="utf-8")
+        )
+        # Simulates missed cleanup: the version check must still deny access.
+        activation_data["tg:101"] = {
+            "requester_id": "tg:101",
+            "user_id": 101,
+            "chat_id": 1001,
+            "username": "user101",
+            "full_name": "User 101",
+            "code": self.key.code,
+            "activated_at": "2026-01-01T00:00:00+00:00",
+            "last_used_at": "2026-01-01T00:00:00+00:00",
+            "access_version": self.key.access_version,
+        }
+        (self.base_path / "activated_keys.json").write_text(
+            json.dumps(activation_data), encoding="utf-8"
+        )
+
+        self.assertIsNone(await self.service.get_activated_subscription(101))
+
     async def test_corrupted_key_store_does_not_clear_existing_activation(self) -> None:
         status, _ = await self.service.activate_subscription_code(
             user_id=101,

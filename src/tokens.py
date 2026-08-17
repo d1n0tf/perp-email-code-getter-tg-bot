@@ -738,7 +738,6 @@ def render_tokens_page(
     content = f"""
     <main class='page'>
       <nav class='top-links' aria-label='Page links'><a href='#faq'>{html.escape(faq_label)}</a><a href='/ai/tokens?lang={opposite_locale}'>{html.escape(text['switch'])}</a></nav>
-      <section class='card intro'><h1>{html.escape(text['title'])}</h1><p>{text['intro']}</p></section>
       <section class='card'><h2>{html.escape(text['activation'])}</h2>{flash}
         <form method='post' action='/ai/tokens' class='activation-form'>
           <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><input type='hidden' name='lang' value='{locale}'>
@@ -848,6 +847,37 @@ def instruction_remove_command(application: str, system: str) -> str | None:
         return f"iex(irm '{url}')"
     return f"bash <(curl -fsSL '{url}')"
 
+
+
+def manual_instruction_notes(application: str, system: str, locale: str = "ru") -> list[str]:
+    """Explain the file-level preparation required before manual setup."""
+    locale = token_locale(locale)
+    home = "%USERPROFILE%" if system == "Windows" else "~"
+    if locale == "ru":
+        text = TOKEN_TEXT[locale]
+        shell = text["shell_windows"] if system == "Windows" else text["shell_other"]
+        return [
+            text["manual_heading"],
+            text["open"].format(shell=shell),
+            text["restart"],
+        ]
+
+    notes = {
+        "VS Code": [f"Close VS Code and create {home}/.codex/.env.", "Paste the values below without removing unrelated entries, then reopen VS Code."],
+        "App": [f"Close the app and create {home}/.codex/.env.", "Paste the values below without removing unrelated entries, then reopen the app."],
+        "CLI": [f"Create {home}/.codex/.env on the machine where the CLI runs.", "Paste the values below and restart the CLI."],
+        "Claude Code CLI": ["Close Claude Code.", "Open ~/.claude/settings.json and add the env object below while preserving existing JSON fields.", "Save the file and restart Claude Code."],
+        "Claude App": ["Fully close Claude App before editing the configuration.", "Open the path shown in the configuration header, save the JSON, then start Claude App again."],
+        "Hermes Desktop": ["Close Hermes Desktop.", "Create the config and .env files shown below; keep other custom providers if you already use them.", "Start Hermes Desktop again after saving both files."],
+        "Cheap Code": ["Create or open ~/.cheapcode-cli/.cheapcode-profile.json.", "Paste the profile below, save it, then run cheapcode in a new terminal."],
+        "Grok Build": ["Create the ~/.grok folder if it does not exist.", "Save the configuration below as ~/.grok/config.toml, then reopen the terminal and run grok."],
+        "Kimi Code CLI": ["Create ~/.kimi-code/config.toml if it does not exist.", "Add the provider and model below, save the file, then restart Kimi Code CLI."],
+        "ZCode": ["Fully close ZCode before editing its configuration.", "Open ~/.zcode/v2/config.json and merge only the provider block below; do not replace the whole file.", "Save the JSON and reopen ZCode."],
+        "Pi": ["Create ~/.pi/agent if it does not exist.", "Add the three JSON fragments below to models.json, auth.json, and settings.json without removing other providers.", "Restart Pi after saving the files."],
+        "OpenCode": ["Open ~/.config/opencode/opencode.json (create it if needed).", "Add the provider values below without removing other providers, then restart OpenCode."],
+        "Cursor": ["Open Cursor Settings and find the API provider fields.", "Enter the Base URL, API key, and model below, then restart Cursor."],
+    }
+    return notes[application]
 
 def manual_instruction_command(application: str, system: str, api_key: str) -> str:
     """Render a manual setup based on the supplied CVC instruction document."""
@@ -1066,6 +1096,9 @@ def render_instructions(key: TokenKey, locale: str = "ru") -> str:
                 slug = f"{instruction_slug(application)}-{instruction_slug(system)}"
                 command = html.escape(instruction_command(application, system, key.api_key, locale))
                 manual_command = html.escape(manual_instruction_command(application, system, key.api_key))
+                manual_notes = "".join(
+                    f"<li>{html.escape(note)}</li>" for note in manual_instruction_notes(application, system, locale)
+                )
                 description = text["manual"]
                 steps = "".join(f"<li>{html.escape(step)}</li>" for step in instruction_steps(application, system, locale))
                 remove_command = instruction_remove_command(application, system)
@@ -1095,6 +1128,7 @@ def render_instructions(key: TokenKey, locale: str = "ru") -> str:
                   </div>
                   <div class='instruction-mode-panel' data-instruction-mode-panel='manual' hidden>
                     <p class='manual-heading'>{html.escape(manual_heading)}</p>
+                    <ol class='manual-notes'>{manual_notes}</ol>
                     <pre id='instruction-manual-{slug}'>{manual_command}</pre>
                     <button type='button' class='primary copy-instruction' data-copy-target='instruction-manual-{slug}' data-copy-label='{html.escape(text['copy'])}' data-copied-label='{html.escape(text['copied'])}'>{html.escape(text['copy'])}</button>
                   </div>
@@ -1306,7 +1340,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 .top-links {{ display:flex; justify-content:space-between; gap:8px; margin:0 0 -4px; }} .top-links a {{ color:var(--text); font-weight:700; text-decoration:none; padding:7px 10px; border:1px solid var(--line); border-radius:7px; }} .top-links a:hover {{ border-color:var(--accent); color:var(--accent); }}
 .details {{ display:grid; grid-template-columns:minmax(210px,auto) 1fr; gap:8px 18px; margin:0; }} .details dt {{ color:var(--muted); }} .details dd {{ margin:0; min-width:0; overflow-wrap:anywhere; }} code,pre {{ font-family:Consolas,'Courier New',monospace; }} .api-key {{ color:#b9d4ff; }}
 .choice-row {{ display:flex; flex-wrap:wrap; gap:8px; margin:14px 0; }} .instruction-apps .choice[hidden] {{ display:none; }} .instruction-card {{ margin-top:18px; }} .choice {{ color:var(--text); background:#1b2940; border:1px solid var(--line); }} .choice.active {{ color:#08101e; background:var(--accent); border-color:var(--accent); }} .selected-line {{ padding:12px; margin:16px 0; border-left:3px solid var(--accent); background:#0b1321; }} ol {{ padding-left:24px; }} pre {{ max-width:100%; overflow:auto; padding:14px; white-space:pre-wrap; overflow-wrap:anywhere; background:#080e18; border:1px solid var(--line); border-radius:9px; color:#d9e7ff; }}
-.instruction-mode-tabs {{ display:flex; gap:6px; margin:16px 0 10px; border-bottom:1px solid var(--line); }} .instruction-mode {{ color:var(--muted); background:transparent; border-radius:8px 8px 0 0; padding:9px 12px; }} .instruction-mode.active {{ color:var(--text); background:#1b2940; box-shadow:inset 0 -2px 0 var(--accent); }} .instruction-mode-panel {{ padding:2px 0 4px; }} .manual-heading {{ color:var(--text); font-weight:700; }} .remove-integration {{ margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:10px; background:#0b1321; }} .remove-integration summary,.faq-item summary {{ cursor:pointer; padding:12px 14px; font-weight:700; }} .remove-integration pre {{ margin:0 12px 12px; }} .remove-integration {{ border-color:rgba(255,120,133,.42); background:rgba(255,120,133,.07); }} .remove-integration summary {{ color:#ffdce0; }} .remove-integration .hint,.remove-integration button {{ margin-left:12px; margin-right:12px; }} .remove-integration button {{ margin-bottom:12px; }}
+.instruction-mode-tabs {{ display:flex; gap:6px; margin:16px 0 10px; border-bottom:1px solid var(--line); }} .instruction-mode {{ color:var(--muted); background:transparent; border-radius:8px 8px 0 0; padding:9px 12px; }} .instruction-mode.active {{ color:var(--text); background:#1b2940; box-shadow:inset 0 -2px 0 var(--accent); }} .instruction-mode-panel {{ padding:2px 0 4px; }} .manual-heading {{ color:var(--text); font-weight:700; }} .manual-notes {{ margin:10px 0 14px; padding-left:24px; color:var(--muted); }} .manual-notes li {{ margin:6px 0; }} .remove-integration {{ margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:10px; background:#0b1321; }} .remove-integration summary,.faq-item summary {{ cursor:pointer; padding:12px 14px; font-weight:700; }} .remove-integration pre {{ margin:0 12px 12px; }} .remove-integration {{ border-color:rgba(255,120,133,.42); background:rgba(255,120,133,.07); }} .remove-integration summary {{ color:#ffdce0; }} .remove-integration .hint,.remove-integration button {{ margin-left:12px; margin-right:12px; }} .remove-integration button {{ margin-bottom:12px; }}
 .faq {{ scroll-margin-top:24px; }} .faq-controls {{ margin:16px 0; }} .faq-controls input {{ max-width:520px; }} .faq-items {{ border-top:1px solid var(--line); }} .faq-item {{ display:block; border-bottom:1px solid var(--line); }} .faq-item summary {{ list-style:none; padding-right:38px; position:relative; }} .faq-item summary::-webkit-details-marker {{ display:none; }} .faq-item summary::after {{ content:'+'; position:absolute; right:14px; color:var(--accent); font-size:20px; line-height:1; }} .faq-item[open] summary::after {{ content:'−'; }} .faq-item p {{ color:var(--muted); padding:0 14px 14px; margin:0; }}
 .title-row {{ display:flex; justify-content:space-between; gap:16px; align-items:start; }} .title-row form {{ margin:0; }} .create-form,.edit-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); column-gap:18px; }} .create-form .wide {{ grid-column:1 / -1; }}
 .table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th[data-sort],th[data-group-service] {{ cursor:pointer; user-select:none; }} th[data-sort]:hover,th[data-group-service]:hover,th.grouped {{ color:var(--accent); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .service-group-toggle {{ color:var(--text); background:transparent; padding:0; font-size:16px; }} .service-group-toggle:hover,.service-group-toggle:focus {{ color:var(--accent); }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-form {{ margin-top:16px; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
@@ -1375,7 +1409,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 __all__ = [
     "CheapVibeCodeClient", "SecondaryKeyClient", "SERVICE_OPTIONS", "TokenKey", "TokenKeyStore",
     "create_tokens_routes", "default_instruction_choice", "generate_access_code",
-    "instruction_command", "instruction_remove_command", "instruction_steps", "manual_instruction_command",
+    "instruction_command", "instruction_remove_command", "instruction_steps", "manual_instruction_command", "manual_instruction_notes",
     "normalize_access_code", "trusted_secondary_remaining", "used_tokens_from_remaining",
 ]
 
