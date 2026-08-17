@@ -420,6 +420,7 @@ def create_tokens_routes(
         error: str = "",
         notice: str = "",
         status_code: int = 200,
+        created_access_codes: list[str] | None = None,
     ) -> HTMLResponse:
         csrf_token = secrets.token_urlsafe(32)
         authenticated = is_admin(request)
@@ -431,6 +432,7 @@ def create_tokens_routes(
             keys=keys,
             error=error,
             notice=notice,
+            created_access_codes=created_access_codes or [],
         )
         response.status_code = status_code
         return attach_csrf(response, csrf_token, TOKENS_ADMIN_CSRF_COOKIE, "/ai/tokens/adm")
@@ -590,6 +592,7 @@ def create_tokens_routes(
                             f"\u041e\u0441\u0442\u0430\u043b\u044c\u043d\u044b\u0435 \u043d\u0435 \u0441\u043e\u0437\u0434\u0430\u043d\u044b: {str(exc)}"
                         ),
                         status_code=502,
+                        created_access_codes=[record.access_code for record in records],
                     )
                 return await admin_response(
                     request,
@@ -597,7 +600,11 @@ def create_tokens_routes(
                     status_code=502,
                 )
             await store.add_many(records)
-        return await admin_response(request, notice=f"\u0421\u043e\u0437\u0434\u0430\u043d\u043e \u043a\u043b\u044e\u0447\u0435\u0439: {len(records)}.")
+        return await admin_response(
+            request,
+            notice=f"\u0421\u043e\u0437\u0434\u0430\u043d\u043e \u043a\u043b\u044e\u0447\u0435\u0439: {len(records)}.",
+            created_access_codes=[record.access_code for record in records],
+        )
 
     async def admin_update(request: Request, key_id: int) -> HTMLResponse:
         form = await read_form(request)
@@ -897,6 +904,7 @@ def render_tokens_admin(
     keys: list[TokenKey],
     error: str = "",
     notice: str = "",
+    created_access_codes: list[str] | None = None,
 ) -> HTMLResponse:
     flash = ""
     if error:
@@ -918,13 +926,22 @@ def render_tokens_admin(
         </section></main>"""
         return HTMLResponse(render_layout("\u0410\u0434\u043c\u0438\u043d-\u043f\u0430\u043d\u0435\u043b\u044c \u043a\u043b\u044e\u0447\u0435\u0439", content))
     rows, forms = render_admin_rows(keys, csrf_token)
+    created_access_codes = created_access_codes or []
+    created_codes = "\n".join(created_access_codes)
+    copy_created = ""
+    if created_access_codes:
+        copy_created = f"""
+        <div class='created-keys' data-created-keys='{html.escape(created_codes, quote=True)}'>
+          <strong>Созданные ключи: {len(created_access_codes)}</strong>
+          <button type='button' class='secondary' id='copy-created-keys'>Скопировать все</button>
+        </div>"""
     service_options = "".join(f"<option value='{html.escape(service)}'>{html.escape(service)}</option>" for service in SERVICE_OPTIONS)
     content = f"""
     <main class='page admin-page'>
       <section class='card'>
         <div class='title-row'><h1>\u0421\u041e\u0417\u0414\u0410\u041d\u0418\u042f \u041a\u041b\u042e\u0427\u0415\u0419</h1>
         <form method='post' action='/ai/tokens/adm/logout'><input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><button class='secondary' type='submit'>\u0412\u044b\u0439\u0442\u0438</button></form></div>
-        {flash}
+        {flash}{copy_created}
         <form method='post' action='/ai/tokens/adm/create' class='create-form'>
           <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
           <label>\u0412\u042b\u0411\u0420\u0410\u0422\u042c \u0421\u0415\u0420\u0412\u0418\u0421:<select name='service' required>{service_options}</select></label>
@@ -937,8 +954,9 @@ def render_tokens_admin(
       <section class='card'>
         <h2>\u0423\u041f\u0420\u0410\u0412\u041b\u0415\u041d\u0418\u0415 \u041a\u041b\u042e\u0427\u0410\u041c\u0418</h2>
         <p class='hint'>\u041d\u0430\u0436\u043c\u0438\u0442\u0435 \u00ab\u0423\u043f\u0440\u0430\u0432\u043b\u044f\u0442\u044c\u00bb, \u0447\u0442\u043e\u0431\u044b \u0438\u0437\u043c\u0435\u043d\u0438\u0442\u044c \u0432\u0441\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u043a\u043b\u044e\u0447\u0430.</p>
-        <div class='table-wrap'><table><thead><tr><th>ID</th><th>\u0414\u0430\u0442\u0430 \u0441\u043e\u0437\u0434\u0430\u043d\u0438\u044f</th><th>\u0421\u0415\u0420\u0412\u0418\u0421</th><th>\u041a\u041b\u042e\u0427</th><th>API KEY</th><th>\u0422\u041e\u041a\u0415\u041d\u041e\u0412</th><th>\u0418\u0421\u041f\u041e\u041b\u042c\u0417\u041e\u0412\u0410\u041d\u041e</th><th>\u0421\u0422\u0410\u0422\u0423\u0421</th><th>\u0423\u041f\u0420\u0410\u0412\u041b\u0415\u041d\u0418\u0415</th></tr></thead>
+        <div class='table-wrap' id='keys-table-wrap'><table id='keys-table'><thead><tr><th data-sort='number'>ID</th><th data-sort='date'>\u0414\u0430\u0442\u0430 \u0441\u043e\u0437\u0434\u0430\u043d\u0438\u044f</th><th data-group-service data-sort='service'>\u0421\u0415\u0420\u0412\u0418\u0421</th><th data-sort='text'>\u041a\u041b\u042e\u0427</th><th data-sort='text'>API KEY</th><th data-sort='number'>\u0422\u041e\u041a\u0415\u041d\u041e\u0412</th><th data-sort='number'>\u0418\u0421\u041f\u041e\u041b\u042c\u0417\u041e\u0412\u0410\u041d\u041e</th><th data-sort='text'>\u0421\u0422\u0410\u0422\u0423\u0421</th><th data-sort='text'>\u0423\u041f\u0420\u0410\u0412\u041b\u0415\u041d\u0418\u0415</th></tr></thead>
         <tbody>{rows or "<tr><td colspan='9' class='empty'>\u041a\u043b\u044e\u0447\u0435\u0439 \u043f\u043e\u043a\u0430 \u043d\u0435\u0442.</td></tr>"}</tbody></table></div>
+        <div id='keys-table-groups' hidden></div>
         {forms}
       </section>
     </main>"""
@@ -956,10 +974,10 @@ def render_admin_rows(keys: list[TokenKey], csrf_token: str) -> tuple[str, str]:
         )
         edit_id = f"edit-{key.id}"
         rows.append(f"""
-        <tr><td>{key.id}</td><td>{format_datetime(key.created_at)}</td><td>{html.escape(key.service)}</td><td><code>{html.escape(key.access_code)}</code></td>
-        <td class='copyable-api-key' data-copy-api-key='{html.escape(key.api_key, quote=True)}' role='button' tabindex='0' title='Нажмите, чтобы скопировать API key' aria-label='Скопировать API key'><code class='api-preview'>{html.escape(key.api_key)}</code></td><td>{format_tokens(key.token_limit)}</td>
-        <td>{format_tokens(key.used_tokens)}<br><span class='hint'>ост. {format_tokens(key.remaining_tokens)}</span></td><td>{status}</td>
-        <td><div class='management-actions'><button type='button' class='secondary' data-edit='{edit_id}'>\u0423\u043f\u0440\u0430\u0432\u043b\u044f\u0442\u044c</button>
+        <tr data-service='{html.escape(key.service, quote=True)}'><td data-sort-value='{key.id}'>{key.id}</td><td data-sort-value='{key.created_at.timestamp()}'>{format_datetime(key.created_at)}</td><td data-sort-value='{html.escape(key.service, quote=True)}'>{html.escape(key.service)}</td><td data-sort-value='{html.escape(key.access_code, quote=True)}'><code>{html.escape(key.access_code)}</code></td>
+        <td data-sort-value='{html.escape(key.api_key, quote=True)}' class='copyable-api-key' data-copy-api-key='{html.escape(key.api_key, quote=True)}' role='button' tabindex='0' title='Нажмите, чтобы скопировать API key' aria-label='Скопировать API key'><code class='api-preview'>{html.escape(key.api_key)}</code></td><td data-sort-value='{key.token_limit}'>{format_tokens(key.token_limit)}</td>
+        <td data-sort-value='{key.used_tokens}'>{format_tokens(key.used_tokens)}<br><span class='hint'>ост. {format_tokens(key.remaining_tokens)}</span></td><td data-sort-value='{html.escape(status, quote=True)}'>{status}</td>
+        <td data-sort-value='\u0423\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435'><div class='management-actions'><button type='button' class='secondary' data-edit='{edit_id}'>\u0423\u043f\u0440\u0430\u0432\u043b\u044f\u0442\u044c</button>
         <form method='post' action='/ai/tokens/adm/{key.id}/delete' class='inline-delete-form'>
           <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
           <button class='danger' type='submit' onclick="return confirm('\u0423\u0434\u0430\u043b\u0438\u0442\u044c \u043a\u043b\u044e\u0447 #{key.id}?')">\u0423\u0434\u0430\u043b\u0438\u0442\u044c</button>
@@ -1006,7 +1024,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 .details {{ display:grid; grid-template-columns:minmax(210px,auto) 1fr; gap:8px 18px; margin:0; }} .details dt {{ color:var(--muted); }} .details dd {{ margin:0; min-width:0; overflow-wrap:anywhere; }} code,pre {{ font-family:Consolas,'Courier New',monospace; }} .api-key {{ color:#b9d4ff; }}
 .choice-row {{ display:flex; flex-wrap:wrap; gap:8px; margin:14px 0; }} .instruction-apps .choice[hidden] {{ display:none; }} .instruction-card {{ margin-top:18px; }} .choice {{ color:var(--text); background:#1b2940; border:1px solid var(--line); }} .choice.active {{ color:#08101e; background:var(--accent); border-color:var(--accent); }} .selected-line {{ padding:12px; margin:16px 0; border-left:3px solid var(--accent); background:#0b1321; }} ol {{ padding-left:24px; }} pre {{ max-width:100%; overflow:auto; padding:14px; white-space:pre-wrap; overflow-wrap:anywhere; background:#080e18; border:1px solid var(--line); border-radius:9px; color:#d9e7ff; }}
 .title-row {{ display:flex; justify-content:space-between; gap:16px; align-items:start; }} .title-row form {{ margin:0; }} .create-form,.edit-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); column-gap:18px; }} .create-form .wide {{ grid-column:1 / -1; }}
-.table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th {{ color:var(--muted); font-size:12px; }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-form {{ margin-top:16px; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
+.table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th[data-sort],th[data-group-service] {{ cursor:pointer; user-select:none; }} th[data-sort]:hover,th[data-group-service]:hover {{ color:var(--accent); }} th[data-sort]::after {{ content:' ↕'; opacity:.55; }} th.sort-asc::after {{ content:' ↑'; opacity:1; }} th.sort-desc::after {{ content:' ↓'; opacity:1; }} th.grouped {{ color:var(--accent); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-form {{ margin-top:16px; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
 @media(max-width:650px) {{ .page,.admin-page {{ width:min(100% - 20px,960px); margin-top:12px; }} .card {{ padding:18px; border-radius:12px; }} h1 {{ font-size:24px; }} .details,.create-form,.edit-grid {{ grid-template-columns:1fr; }} .title-row {{ display:block; }} .title-row form {{ margin-top:12px; }} }}
 </style></head><body>{content}<script>
 (function() {{
@@ -1036,6 +1054,29 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
   if(balance) fetch('/ai/tokens/balance',{{cache:'no-store'}}).then(function(response) {{ return response.ok ? response.json() : Promise.reject(); }}).then(function(data) {{ if(data.ok) balance.textContent=data.formatted+' '+(balance.dataset.separator||'/')+' '+data.token_limit_formatted; }}).catch(function() {{ /* Keep the locally saved balance visible. */ }});
   function copyApiKey(cell) {{ var value=cell.dataset.copyApiKey; if(!value) return; navigator.clipboard.writeText(value).then(function() {{ var old=cell.title; cell.title='API key скопирован'; setTimeout(function() {{ cell.title=old; }},1500); }}); }}
   document.querySelectorAll('.copyable-api-key').forEach(function(cell) {{ cell.addEventListener('click',function() {{ copyApiKey(cell); }}); cell.addEventListener('keydown',function(event) {{ if(event.key==='Enter'||event.key===' ') {{ event.preventDefault(); copyApiKey(cell); }} }}); }});
+  var createdKeys=document.querySelector('.created-keys'), copyCreated=document.getElementById('copy-created-keys');
+  if(createdKeys&&copyCreated) copyCreated.addEventListener('click',function() {{ navigator.clipboard.writeText(createdKeys.dataset.createdKeys||'').then(function() {{ var old=copyCreated.textContent; copyCreated.textContent='Скопировано'; setTimeout(function() {{ copyCreated.textContent=old; }},1500); }}); }});
+  var keyTable=document.getElementById('keys-table'), tableWrap=document.getElementById('keys-table-wrap'), groups=document.getElementById('keys-table-groups');
+  if(keyTable&&tableWrap&&groups) {{
+    var body=keyTable.tBodies[0], originalRows=Array.prototype.slice.call(body.rows).filter(function(row) {{ return row.dataset.service; }}), sortColumn=-1, sortAscending=true, grouped=false;
+    function cellValue(row,index) {{ var cell=row.cells[index]; return cell ? (cell.dataset.sortValue||cell.textContent||'').trim() : ''; }}
+    function clearSort() {{ keyTable.querySelectorAll('th').forEach(function(header) {{ header.classList.remove('sort-asc','sort-desc'); }}); }}
+    function sortRows(index) {{
+      if(grouped) return;
+      sortAscending=sortColumn===index ? !sortAscending : true; sortColumn=index;
+      originalRows.sort(function(left,right) {{ var a=cellValue(left,index), b=cellValue(right,index), an=Number(a), bn=Number(b); var result=(!Number.isNaN(an)&&!Number.isNaN(bn)) ? an-bn : a.localeCompare(b,undefined,{{numeric:true,sensitivity:'base'}}); return sortAscending ? result : -result; }});
+      originalRows.forEach(function(row) {{ body.appendChild(row); }}); clearSort(); var header=keyTable.tHead.rows[0].cells[index]; header.classList.add(sortAscending?'sort-asc':'sort-desc');
+    }}
+    function toggleGroups() {{
+      grouped=!grouped; keyTable.querySelector('[data-group-service]').classList.toggle('grouped',grouped);
+      if(!grouped) {{ groups.hidden=true; tableWrap.hidden=false; return; }}
+      groups.innerHTML=''; var byService={{}}; originalRows.forEach(function(row) {{ var service=row.dataset.service||''; (byService[service]||(byService[service]=[])).push(row); }});
+      Object.keys(byService).sort(function(a,b) {{ return a.localeCompare(b); }}).forEach(function(service) {{ var section=document.createElement('section'), heading=document.createElement('h3'), wrap=document.createElement('div'), table=keyTable.cloneNode(false), head=keyTable.tHead.cloneNode(true), newBody=document.createElement('tbody'); heading.textContent=service; section.className='service-group'; wrap.className='table-wrap'; table.removeAttribute('id'); table.appendChild(head); byService[service].forEach(function(row) {{ newBody.appendChild(row.cloneNode(true)); }}); table.appendChild(newBody); wrap.appendChild(table); section.appendChild(heading); section.appendChild(wrap); groups.appendChild(section); }});
+      tableWrap.hidden=true; groups.hidden=false;
+    }}
+    keyTable.tHead.rows[0].querySelectorAll('th[data-sort]').forEach(function(header,index) {{ header.addEventListener('click',function() {{ if(header.hasAttribute('data-group-service')) toggleGroups(); else sortRows(index); }}); }});
+    groups.addEventListener('click',function(event) {{ var serviceHeader=event.target.closest('th[data-group-service]'); if(serviceHeader) {{ toggleGroups(); return; }} var apiCell=event.target.closest('.copyable-api-key'); if(apiCell) {{ copyApiKey(apiCell); return; }} var editButton=event.target.closest('[data-edit]'); if(editButton) {{ var form=document.getElementById(editButton.dataset.edit); if(form) form.hidden=!form.hidden; }} }});
+  }}
   document.querySelectorAll('[data-edit]').forEach(function(button) {{ button.addEventListener('click',function() {{ var form=document.getElementById(button.dataset.edit); if(form) form.hidden=!form.hidden; }}); }});
   update();
 }})();
