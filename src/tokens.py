@@ -1238,7 +1238,7 @@ def render_tokens_admin(
           </form>
         </section></main>"""
         return HTMLResponse(render_layout("\u0410\u0434\u043c\u0438\u043d-\u043f\u0430\u043d\u0435\u043b\u044c \u043a\u043b\u044e\u0447\u0435\u0439", content))
-    rows, forms = render_admin_rows(keys, csrf_token)
+    rows = render_admin_rows(keys, csrf_token)
     created_access_codes = created_access_codes or []
     created_codes = "\n".join(created_access_codes)
     copy_created = ""
@@ -1270,27 +1270,24 @@ def render_tokens_admin(
         <div class='table-wrap' id='keys-table-wrap'><table id='keys-table'><thead><tr><th data-sort='number'>ID</th><th data-sort='date'>\u0414\u0430\u0442\u0430 \u0441\u043e\u0437\u0434\u0430\u043d\u0438\u044f</th><th data-group-service data-sort='service'>\u0421\u0415\u0420\u0412\u0418\u0421</th><th data-sort='text'>\u041a\u041b\u042e\u0427</th><th data-sort='text'>API KEY</th><th data-sort='number'>\u0422\u041e\u041a\u0415\u041d\u041e\u0412</th><th data-sort='number'>\u0418\u0421\u041f\u041e\u041b\u042c\u0417\u041e\u0412\u0410\u041d\u041e</th><th data-sort='text'>\u0421\u0422\u0410\u0422\u0423\u0421</th><th data-sort='text'>\u0423\u041f\u0420\u0410\u0412\u041b\u0415\u041d\u0418\u0415</th></tr></thead>
         <tbody>{rows or "<tr><td colspan='9' class='empty'>\u041a\u043b\u044e\u0447\u0435\u0439 \u043f\u043e\u043a\u0430 \u043d\u0435\u0442.</td></tr>"}</tbody></table></div>
         <div id='keys-table-groups' hidden></div>
-        {forms}
       </section>
     </main>"""
     return HTMLResponse(render_layout("\u0410\u0434\u043c\u0438\u043d-\u043f\u0430\u043d\u0435\u043b\u044c \u043a\u043b\u044e\u0447\u0435\u0439", content))
 
 
-def render_admin_rows(keys: list[TokenKey], csrf_token: str) -> tuple[str, str]:
+def render_admin_rows(keys: list[TokenKey], csrf_token: str) -> str:
     rows: list[str] = []
-    forms: list[str] = []
     for key in keys:
         status = (
             f"\u0418\u0441\u0442\u0440\u0430\u0447\u0435\u043d ({format_datetime(key.exhausted_at or key.activated_at)})"
             if key.is_exhausted else
             (f"\u0410\u043a\u0442\u0438\u0432\u0438\u0440\u043e\u0432\u0430\u043d ({format_datetime(key.activated_at)})" if key.activated_at else "\u041d\u0435 \u0430\u043a\u0442\u0438\u0432\u0438\u0440\u043e\u0432\u0430\u043d")
         )
-        edit_id = f"edit-{key.id}"
         rows.append(f"""
         <tr data-service='{html.escape(key.service, quote=True)}'><td data-sort-value='{key.id}'>{key.id}</td><td data-sort-value='{key.created_at.timestamp()}'>{format_datetime(key.created_at)}</td><td data-sort-value='{html.escape(key.service, quote=True)}'>{html.escape(key.service)}</td><td data-sort-value='{html.escape(key.access_code, quote=True)}'><code>{html.escape(key.access_code)}</code></td>
         <td data-sort-value='{html.escape(key.api_key, quote=True)}' class='copyable-api-key' data-copy-api-key='{html.escape(key.api_key, quote=True)}' role='button' tabindex='0' title='Нажмите, чтобы скопировать API key' aria-label='Скопировать API key'><code class='api-preview'>{html.escape(key.api_key)}</code></td><td data-sort-value='{key.token_limit}'>{format_tokens(key.token_limit)}</td>
         <td data-sort-value='{key.used_tokens}'>{format_tokens(key.used_tokens)}<br><span class='hint'>ост. {format_tokens(key.remaining_tokens)}</span></td><td data-sort-value='{html.escape(status, quote=True)}'>{status}</td>
-        <td data-sort-value='\u0423\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435'><div class='management-actions'><button type='button' class='secondary' data-edit='{edit_id}'>\u0423\u043f\u0440\u0430\u0432\u043b\u044f\u0442\u044c</button>
+        <td data-sort-value='\u0423\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435'><div class='management-actions'><button type='button' class='secondary' data-edit='row'>\u0423\u043f\u0440\u0430\u0432\u043b\u044f\u0442\u044c</button>
         <form method='post' action='/ai/tokens/adm/{key.id}/delete' class='inline-delete-form'>
           <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
           <button class='danger' type='submit' onclick="return confirm('\u0423\u0434\u0430\u043b\u0438\u0442\u044c \u043a\u043b\u044e\u0447 #{key.id}?')">\u0423\u0434\u0430\u043b\u0438\u0442\u044c</button>
@@ -1299,26 +1296,28 @@ def render_admin_rows(keys: list[TokenKey], csrf_token: str) -> tuple[str, str]:
             f"<option value='{html.escape(service, quote=True)}' {'selected' if service == key.service else ''}>{html.escape(service)}</option>"
             for service in SERVICE_OPTIONS
         )
-        forms.append(f"""
-        <form id='{edit_id}' class='edit-form' method='post' action='/ai/tokens/adm/{key.id}/update' hidden>
-          <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
-          <h3>\u0423\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435 \u043a\u043b\u044e\u0447\u043e\u043c #{key.id}</h3>
-          <div class='edit-grid'>
-            <label>\u0421\u0435\u0440\u0432\u0438\u0441<select name='service'>{options}</select></label>
-            <label>\u041d\u0430\u0437\u0432\u0430\u043d\u0438\u0435<input name='name' value='{html.escape(key.name, quote=True)}' required></label>
-            <label>\u0414\u0430\u0442\u0430 \u0441\u043e\u0437\u0434\u0430\u043d\u0438\u044f<input type='datetime-local' name='created_at' value='{input_datetime(key.created_at)}' required></label>
-            <label>\u041a\u043b\u044e\u0447 \u0434\u043e\u0441\u0442\u0443\u043f\u0430<input name='access_code' minlength='20' maxlength='20' pattern='[A-Z0-9]{{20}}' value='{html.escape(key.access_code, quote=True)}' required></label>
-            <label>API key<input name='api_key' value='{html.escape(key.api_key, quote=True)}' required></label>
-            <label>\u041b\u0438\u043c\u0438\u0442 \u0442\u043e\u043a\u0435\u043d\u043e\u0432<input type='number' name='token_limit' min='1' step='1' value='{key.token_limit}' required></label>
-            <label>\u0418\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u043d\u043e<input type='number' name='used_tokens' min='0' step='1' value='{key.used_tokens}' required></label>
-            <label>\u0414\u0430\u0442\u0430 \u0430\u043a\u0442\u0438\u0432\u0430\u0446\u0438\u0438<input type='datetime-local' name='activated_at' value='{input_datetime(key.activated_at)}'></label>
-            <label>\u0414\u0430\u0442\u0430 \u0438\u0441\u0442\u0440\u0430\u0447\u0435\u043d\u0438\u044f<input type='datetime-local' name='exhausted_at' value='{input_datetime(key.exhausted_at)}'></label>
-          </div>
-          <div class='edit-actions'><button class='primary' type='submit'>\u0421\u043e\u0445\u0440\u0430\u043d\u0438\u0442\u044c</button>
-          <button class='secondary cancel-edit' type='button' data-edit='{edit_id}'>\u041e\u0442\u043c\u0435\u043d\u0430</button></div>
-        </form>
+        rows.append(f"""
+        <tr class='edit-row' hidden><td colspan='9'>
+          <form class='edit-form' method='post' action='/ai/tokens/adm/{key.id}/update'>
+            <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
+            <h3>?????????? ?????? #{key.id}</h3>
+            <div class='edit-grid'>
+              <label>??????<select name='service'>{options}</select></label>
+              <label>????????<input name='name' value='{html.escape(key.name, quote=True)}' required></label>
+              <label>???? ????????<input type='datetime-local' name='created_at' value='{input_datetime(key.created_at)}' required></label>
+              <label>???? ???????<input name='access_code' minlength='20' maxlength='20' pattern='[A-Z0-9]{{20}}' value='{html.escape(key.access_code, quote=True)}' required></label>
+              <label>API key<input name='api_key' value='{html.escape(key.api_key, quote=True)}' required></label>
+              <label>????? ???????<input type='number' name='token_limit' min='1' step='1' value='{key.token_limit}' required></label>
+              <label>????????????<input type='number' name='used_tokens' min='0' step='1' value='{key.used_tokens}' required></label>
+              <label>???? ?????????<input type='datetime-local' name='activated_at' value='{input_datetime(key.activated_at)}'></label>
+              <label>???? ??????????<input type='datetime-local' name='exhausted_at' value='{input_datetime(key.exhausted_at)}'></label>
+            </div>
+            <div class='edit-actions'><button class='primary' type='submit'>?????????</button>
+            <button class='secondary cancel-edit' type='button' data-edit='row'>??????</button></div>
+          </form>
+        </td></tr>
 """)
-    return "".join(rows), "".join(forms)
+    return "".join(rows)
 
 
 def render_layout(title: str, content: str, locale: str = "ru") -> str:
@@ -1339,7 +1338,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 .instruction-mode-tabs {{ display:flex; gap:6px; margin:16px 0 10px; border-bottom:1px solid var(--line); }} .instruction-mode {{ color:var(--muted); background:transparent; border-radius:8px 8px 0 0; padding:9px 12px; }} .instruction-mode.active {{ color:var(--text); background:#1b2940; box-shadow:inset 0 -2px 0 var(--accent); }} .instruction-mode-panel {{ padding:2px 0 4px; }} .manual-heading {{ color:var(--text); font-weight:700; }} .manual-note {{ margin:8px 0 14px; color:var(--muted); line-height:1.55; }} .remove-integration {{ margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:10px; background:#0b1321; }} .remove-integration summary,.faq-item summary {{ cursor:pointer; padding:12px 14px; font-weight:700; }} .remove-integration pre {{ margin:0 12px 12px; }} .remove-integration {{ border-color:rgba(255,120,133,.42); background:rgba(255,120,133,.07); }} .remove-integration summary {{ color:#ffdce0; }} .remove-integration .hint,.remove-integration button {{ margin-left:12px; margin-right:12px; }} .remove-integration button {{ margin-bottom:12px; }}
 .faq {{ scroll-margin-top:24px; }} .faq-items {{ border-top:1px solid var(--line); }} .faq-item {{ display:block; border-bottom:1px solid var(--line); }} .faq-item summary {{ list-style:none; padding-right:38px; position:relative; }} .faq-item summary::-webkit-details-marker {{ display:none; }} .faq-item summary::after {{ content:'+'; position:absolute; right:14px; color:var(--accent); font-size:20px; line-height:1; }} .faq-item[open] summary::after {{ content:'−'; }} .faq-item p {{ color:var(--muted); padding:0 14px 14px; margin:0; }}
 .title-row {{ display:flex; justify-content:space-between; gap:16px; align-items:start; }} .title-row form {{ margin:0; }} .create-form,.edit-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); column-gap:18px; }} .create-form .wide {{ grid-column:1 / -1; }}
-.table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th[data-sort],th[data-group-service] {{ cursor:pointer; user-select:none; }} th[data-sort]:hover,th[data-group-service]:hover,th.grouped {{ color:var(--accent); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .service-group-toggle {{ color:var(--text); background:transparent; padding:0; font-size:16px; }} .service-group-toggle:hover,.service-group-toggle:focus {{ color:var(--accent); }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-form {{ margin-top:16px; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
+.table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th[data-sort],th[data-group-service] {{ cursor:pointer; user-select:none; }} th[data-sort]:hover,th[data-group-service]:hover,th.grouped {{ color:var(--accent); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .service-group-toggle {{ color:var(--text); background:transparent; padding:0; font-size:16px; }} .service-group-toggle:hover,.service-group-toggle:focus {{ color:var(--accent); }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-row>td {{ padding:0 8px 14px; border-bottom:1px solid var(--line); }} .edit-form {{ margin:0; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
 @media(max-width:650px) {{ .page,.admin-page {{ width:min(100% - 20px,960px); margin-top:12px; }} .card {{ padding:18px; border-radius:12px; }} h1 {{ font-size:24px; }} .details,.create-form,.edit-grid {{ grid-template-columns:1fr; }} .title-row {{ display:block; }} .title-row form {{ margin-top:12px; }} }}
 </style></head><body>{content}<script>
 (function() {{
@@ -1374,25 +1373,27 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
   if(createdKeys&&copyCreated) copyCreated.addEventListener('click',function() {{ navigator.clipboard.writeText(createdKeys.dataset.createdKeys||'').then(function() {{ var old=copyCreated.textContent; copyCreated.textContent='Скопировано'; setTimeout(function() {{ copyCreated.textContent=old; }},1500); }}); }});
   var keyTable=document.getElementById('keys-table'), tableWrap=document.getElementById('keys-table-wrap'), groups=document.getElementById('keys-table-groups');
   if(keyTable&&tableWrap&&groups) {{
-    var body=keyTable.tBodies[0], originalRows=Array.prototype.slice.call(body.rows).filter(function(row) {{ return row.dataset.service; }}), sortColumn=-1, sortAscending=true, grouped=false;
+    var body=keyTable.tBodies[0], originalRows=Array.prototype.slice.call(body.rows).filter(function(row) {{ return row.dataset.service; }}), editRows=new Map(), sortColumn=-1, sortAscending=true, grouped=false;
+    originalRows.forEach(function(row) {{ var edit=row.nextElementSibling; if(edit&&edit.classList.contains('edit-row')) editRows.set(row,edit); }});
     function cellValue(row,index) {{ var cell=row.cells[index]; return cell ? (cell.dataset.sortValue||cell.textContent||'').trim() : ''; }}
+    function toggleEdit(button) {{ var row=button.closest('tr'), edit=row&&row.nextElementSibling; if(edit&&edit.classList.contains('edit-row')) edit.hidden=!edit.hidden; }}
     function sortRows(index) {{
       if(grouped) return;
       sortAscending=sortColumn===index ? !sortAscending : true; sortColumn=index;
       originalRows.sort(function(left,right) {{ var a=cellValue(left,index), b=cellValue(right,index), an=Number(a), bn=Number(b); var result=(!Number.isNaN(an)&&!Number.isNaN(bn)) ? an-bn : a.localeCompare(b,undefined,{{numeric:true,sensitivity:'base'}}); return sortAscending ? result : -result; }});
-      originalRows.forEach(function(row) {{ body.appendChild(row); }});
+      originalRows.forEach(function(row) {{ body.appendChild(row); var edit=editRows.get(row); if(edit) body.appendChild(edit); }});
     }}
     function toggleGroups() {{
       grouped=!grouped; keyTable.querySelector('[data-group-service]').classList.toggle('grouped',grouped);
       if(!grouped) {{ groups.hidden=true; tableWrap.hidden=false; return; }}
       groups.innerHTML=''; var byService={{}}; originalRows.forEach(function(row) {{ var service=row.dataset.service||''; (byService[service]||(byService[service]=[])).push(row); }});
-      Object.keys(byService).sort(function(a,b) {{ return a.localeCompare(b); }}).forEach(function(service) {{ var section=document.createElement('section'), heading=document.createElement('h3'), toggle=document.createElement('button'), wrap=document.createElement('div'), table=keyTable.cloneNode(false), head=keyTable.tHead.cloneNode(true), newBody=document.createElement('tbody'); section.className='service-group'; toggle.type='button'; toggle.className='service-group-toggle'; toggle.textContent=service; toggle.setAttribute('aria-expanded','true'); toggle.addEventListener('click',function() {{ wrap.hidden=!wrap.hidden; toggle.setAttribute('aria-expanded',String(!wrap.hidden)); }}); heading.appendChild(toggle); wrap.className='table-wrap'; table.removeAttribute('id'); table.appendChild(head); byService[service].forEach(function(row) {{ newBody.appendChild(row.cloneNode(true)); }}); table.appendChild(newBody); wrap.appendChild(table); section.appendChild(heading); section.appendChild(wrap); groups.appendChild(section); }});
+      Object.keys(byService).sort(function(a,b) {{ return a.localeCompare(b); }}).forEach(function(service) {{ var section=document.createElement('section'), heading=document.createElement('h3'), toggle=document.createElement('button'), wrap=document.createElement('div'), table=keyTable.cloneNode(false), head=keyTable.tHead.cloneNode(true), newBody=document.createElement('tbody'); section.className='service-group'; toggle.type='button'; toggle.className='service-group-toggle'; toggle.textContent=service; toggle.setAttribute('aria-expanded','true'); toggle.addEventListener('click',function() {{ wrap.hidden=!wrap.hidden; toggle.setAttribute('aria-expanded',String(!wrap.hidden)); }}); heading.appendChild(toggle); wrap.className='table-wrap'; table.removeAttribute('id'); table.appendChild(head); byService[service].forEach(function(row) {{ newBody.appendChild(row.cloneNode(true)); var edit=editRows.get(row); if(edit) newBody.appendChild(edit.cloneNode(true)); }}); table.appendChild(newBody); wrap.appendChild(table); section.appendChild(heading); section.appendChild(wrap); groups.appendChild(section); }});
       tableWrap.hidden=true; groups.hidden=false;
     }}
     keyTable.tHead.rows[0].querySelectorAll('th[data-sort]').forEach(function(header,index) {{ header.addEventListener('click',function() {{ if(header.hasAttribute('data-group-service')) toggleGroups(); else sortRows(index); }}); }});
-    groups.addEventListener('click',function(event) {{ var serviceHeader=event.target.closest('th[data-group-service]'); if(serviceHeader) {{ toggleGroups(); return; }} var apiCell=event.target.closest('.copyable-api-key'); if(apiCell) {{ copyApiKey(apiCell); return; }} var editButton=event.target.closest('[data-edit]'); if(editButton) {{ var form=document.getElementById(editButton.dataset.edit); if(form) form.hidden=!form.hidden; }} }});
+    groups.addEventListener('click',function(event) {{ var serviceHeader=event.target.closest('th[data-group-service]'); if(serviceHeader) {{ toggleGroups(); return; }} var apiCell=event.target.closest('.copyable-api-key'); if(apiCell) {{ copyApiKey(apiCell); return; }} var editButton=event.target.closest('[data-edit]'); if(editButton) toggleEdit(editButton); }});
   }}
-  document.querySelectorAll('[data-edit]').forEach(function(button) {{ button.addEventListener('click',function() {{ var form=document.getElementById(button.dataset.edit); if(form) form.hidden=!form.hidden; }}); }});
+  document.querySelectorAll('[data-edit]').forEach(function(button) {{ button.addEventListener('click',function() {{ toggleEdit(button); }}); }});
   update();
 }})();
 </script></body></html>"""
