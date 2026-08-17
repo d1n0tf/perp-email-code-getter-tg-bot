@@ -1406,22 +1406,29 @@ def render_wait_page(
           credentials: "same-origin",
         }});
 
+        let data = null;
+        try {{ data = await response.json(); }} catch (_) {{ /* A proxy can return a non-JSON error page. */ }}
+        if (data) {{
+          statusNode.textContent = data.message || "";
+          statusNode.className = "status";
+
+          if (data.status === "success") {{
+            statusNode.classList.add("success");
+            return;
+          }}
+
+          if (data.status === "failed" || data.status === "timeout" || data.status === "missing") {{
+            statusNode.classList.add("error");
+            return;
+          }}
+        }}
         if (!response.ok) {{
+          if (response.status < 500) {{
+            statusNode.textContent = data && data.message ? data.message : "Request is no longer available.";
+            statusNode.className = "status error";
+            return;
+          }}
           throw new Error("Bad status: " + response.status);
-        }}
-
-        const data = await response.json();
-        statusNode.textContent = data.message || "";
-        statusNode.className = "status";
-
-        if (data.status === "success") {{
-          statusNode.classList.add("success");
-          return;
-        }}
-
-        if (data.status === "failed" || data.status === "timeout" || data.status === "missing") {{
-          statusNode.classList.add("error");
-          return;
         }}
       }} catch (error) {{
         statusNode.textContent = pollingErrorText;

@@ -11,7 +11,7 @@ import httpx
 from src.config import Settings, settings
 from src.service import BotService
 from src.storage import EmailAccount, JsonStorage
-from src.web import WEB_USER_COOKIE_NAME, build_web_path, create_web_app
+from src.web import WEB_USER_COOKIE_NAME, build_web_path, create_web_app, render_wait_page
 
 
 class BaseWebFlowTestCase(unittest.IsolatedAsyncioTestCase):
@@ -210,6 +210,22 @@ class WebFlowCancellationTests(BaseWebFlowTestCase):
 
         payload = status_response.json()
         self.assertEqual(payload["status"], "missing")
+
+    async def test_wait_page_stops_polling_when_request_is_missing(self) -> None:
+        page = render_wait_page(
+            locale="en",
+            base_path="/perp-code-getter",
+            request_id="request-id",
+            email_address="shared@example.com",
+        )
+
+        self.assertIn("let data = null;", page)
+        self.assertIn('data.status === "missing"', page)
+        self.assertLess(
+            page.index('data.status === "missing"'),
+            page.index("if (!response.ok)"),
+        )
+        self.assertIn("if (response.status < 500)", page)
 
 
 class AdminControlTests(BaseWebFlowTestCase):
