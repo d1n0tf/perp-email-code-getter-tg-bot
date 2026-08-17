@@ -10,6 +10,8 @@ from pathlib import Path
 from typing import Any
 from uuid import UUID
 
+from src.time_utils import moscow_end_of_day, to_moscow
+
 
 class JsonStorageCorruptionError(RuntimeError):
     def __init__(self, path: Path, reason: str) -> None:
@@ -351,8 +353,8 @@ class JsonStorage:
             used_codes = {normalize_key_code(code) for code in key_data}
             final_key_code = normalized_key_code or _generate_subscription_code(used_codes)
             created_at = datetime.now(timezone.utc)
-            expires_on = created_at.date() + timedelta(days=duration_days)
-            expires_at = datetime.combine(expires_on, time.max, tzinfo=timezone.utc)
+            expires_on = to_moscow(created_at).date() + timedelta(days=duration_days)
+            expires_at = moscow_end_of_day(expires_on)
             key = SubscriptionKey(
                 code=final_key_code,
                 email_address=account.login_email,
@@ -415,8 +417,8 @@ class JsonStorage:
             email_data[normalized_target_email] = account.to_dict()
 
             SubscriptionKey.from_dict(existing_key_data)
-            expires_on = normalized_activated_at.date() + timedelta(days=duration_days)
-            expires_at = datetime.combine(expires_on, time.max, tzinfo=timezone.utc)
+            expires_on = to_moscow(normalized_activated_at).date() + timedelta(days=duration_days)
+            expires_at = moscow_end_of_day(expires_on)
             updated_key = SubscriptionKey(
                 code=normalized_target_code,
                 email_address=normalized_target_email,

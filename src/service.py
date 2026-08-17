@@ -21,6 +21,7 @@ from src.microsoft_device_flow import (
     MicrosoftDeviceFlowError,
 )
 from src.messages import DEFAULT_LOCALE
+from src.time_utils import moscow_end_of_day, to_moscow
 from src.storage import (
     EmailAccount,
     JsonStorage,
@@ -164,8 +165,8 @@ class BotService:
         existing_codes = {item.code for item in await self.storage.list_subscription_keys()}
         generated_codes: set[str] = set()
         created_at = datetime.now(timezone.utc)
-        expires_on = created_at.date() + timedelta(days=duration_days)
-        expires_at = datetime.combine(expires_on, time.max, tzinfo=timezone.utc)
+        expires_on = to_moscow(created_at).date() + timedelta(days=duration_days)
+        expires_at = moscow_end_of_day(expires_on)
         keys: list[SubscriptionKey] = []
 
         for _ in range(count):
@@ -657,7 +658,7 @@ class BotService:
 
     @staticmethod
     def format_date(date_value: datetime) -> str:
-        return date_value.astimezone(timezone.utc).strftime("%d.%m.%Y")
+        return to_moscow(date_value).strftime("%d.%m.%Y")
 
     def split_message(self, text: str, limit: int = 3900) -> list[str]:
         return self._chunk_message(text, limit)

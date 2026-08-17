@@ -12,6 +12,7 @@ from src.grok import GrokActivationClient, create_grok_routes
 from src.tokens import CheapVibeCodeClient, TokenKeyStore, create_tokens_routes
 from src.messages import DEFAULT_LOCALE, SUPPORTED_LOCALES, translate
 from src.service import ActivatedSubscription, BotService
+from src.time_utils import MOSCOW_TZ, to_moscow, to_utc
 from src.storage import (
     EmailAccount,
     SubscriptionKey,
@@ -2562,10 +2563,10 @@ def build_admin_rows(
     sort_key: str,
     sort_order: str,
 ) -> list[AdminSubscriptionRow]:
-    now = datetime.now(timezone.utc).date()
+    now = datetime.now(MOSCOW_TZ).date()
     rows: list[AdminSubscriptionRow] = []
     for subscription in subscriptions:
-        expires_on = subscription.key.expires_at.astimezone(timezone.utc).date()
+        expires_on = to_moscow(subscription.key.expires_at).date()
         days_left = max(0, (expires_on - now).days)
         rows.append(
             AdminSubscriptionRow(
@@ -2659,7 +2660,7 @@ def filter_admin_subscriptions(
 
 
 def format_admin_datetime(value: datetime, *, include_time: bool = True) -> str:
-    normalized = value.astimezone(timezone.utc)
+    normalized = to_moscow(value)
     if include_time:
         return normalized.strftime("%d.%m.%Y %H:%M")
     return normalized.strftime("%d.%m.%Y")
@@ -2770,7 +2771,7 @@ def parse_admin_row_id(row_id: str | None) -> tuple[str | None, str | None]:
 
 
 def format_admin_datetime_input(value: datetime) -> str:
-    normalized = value.astimezone(timezone.utc)
+    normalized = to_moscow(value)
     return normalized.strftime("%Y-%m-%dT%H:%M")
 
 
@@ -2780,5 +2781,5 @@ def parse_admin_datetime_input(raw_value: str) -> datetime:
         raise ValueError("Activation date is required")
     parsed = datetime.fromisoformat(candidate)
     if parsed.tzinfo is None:
-        return parsed.replace(tzinfo=timezone.utc)
-    return parsed.astimezone(timezone.utc)
+        parsed = parsed.replace(tzinfo=MOSCOW_TZ)
+    return to_utc(parsed)

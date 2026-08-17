@@ -15,6 +15,7 @@ from urllib.parse import parse_qs
 import aiohttp
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from src.time_utils import MOSCOW_TZ, to_moscow, to_utc
 
 TOKENS_ACCESS_COOKIE = "tokens_access_key"
 TOKENS_ADMIN_COOKIE = "tokens_admin_session"
@@ -65,8 +66,15 @@ def utc_now() -> datetime:
 
 
 def parse_datetime(value: object) -> datetime:
+    """Parse values read from the UTC JSON store, including legacy naive values."""
     parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
     return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+
+
+def parse_admin_datetime(value: object) -> datetime:
+    """Parse a datetime-local value entered in the Moscow-time admin UI."""
+    parsed = value if isinstance(value, datetime) else datetime.fromisoformat(str(value))
+    return to_utc(parsed.replace(tzinfo=MOSCOW_TZ) if parsed.tzinfo is None else parsed)
 
 
 def normalize_access_code(value: str) -> str:
@@ -85,7 +93,7 @@ def format_tokens(value: int) -> str:
 
 
 def format_datetime(value: datetime | None) -> str:
-    return value.astimezone(timezone.utc).strftime("%d.%m.%Y %H:%M") if value else "\u2014"
+    return to_moscow(value).strftime("%d.%m.%Y %H:%M") if value else "\u2014"
 
 
 @dataclass(frozen=True, slots=True)
@@ -658,7 +666,7 @@ def exhausted_message(key: TokenKey, locale: str = "ru") -> str:
 def input_datetime(value: datetime | None) -> str:
     if value is None:
         return ""
-    return value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M")
+    return to_moscow(value).strftime("%Y-%m-%dT%H:%M")
 
 
 def record_from_admin_form(form: dict[str, str], current: TokenKey, all_keys: list[TokenKey]) -> TokenKey:
@@ -683,11 +691,11 @@ def record_from_admin_form(form: dict[str, str], current: TokenKey, all_keys: li
     if used_tokens is None or not 0 <= used_tokens <= token_limit:
         raise ValueError("\u0418\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u043d\u043e \u0434\u043e\u043b\u0436\u043d\u043e \u0431\u044b\u0442\u044c \u043e\u0442 0 \u0434\u043e \u043b\u0438\u043c\u0438\u0442\u0430 \u0442\u043e\u043a\u0435\u043d\u043e\u0432.")
     try:
-        created_at = parse_datetime(form.get("created_at", ""))
+        created_at = parse_admin_datetime(form.get("created_at", ""))
         activated_raw = form.get("activated_at", "").strip()
-        activated_at = parse_datetime(activated_raw) if activated_raw else None
+        activated_at = parse_admin_datetime(activated_raw) if activated_raw else None
         exhausted_raw = form.get("exhausted_at", "").strip()
-        exhausted_at = parse_datetime(exhausted_raw) if exhausted_raw else None
+        exhausted_at = parse_admin_datetime(exhausted_raw) if exhausted_raw else None
     except (TypeError, ValueError):
         raise ValueError("\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u044b\u0435 \u0434\u0430\u0442\u044b.") from None
     if used_tokens >= token_limit:

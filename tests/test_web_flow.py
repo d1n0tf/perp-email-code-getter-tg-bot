@@ -1,7 +1,7 @@
 import asyncio
 import tempfile
 import unittest
-from datetime import datetime, time, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
@@ -346,15 +346,11 @@ class AdminControlTests(BaseWebFlowTestCase):
         self.assertEqual(updated_key.duration_days, 60)
         self.assertEqual(
             updated_key.created_at,
-            datetime(2026, 2, 10, 14, 30, tzinfo=timezone.utc),
+            datetime(2026, 2, 10, 11, 30, tzinfo=timezone.utc),
         )
         self.assertEqual(
             updated_key.expires_at,
-            datetime.combine(
-                datetime(2026, 2, 10, 14, 30, tzinfo=timezone.utc).date() + timedelta(days=60),
-                time.max,
-                tzinfo=timezone.utc,
-            ),
+            datetime(2026, 4, 11, 20, 59, 59, 999999, tzinfo=timezone.utc),
         )
         self.assertIsNone(await self.storage.get_subscription_key(self.key.code))
         old_activation = await self.storage.get_user_activation(
