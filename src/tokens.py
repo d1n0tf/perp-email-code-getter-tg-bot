@@ -37,6 +37,7 @@ TOKEN_TEXT = {
         "choose_service": "1. Выберите сервис", "choose_app": "2. Выберите приложение", "choose_os": "3. Выберите операционную систему", "selected": "Выбрано:", "description": "Описание:", "os": "Операционная система:",
         "manual": "Ручная настройка с готовым скриптом", "shell_windows": "PowerShell", "shell_other": "Терминал", "open": "Откройте {shell} на машине, где запускается выбранное приложение.", "run": "Скопируйте и выполните скрипт ниже. API ключ уже подставлен автоматически.", "restart": "Перезапустите приложение после завершения настройки.", "warning": "⚠️ Копируйте скрипт полностью или воспользуйтесь кнопкой «Скопировать».", "copy": "Скопировать", "copied": "Скопировано", "remove_hint": "Для удаления настройки повторите инструкцию из документации сервиса или удалите добавленные строки из конфигурации.",
         "remaining_sep": "из", "remove_script": "Скрипт удаления настройки",
+        "script": "Скрипт", "manual_mode": "Вручную", "manual_heading": "Ручная настройка", "remove_integration": "Удалить интеграцию", "remove_integration_hint": "Удаляется только интеграция CheapVibeCode для выбранного приложения.", "full_script": "Полный скрипт",
         "grok_open_windows": "Открой PowerShell.", "grok_open_other": "Открой терминал.", "grok_run": "Выполни команду ниже.", "grok_restart": "Перезапусти терминал и введи grok.",
         "required": "Введите ключ доступа.", "missing": "Ключ доступа не существует.", "success": "Ключ успешно активирован. API-ключ готов к использованию.",
         "balance_unavailable": "Не удалось обновить баланс токенов.",
@@ -48,8 +49,9 @@ TOKEN_TEXT = {
         "exhausted": "All tokens have been used. Date: {date}", "not_activated": "Not activated", "activated_status": "Activated ({date})", "exhausted_status": "Exhausted ({date})",
         "instructions": "INSTRUCTIONS FOR USE", "instructions_intro": "If you do not know how to use the API key, we can help. First choose how you will use the API.",
         "choose_service": "1. Choose a service", "choose_app": "2. Choose an application", "choose_os": "3. Choose an operating system", "selected": "Selected:", "description": "Description:", "os": "Operating system:",
-        "manual": "Manual setup with a ready-made script", "shell_windows": "PowerShell", "shell_other": "Terminal", "open": "Open {shell} on the machine where the selected application runs.", "run": "Copy and run the script below. The API key is already inserted automatically.", "restart": "Restart the application after setup is complete.", "warning": "⚠️ Copy the complete script or use the «Copy» button.", "copy": "Copy", "copied": "Copied", "remove_hint": "To remove the setup, follow the service documentation or remove the added configuration lines.",
+        "manual": "Setup", "shell_windows": "PowerShell", "shell_other": "Terminal", "open": "Open {shell} on the machine where the selected application runs.", "run": "Copy and run the script below. The API key is already inserted automatically.", "restart": "Restart the application after setup is complete.", "warning": "⚠️ Copy the complete script or use the «Copy» button.", "copy": "Copy", "copied": "Copied", "remove_hint": "To remove the setup, follow the service documentation or remove the added configuration lines.",
         "remaining_sep": "of", "remove_script": "Uninstall script",
+        "script": "Script", "manual_mode": "Manually", "manual_heading": "Manual setup", "remove_integration": "Remove integration", "remove_integration_hint": "This removes only the CheapVibeCode integration for the selected application.", "full_script": "Full script",
         "grok_open_windows": "Open PowerShell.", "grok_open_other": "Open the terminal.", "grok_run": "Run the command below.", "grok_restart": "Restart the terminal and type grok.",
         "required": "Enter an access key.", "missing": "The access key does not exist.", "success": "The key was activated successfully. The API key is ready to use.",
         "balance_unavailable": "Could not refresh the token balance.",
@@ -730,10 +732,12 @@ def render_tokens_page(
     flash = f"<div class='flash error'>{html.escape(error)}</div>" if error else (f"<div class='flash success'>{html.escape(notice)}</div>" if notice else "")
     info = render_key_information(key, locale) if key is not None else ""
     instructions = render_instructions(key, locale) if key is not None and not key.is_exhausted else ""
+    faq = render_faq(locale)
     opposite_locale = "ru" if locale == "en" else "en"
+    faq_label = "Help / errors" if locale == "en" else "Ответы на вопросы / ошибки"
     content = f"""
     <main class='page'>
-      <nav class='language-switch' aria-label='Language'><a href='/ai/tokens?lang={opposite_locale}'>{html.escape(text['switch'])}</a></nav>
+      <nav class='top-links' aria-label='Page links'><a href='#faq'>{html.escape(faq_label)}</a><a href='/ai/tokens?lang={opposite_locale}'>{html.escape(text['switch'])}</a></nav>
       <section class='card intro'><h1>{html.escape(text['title'])}</h1><p>{text['intro']}</p></section>
       <section class='card'><h2>{html.escape(text['activation'])}</h2>{flash}
         <form method='post' action='/ai/tokens' class='activation-form'>
@@ -742,7 +746,7 @@ def render_tokens_page(
           <input id='access_code' name='access_code' value='{html.escape(submitted_code, quote=True)}' autocomplete='off' spellcheck='false' required>
           <p class='hint'>{html.escape(text['access_hint'])}</p><button class='primary wide' type='submit'>{html.escape(text['activate'])}</button>
         </form>
-      </section>{info}{instructions}
+      </section>{info}{instructions}{faq}
     </main>"""
     return HTMLResponse(render_layout(text['title'], content, locale))
 
@@ -765,14 +769,15 @@ INSTRUCTION_GROUPS = (
     ("codex", "Codex", ("VS Code", "App", "CLI")),
     ("claude", "Claude", ("Claude Code CLI", "Claude App")),
     ("grok", "Grok", ("Grok Build",)),
-    ("other", "Другие", ("Hermes Desktop", "Cheap Code", "Pi", "OpenCode", "Cursor")),
+    ("other", "Другие", ("Hermes Desktop", "Cheap Code", "Kimi Code CLI", "ZCode", "Pi", "OpenCode", "Cursor")),
 )
 INSTRUCTION_SYSTEMS = ("Windows", "macOS", "Linux")
 INSTRUCTION_SYSTEMS_BY_APP = {
     "VS Code": ("Windows", "macOS", "Linux"), "App": ("Windows", "macOS"), "CLI": ("Windows", "macOS", "Linux"),
     "Claude Code CLI": ("Windows", "macOS", "Linux"), "Claude App": ("Windows", "macOS"),
     "Hermes Desktop": ("Windows", "macOS", "Linux"), "Cheap Code": ("Windows", "macOS", "Linux"),
-    "Grok Build": ("Windows", "macOS", "Linux"), "Pi": ("Windows", "macOS", "Linux"),
+    "Grok Build": ("Windows", "macOS", "Linux"), "Kimi Code CLI": ("Windows", "macOS", "Linux"),
+    "ZCode": ("Windows", "macOS", "Linux"), "Pi": ("Windows", "macOS", "Linux"),
     "OpenCode": ("Windows", "macOS", "Linux"), "Cursor": ("Windows", "macOS", "Linux"),
 }
 INSTRUCTION_ENDPOINTS = {
@@ -784,12 +789,26 @@ INSTRUCTION_ENDPOINTS = {
     "Hermes Desktop": {"Windows": "ihermesw", "macOS": "ihermesm", "Linux": "ihermesl"},
     "Cheap Code": {"Windows": "igw", "macOS": "igm", "Linux": "igl"},
     "Grok Build": {"Windows": "igw", "macOS": "igm", "Linux": "igl"},
+    "Kimi Code CLI": {"Windows": "ikw", "macOS": "ikm", "Linux": "ikl"},
+    "ZCode": {"Windows": "izw", "macOS": "izm", "Linux": "izl"},
     "Pi": {"Windows": "ipw", "macOS": "ipm", "Linux": "ipl"},
     "OpenCode": {"Windows": "iow", "macOS": "iom", "Linux": "iol"},
     "Cursor": {"Windows": "icrw", "macOS": "icrm", "Linux": "icr"},
 }
 INSTRUCTION_REMOVE_ENDPOINTS = {
+    "VS Code": {"Windows": "uc?shell=powershell", "macOS": "uc?shell=bash", "Linux": "uc?shell=bash"},
+    "App": {"Windows": "uc?shell=powershell", "macOS": "uc?shell=bash"},
+    "CLI": {"Windows": "uc?shell=powershell", "macOS": "uc?shell=bash", "Linux": "uc?shell=bash"},
+    "Claude Code CLI": {"Windows": "crw", "macOS": "crm", "Linux": "crl"},
+    "Claude App": {"Windows": "rclaudew", "macOS": "rclaudem"},
+    "Hermes Desktop": {"Windows": "rhermesw", "macOS": "rhermesm", "Linux": "rhermesl"},
+    "Cheap Code": {"Windows": "rcheapcode-windows", "macOS": "rcheapcode", "Linux": "rcheapcode"},
     "Grok Build": {"Windows": "rgw", "macOS": "rgm", "Linux": "rgl"},
+    "Kimi Code CLI": {"Windows": "rkw", "macOS": "rkm", "Linux": "rkl"},
+    "ZCode": {"Windows": "rzw", "macOS": "rzm", "Linux": "rzl"},
+    "Pi": {"Windows": "rpw", "macOS": "rpm", "Linux": "rpl"},
+    "OpenCode": {"Windows": "row", "macOS": "rom", "Linux": "rol"},
+    "Cursor": {"Windows": "rcrw", "macOS": "rcrm", "Linux": "rcrl"},
 }
 
 
@@ -797,16 +816,20 @@ def instruction_slug(value: str) -> str:
     return "".join(char.lower() if char.isalnum() else "-" for char in value).strip("-")
 
 
+def instruction_base_url(application: str) -> str:
+    """Return the documented proxy endpoint for a client integration."""
+    return "https://cheapvibecode.ru" if application in {"Kimi Code CLI", "ZCode"} else "https://ru.cheapvibecode.ru"
+
+
 def instruction_command(application: str, system: str, api_key: str, locale: str = "ru") -> str:
     endpoint = INSTRUCTION_ENDPOINTS[application][system]
-    url = f"https://starimg.ru/ai/common/{endpoint}"
+    url = f"{instruction_base_url(application)}/{endpoint}"
     if application == "Claude Code CLI":
         if system == "Windows":
             return f"$h=@{{Authorization='Bearer {api_key}'}}; iex(irm -Headers $h '{url}')"
-        return f"curl -fsSL -H 'Authorization: Bearer {api_key}' '{url}' | bash"
+        return f"bash <(curl -fsSL -H 'Authorization: Bearer {api_key}' '{url}')"
     if application == "Cheap Code":
-        message = "Set the API key in the application settings" if locale == "en" else "Установите API ключ в настройках приложения"
-        return f"npm install -g @cheapcode/cli@latest && echo '{message}: {api_key}'"
+        return "npm install -g @cheapcode/cli@latest"
     if application == "Grok Build":
         if system == "Windows":
             return f"$env:CVC_API_KEY='{api_key}'; iex(irm '{url}')"
@@ -817,13 +840,195 @@ def instruction_command(application: str, system: str, api_key: str, locale: str
 
 
 def instruction_remove_command(application: str, system: str) -> str | None:
-    endpoints = INSTRUCTION_REMOVE_ENDPOINTS.get(application)
-    if not endpoints:
+    endpoint = INSTRUCTION_REMOVE_ENDPOINTS.get(application, {}).get(system)
+    if not endpoint:
         return None
-    url = f"https://starimg.ru/ai/common/{endpoints[system]}"
+    url = f"{instruction_base_url(application)}/{endpoint}"
     if system == "Windows":
         return f"iex(irm '{url}')"
     return f"bash <(curl -fsSL '{url}')"
+
+
+def manual_instruction_command(application: str, system: str, api_key: str) -> str:
+    """Render a manual setup based on the supplied CVC instruction document."""
+    base_url = instruction_base_url(application)
+    if application in {"VS Code", "App", "CLI"}:
+        return f"""# Windows PowerShell
+$d=Join-Path $HOME '.codex'; $p=Join-Path $d '.env'; New-Item -ItemType Directory -Force $d | Out-Null; $lines=if(Test-Path $p){{@(Get-Content $p | Where-Object {{ $_ -notmatch '^ *(CVC_API_KEY|OPENAI_API_KEY) *=' }})}}else{{@()}}; [IO.File]::WriteAllLines($p,@($lines)+'CVC_API_KEY={api_key}'+'OPENAI_API_KEY={api_key}')
+
+# macOS / Linux
+mkdir -p ~/.codex; {{ grep -Ev '^(CVC_API_KEY|OPENAI_API_KEY)=' ~/.codex/.env 2>/dev/null || true; printf 'CVC_API_KEY=%s\nOPENAI_API_KEY=%s\n' '{api_key}' '{api_key}'; }} > ~/.codex/.env.tmp; mv ~/.codex/.env.tmp ~/.codex/.env; chmod 600 ~/.codex/.env"""
+    if application == "Claude Code CLI":
+        return f'''# ~/.claude/settings.json
+{{
+  "env": {{
+    "ANTHROPIC_BASE_URL": "https://ru.cheapvibecode.ru",
+    "ANTHROPIC_AUTH_TOKEN": "{api_key}"
+  }}
+}}'''
+    if application == "Claude App":
+        return f'''# %LOCALAPPDATA%\\Claude-3p\\claude_desktop_config.json (Windows)
+# ~/Library/Application Support/Claude-3p/claude_desktop_config.json (macOS)
+{{
+  "deploymentMode": "3p",
+  "enterpriseConfig": {{
+    "inferenceProvider": "gateway",
+    "inferenceGatewayBaseUrl": "https://ru.cheapvibecode.ru",
+    "inferenceGatewayApiKey": "{api_key}",
+    "inferenceGatewayAuthScheme": "bearer",
+    "modelDiscoveryEnabled": true
+  }}
+}}'''
+    if application == "Hermes Desktop":
+        return f'''# config.yaml
+custom_providers:
+  - name: "cheapvibecode"
+    base_url: "https://ru.cheapvibecode.ru/v1"
+    key_env: "CVC_API_KEY"
+    api_mode: chat_completions
+
+model:
+  provider: "custom:cheapvibecode"
+  default: "claude-sonnet-4-6"
+
+# .env
+CVC_API_KEY={api_key}
+CHEAPCODE_API_KEY={api_key}'''
+    if application == "Cheap Code":
+        return f'''# ~/.cheapcode-cli/.cheapcode-profile.json
+{{
+  "profile": "openai",
+  "env": {{
+    "CHEAPCODE_USE_OPENAI": "1",
+    "CVC_API_KEY": "{api_key}",
+    "OPENAI_API_KEY": "{api_key}",
+    "OPENAI_BASE_URL": "https://ru.cheapvibecode.ru/v1",
+    "OPENAI_MODEL": "gpt-5.6-terra",
+    "OPENAI_API_FORMAT": "responses",
+    "CHEAPCODE_CLI_PROFILE": "1"
+  }}
+}}
+
+# Then run:
+cheapcode'''
+    if application == "Grok Build":
+        return f'''# ~/.grok/config.toml
+[models]
+default = "grok-4.6"
+default_reasoning_effort = "xhigh"
+
+[model."grok-4.6"]
+model = "grok-4.6"
+base_url = "https://ru.cheapvibecode.ru/v1"
+name = "grok-4.6"
+description = "xAI \u00b7 Grok 4.6"
+api_key = "{api_key}"
+api_backend = "chat_completions"
+context_window = 500000
+supports_reasoning_effort = true
+reasoning_effort = "xhigh"
+reasoning_efforts = [
+  {{ id = "low", value = "low", label = "Low Effort", description = "Quick reasoning with minimal overhead", default = false }},
+  {{ id = "medium", value = "medium", label = "Medium Effort", description = "Balanced reasoning and implementation", default = false }},
+  {{ id = "high", value = "high", label = "High Effort", description = "Deep reasoning with extensive implementation", default = false }},
+  {{ id = "xhigh", value = "xhigh", label = "Extra High Effort", description = "Maximum reasoning depth", default = true }},
+]
+
+[model."grok-composer-2.5-fast"]
+model = "composer-2.5-fast"
+base_url = "https://ru.cheapvibecode.ru/v1"
+name = "composer-2.5-fast"
+description = "xAI \u00b7 Composer 2.5 Fast"
+api_key = "{api_key}"
+api_backend = "chat_completions"
+context_window = 200000'''
+    if application == "Kimi Code CLI":
+        return f'''# ~/.kimi-code/config.toml
+default_model = "cheapvibecode/gpt-5.6-terra"
+
+[providers.cheapvibecode]
+type = "openai"
+base_url = "{base_url}/v1"
+api_key = "{api_key}"
+
+[models."cheapvibecode/gpt-5.6-terra"]
+provider = "cheapvibecode"
+model = "gpt-5.6-terra"
+max_context_size = 353000
+max_input_size = 225000
+capabilities = ["tool_use", "thinking", "image_in"]
+display_name = "GPT 5.6 Terra"
+support_efforts = ["none", "low", "medium", "high", "xhigh", "max"]
+default_effort = "high"
+
+[thinking]
+enabled = true
+effort = "high"
+keep = "all"'''
+    if application == "ZCode":
+        return f'''# Merge only provider.cheapvibecode into ~/.zcode/v2/config.json.
+{{
+  "provider": {{
+    "cheapvibecode": {{
+      "name": "CheapVibeCode",
+      "kind": "openai-compatible",
+      "options": {{
+        "apiKey": "{api_key}",
+        "baseURL": "{base_url}/v1",
+        "apiKeyRequired": true
+      }},
+      "models": {{
+        "gpt-5.6-terra": {{
+          "name": "GPT 5.6 Terra",
+          "limit": {{ "context": 353000, "output": 128000 }},
+          "modalities": {{ "input": ["text", "image"], "output": ["text"] }},
+          "supportsTools": true,
+          "supportsStructuredOutput": true
+        }}
+      }},
+      "enabled": true
+    }}
+  }}
+}}'''
+    if application == "Pi":
+        return f'''# ~/.pi/agent/models.json
+{{
+  "providers": {{
+    "cheapvibecode": {{
+      "baseUrl": "{base_url}/v1",
+      "api": "openai-completions",
+      "authHeader": true,
+      "models": [{{ "id": "gpt-5.6-terra", "name": "GPT 5.6 Terra", "reasoning": true, "input": ["text", "image"], "contextWindow": 353000, "maxTokens": 128000 }}]
+    }}
+  }}
+}}
+
+# ~/.pi/agent/auth.json
+{{ "cheapvibecode": {{ "type": "api_key", "key": "{api_key}" }} }}
+
+# ~/.pi/agent/settings.json
+{{ "defaultProvider": "cheapvibecode", "defaultModel": "gpt-5.6-terra" }}'''
+    if application == "OpenCode":
+        return f'''File: https://ru.cheapvibecode.ru/downloads/opencode.jsonc
+Configuration: ~/.config/opencode/opencode.json
+
+The script creates a backup, downloads the configuration, inserts the API key, sorts models, and selects cheapvibecode/gpt-5.6-terra.
+apiKey: {api_key}
+baseURL: https://ru.cheapvibecode.ru/v1
+model: cheapvibecode/gpt-5.6-terra'''
+    if application == "Cursor":
+        return f'''Base URL : https://ru.cheapvibecode.ru/v1
+API key  : {api_key}
+Model    : gpt-5.6-terra-cursor
+
+Alias rule: model id + "-cursor"
+
+Examples:
+gpt-5.6-terra-cursor = GPT 5.6 Terra
+grok-4.5-cursor = Grok 4.5
+grok-4.6-cursor = Grok 4.6
+composer-2.5-fast-cursor = Composer 2.5 Fast'''
+    raise ValueError(f"Unsupported instruction application: {application}")
 
 
 def instruction_steps(application: str, system: str, locale: str = "ru") -> list[str]:
@@ -849,12 +1054,19 @@ def default_instruction_choice(service: str) -> tuple[str, str]:
 def render_instructions(key: TokenKey, locale: str = "ru") -> str:
     text = TOKEN_TEXT[token_locale(locale)]
     default_provider, default_app = default_instruction_choice(key.service)
+    script_label = text["script"]
+    manual_label = text["manual_mode"]
+    manual_heading = text["manual_heading"]
+    remove_label = text["remove_integration"]
+    remove_help = text["remove_integration_hint"]
+    full_script_label = text["full_script"]
     cards: list[str] = []
     for _, _, applications in INSTRUCTION_GROUPS:
         for application in applications:
             for system in INSTRUCTION_SYSTEMS_BY_APP[application]:
                 slug = f"{instruction_slug(application)}-{instruction_slug(system)}"
                 command = html.escape(instruction_command(application, system, key.api_key, locale))
+                manual_command = html.escape(manual_instruction_command(application, system, key.api_key))
                 description = text["manual"]
                 steps = "".join(f"<li>{html.escape(step)}</li>" for step in instruction_steps(application, system, locale))
                 remove_command = instruction_remove_command(application, system)
@@ -862,19 +1074,33 @@ def render_instructions(key: TokenKey, locale: str = "ru") -> str:
                 if remove_command:
                     remove_slug = f"{slug}-remove"
                     remove_block = f"""
-                  <p class='hint'>{html.escape(text['remove_script'])}</p>
-                  <pre id='instruction-script-{remove_slug}'>{html.escape(remove_command)}</pre>
-                  <button type='button' class='secondary copy-instruction' data-copy-target='instruction-script-{remove_slug}' data-copy-label='{html.escape(text['copy'])}' data-copied-label='{html.escape(text['copied'])}'>{html.escape(text['copy'])}</button>"""
+                  <details class='remove-integration'>
+                    <summary>{html.escape(remove_label)}</summary>
+                    <p class='hint'>{html.escape(remove_help)}</p>
+                    <pre id='instruction-script-{remove_slug}'>{html.escape(remove_command)}</pre>
+                    <button type='button' class='secondary copy-instruction' data-copy-target='instruction-script-{remove_slug}' data-copy-label='{html.escape(text['copy'])}' data-copied-label='{html.escape(text['copied'])}'>{html.escape(text['copy'])}</button>
+                  </details>"""
                 cards.append(f"""
                 <article class='instruction-card' id='instruction-card-{slug}' data-provider-app='{html.escape(application)}' data-instruction-system='{system}' hidden>
                   <h3>{html.escape(application)} · {html.escape(system)}</h3>
                   <p><strong>• {html.escape(text['selected'])}</strong> {html.escape(application)}<br><strong>• {html.escape(text['description'])}</strong> {html.escape(description)}<br><strong>• {html.escape(text['os'])}</strong> {html.escape(system)}</p>
                   <ol>{steps}</ol>
-                  <p class='warning'>{html.escape(text['warning'])}</p>
-                  <pre id='instruction-script-{slug}'>{command}</pre>
-                  <button type='button' class='primary copy-instruction' data-copy-target='instruction-script-{slug}' data-copy-label='{html.escape(text['copy'])}' data-copied-label='{html.escape(text['copied'])}'>{html.escape(text['copy'])}</button>
+                  <div class='instruction-mode-tabs' role='tablist' aria-label='{html.escape(application)}'>
+                    <button type='button' class='instruction-mode active' data-instruction-mode='script' aria-selected='true'>{html.escape(script_label)}</button>
+                    <button type='button' class='instruction-mode' data-instruction-mode='manual' aria-selected='false'>{html.escape(manual_label)}</button>
+                  </div>
+                  <div class='instruction-mode-panel' data-instruction-mode-panel='script'>
+                    <p class='warning'>{html.escape(text['warning'])}</p>
+                    <pre id='instruction-script-{slug}'>{command}</pre>
+                    <button type='button' class='primary copy-instruction' data-copy-target='instruction-script-{slug}' data-copy-label='{html.escape(text['copy'])}' data-copied-label='{html.escape(text['copied'])}'>{html.escape(text['copy'])}</button>
+                    <details class='full-script'><summary>{html.escape(full_script_label)}</summary><pre>{command}</pre></details>
+                  </div>
+                  <div class='instruction-mode-panel' data-instruction-mode-panel='manual' hidden>
+                    <p class='manual-heading'>{html.escape(manual_heading)}</p>
+                    <pre id='instruction-manual-{slug}'>{manual_command}</pre>
+                    <button type='button' class='primary copy-instruction' data-copy-target='instruction-manual-{slug}' data-copy-label='{html.escape(text['copy'])}' data-copied-label='{html.escape(text['copied'])}'>{html.escape(text['copy'])}</button>
+                  </div>
                   {remove_block}
-                  <p class='hint'>{html.escape(text['remove_hint'])}</p>
                 </article>""")
     groups = "".join(
         f"<button type='button' class='choice {'active' if group_key == default_provider else ''}' data-instruction-provider='{group_key}'>{html.escape('Others' if group_key == 'other' and locale == 'en' else label)}</button>"
@@ -902,6 +1128,57 @@ def render_instructions(key: TokenKey, locale: str = "ru") -> str:
       <div id='instruction-content'>{''.join(cards)}</div>
     </section>
     """
+
+
+def render_faq(locale: str = "ru") -> str:
+    """Local support FAQ: excludes upstream billing and account-management topics."""
+    locale = token_locale(locale)
+    if locale == "en":
+        title = "Help and common errors"
+        intro = "Answers about connection, setup, and common application errors."
+        labels = ("All", "Setup", "Errors")
+        items = (
+            ("setup", "Which instruction should I choose?", "Choose the client you actually use: Codex for VS Code/Codex App/Codex CLI, Claude for Claude Code CLI/Claude App, and Others for Hermes, Cheap Code, Grok Build, Kimi, ZCode, Pi, OpenCode, Cursor, and similar clients. Then choose the application and operating system."),
+            ("setup", "What is the difference between Codex, OpenAI, and Anthropic endpoints?", "Codex clients use the prepared Codex provider at /backend-api/codex. OpenAI-compatible clients use /v1. Claude Code CLI and other Anthropic-compatible clients use /anthropic/v1. The same API key is used in every case; the selected instruction inserts the right endpoint."),
+            ("setup", "What is the difference between Script and Manually?", "Script applies the prepared configuration automatically. Manually shows the configuration values and file locations so that you can add them yourself. In both modes the active API key is already inserted."),
+            ("setup", "Will setup remove my chats or other providers?", "The setup and removal commands are intended to change only the CheapVibeCode integration. Close the selected client before setup, and use the hidden Remove integration block when you need to undo it."),
+            ("errors", "The client asks to sign in or does not see CVC_API_KEY", "Fully close and reopen the client. For remote development, SSH, VPS, or server workspaces, run the setup on the machine where the client or extension host actually runs."),
+            ("errors", "401 / Incorrect API key / requests go to api.openai.com", "The client is still using its direct provider configuration. Run setup on the correct machine, restart the client, then use Remove integration once and run setup again if an old configuration remains."),
+            ("errors", "Model not found", "Check the exact model ID supported by your selected client. Codex and ZCode use the regular ID, OpenCode and Kimi use cheapvibecode/<model>, while Cursor uses <model>-cursor. Restart the client after changing model or key."),
+            ("errors", "What do 429, 502, 503, 504, 524, or capacity_unavailable mean?", "429 is a rate limit: wait and reduce parallel requests. 502/503/capacity_unavailable are temporary upstream availability errors. For 504/524 wait briefly, retry once with backoff, and if needed choose another model."),
+            ("errors", "Claude Code is outdated or continually asks yes/no", "Run claude update and restart the CLI for an unsupported version. Yes/no prompts are local Claude permissions, not API-key errors. Claude App and Claude Code CLI are configured separately."),
+        )
+        placeholder, empty = "Search questions…", "No matching answers."
+    else:
+        title = "Ответы на вопросы и ошибки"
+        intro = "Подключение, настройка и частые ошибки приложений."
+        labels = ("Все", "Подключение", "Ошибки")
+        items = (
+            ("setup", "Чем отличаются Codex, OpenAI и Anthropic endpoint'ы?", "Codex-клиенты используют готовый Codex provider с /backend-api/codex. OpenAI-совместимые клиенты используют Base URL с /v1. Claude Code CLI и другие Anthropic-совместимые клиенты используют /anthropic/v1. Ключ во всех случаях один; нужный endpoint уже подставляет выбранная инструкция."),
+            ("setup", "Что выбрать в инструкции: Codex, Claude или «Другие»?", "Выбирайте по клиенту, а не по названию модели: Codex — для VS Code, Codex App и Codex CLI; Claude — для Claude Code CLI и Claude App; «Другие» — для Hermes, Cheap Code, Grok Build, Kimi, ZCode, Pi, OpenCode, Cursor и похожих клиентов. Затем выберите приложение и ОС."),
+            ("setup", "Чем отличаются «Скрипт» и «Вручную»?", "Скрипт автоматически применяет готовую настройку. «Вручную» показывает значения и файлы конфигурации, чтобы внести их самостоятельно. В обоих вариантах API-ключ уже подставлен."),
+            ("setup", "Слетят ли другие провайдеры, настройки или чаты?", "Команды настройки и удаления предназначены только для интеграции CheapVibeCode. Перед настройкой полностью закройте выбранный клиент; для отмены используйте скрытый блок «Удалить интеграцию»."),
+            ("errors", "Клиент просит войти или не видит CVC_API_KEY", "Полностью закройте и снова откройте клиент. Для Remote/SSH/VPS и server workspace запускайте настройку на машине, где реально работает клиент или extension host."),
+            ("errors", "401, Incorrect API key или запрос уходит на api.openai.com", "Клиент всё ещё использует прямую конфигурацию провайдера. Запустите настройку на нужной машине и перезапустите клиент. Если осталась старая конфигурация — один раз выполните «Удалить интеграцию», затем повторите настройку."),
+            ("errors", "Модель не появилась или Model not found", "Проверьте точный ID модели для выбранного клиента. В OpenCode и Kimi используется cheapvibecode/<model>, в Cursor — <model>-cursor. После смены модели или ключа перезапустите клиент."),
+            ("errors", "Что означают 429, 502, 503, 504, 524 и capacity_unavailable?", "429 — ограничение частоты: подождите и уменьшите параллельные запросы. 502/503/capacity_unavailable — временная недоступность upstream. При 504/524 немного подождите, повторите запрос один раз с паузой и при необходимости выберите другую модель."),
+            ("errors", "Claude Code устарел или постоянно спрашивает yes / no", "При Unsupported Claude Code version выполните claude update и перезапустите CLI. Запросы yes/no — это локальные разрешения Claude, а не ошибка API-ключа. Claude App и Claude Code CLI настраиваются отдельно."),
+        )
+        placeholder, empty = "Поиск по вопросам…", "Подходящих ответов не найдено."
+    rows = "".join(
+        f"<details class='faq-item' data-faq-category='{category}'><summary>{html.escape(question)}</summary><p>{html.escape(answer)}</p></details>"
+        for category, question, answer in items
+    )
+    filters = "".join(
+        f"<button type='button' class='choice {'active' if category == 'all' else ''}' data-faq-filter='{category}'>{html.escape(label)}</button>"
+        for category, label in zip(("all", "setup", "errors"), labels, strict=True)
+    )
+    return f"""
+    <section class='card faq' id='faq'>
+      <h2>{html.escape(title)}</h2><p>{html.escape(intro)}</p>
+      <div class='faq-controls'><input id='faq-search' type='search' placeholder='{html.escape(placeholder, quote=True)}' aria-label='{html.escape(placeholder, quote=True)}'><div class='choice-row faq-filters'>{filters}</div></div>
+      <div class='faq-items'>{rows}<p class='hint faq-empty' hidden>{html.escape(empty)}</p></div>
+    </section>"""
 
 
 def render_tokens_admin(
@@ -1028,9 +1305,11 @@ h1,h2,h3 {{ margin:0 0 14px; line-height:1.24; }} h1 {{ font-size:28px; }} h2 {{
 label {{ display:block; font-weight:700; margin:14px 0 6px; }} input,select {{ display:block; width:100%; margin-top:6px; padding:12px 13px; border:1px solid var(--line); border-radius:9px; background:#0b1321; color:var(--text); font:inherit; }}
 button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sans-serif; cursor:pointer; }} button:disabled {{ cursor:not-allowed; opacity:.5; }} .primary {{ color:#071120; background:var(--accent); }} .wide {{ display:block; width:100%; margin-top:18px; }} .secondary {{ color:var(--text); background:#263652; }} .danger {{ color:#26080c; background:var(--danger); margin-top:12px; }}
 .hint {{ color:var(--muted); font-size:14px; }} .warning {{ color:var(--warn); font-weight:700; }} .flash {{ border-radius:9px; padding:11px 13px; margin:12px 0; }} .error {{ color:#ffdce0; background:rgba(255,120,133,.18); border:1px solid rgba(255,120,133,.45); }} .success {{ color:#d8ffec; background:rgba(95,213,160,.15); border:1px solid rgba(95,213,160,.45); }}
-.language-switch {{ display:flex; justify-content:flex-end; margin:0 0 -4px; }} .language-switch a {{ color:var(--text); font-weight:700; text-decoration:none; padding:7px 10px; border:1px solid var(--line); border-radius:7px; }} .language-switch a:hover {{ border-color:var(--accent); color:var(--accent); }}
+.top-links {{ display:flex; justify-content:space-between; gap:8px; margin:0 0 -4px; }} .top-links a {{ color:var(--text); font-weight:700; text-decoration:none; padding:7px 10px; border:1px solid var(--line); border-radius:7px; }} .top-links a:hover {{ border-color:var(--accent); color:var(--accent); }}
 .details {{ display:grid; grid-template-columns:minmax(210px,auto) 1fr; gap:8px 18px; margin:0; }} .details dt {{ color:var(--muted); }} .details dd {{ margin:0; min-width:0; overflow-wrap:anywhere; }} code,pre {{ font-family:Consolas,'Courier New',monospace; }} .api-key {{ color:#b9d4ff; }}
 .choice-row {{ display:flex; flex-wrap:wrap; gap:8px; margin:14px 0; }} .instruction-apps .choice[hidden] {{ display:none; }} .instruction-card {{ margin-top:18px; }} .choice {{ color:var(--text); background:#1b2940; border:1px solid var(--line); }} .choice.active {{ color:#08101e; background:var(--accent); border-color:var(--accent); }} .selected-line {{ padding:12px; margin:16px 0; border-left:3px solid var(--accent); background:#0b1321; }} ol {{ padding-left:24px; }} pre {{ max-width:100%; overflow:auto; padding:14px; white-space:pre-wrap; overflow-wrap:anywhere; background:#080e18; border:1px solid var(--line); border-radius:9px; color:#d9e7ff; }}
+.instruction-mode-tabs {{ display:flex; gap:6px; margin:16px 0 10px; border-bottom:1px solid var(--line); }} .instruction-mode {{ color:var(--muted); background:transparent; border-radius:8px 8px 0 0; padding:9px 12px; }} .instruction-mode.active {{ color:var(--text); background:#1b2940; box-shadow:inset 0 -2px 0 var(--accent); }} .instruction-mode-panel {{ padding:2px 0 4px; }} .manual-heading {{ color:var(--text); font-weight:700; }} .full-script,.remove-integration {{ margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:10px; background:#0b1321; }} .full-script summary,.remove-integration summary,.faq-item summary {{ cursor:pointer; padding:12px 14px; font-weight:700; }} .full-script pre,.remove-integration pre {{ margin:0 12px 12px; }} .remove-integration {{ border-color:rgba(255,120,133,.42); background:rgba(255,120,133,.07); }} .remove-integration summary {{ color:#ffdce0; }} .remove-integration .hint,.remove-integration button {{ margin-left:12px; margin-right:12px; }} .remove-integration button {{ margin-bottom:12px; }}
+.faq {{ scroll-margin-top:24px; }} .faq-controls {{ margin:16px 0; }} .faq-controls input {{ max-width:520px; }} .faq-items {{ border-top:1px solid var(--line); }} .faq-item {{ display:block; border-bottom:1px solid var(--line); }} .faq-item summary {{ list-style:none; padding-right:38px; position:relative; }} .faq-item summary::-webkit-details-marker {{ display:none; }} .faq-item summary::after {{ content:'+'; position:absolute; right:14px; color:var(--accent); font-size:20px; line-height:1; }} .faq-item[open] summary::after {{ content:'−'; }} .faq-item p {{ color:var(--muted); padding:0 14px 14px; margin:0; }}
 .title-row {{ display:flex; justify-content:space-between; gap:16px; align-items:start; }} .title-row form {{ margin:0; }} .create-form,.edit-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); column-gap:18px; }} .create-form .wide {{ grid-column:1 / -1; }}
 .table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th[data-sort],th[data-group-service] {{ cursor:pointer; user-select:none; }} th[data-sort]:hover,th[data-group-service]:hover,th.grouped {{ color:var(--accent); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .service-group-toggle {{ color:var(--text); background:transparent; padding:0; font-size:16px; }} .service-group-toggle:hover,.service-group-toggle:focus {{ color:var(--accent); }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-form {{ margin-top:16px; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
 @media(max-width:650px) {{ .page,.admin-page {{ width:min(100% - 20px,960px); margin-top:12px; }} .card {{ padding:18px; border-radius:12px; }} h1 {{ font-size:24px; }} .details,.create-form,.edit-grid {{ grid-template-columns:1fr; }} .title-row {{ display:block; }} .title-row form {{ margin-top:12px; }} }}
@@ -1040,8 +1319,8 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
   var provider=(root && root.dataset.defaultProvider) || 'claude';
   var app=(root && root.dataset.defaultApp) || 'Claude Code CLI';
   var os='Windows';
-  var descriptions={{'VS Code':'Настройка API в VS Code','App':'Настройка приложения','CLI':'Ручная CLI-настройка','Claude Code CLI':'Ручная CLI-настройка','Claude App':'Настройка Claude App','Hermes Desktop':'Настройка Hermes Desktop','Cheap Code':'Настройка Cheap Code','Grok Build':'Настройка Grok Build','Pi':'Настройка Pi','OpenCode':'Настройка OpenCode','Cursor':'Настройка Cursor'}};
-  if(document.documentElement.lang==='en') descriptions={{'VS Code':'API setup in VS Code','App':'Application setup','CLI':'Manual CLI setup','Claude Code CLI':'Manual CLI setup','Claude App':'Claude App setup','Hermes Desktop':'Hermes Desktop setup','Cheap Code':'Cheap Code setup','Grok Build':'Grok Build setup','Pi':'Pi setup','OpenCode':'OpenCode setup','Cursor':'Cursor setup'}};
+  var descriptions={{'VS Code':'Настройка API в VS Code','App':'Настройка приложения','CLI':'Ручная CLI-настройка','Claude Code CLI':'Ручная CLI-настройка','Claude App':'Настройка Claude App','Hermes Desktop':'Настройка Hermes Desktop','Cheap Code':'Настройка Cheap Code','Grok Build':'Настройка Grok Build','Kimi Code CLI':'Настройка Kimi Code CLI','ZCode':'Настройка ZCode','Pi':'Настройка Pi','OpenCode':'Настройка OpenCode','Cursor':'Настройка Cursor'}};
+  if(document.documentElement.lang==='en') descriptions={{'VS Code':'API setup in VS Code','App':'Application setup','CLI':'Manual CLI setup','Claude Code CLI':'Manual CLI setup','Claude App':'Claude App setup','Hermes Desktop':'Hermes Desktop setup','Cheap Code':'Cheap Code setup','Grok Build':'Grok Build setup','Kimi Code CLI':'Kimi Code CLI setup','ZCode':'ZCode setup','Pi':'Pi setup','OpenCode':'OpenCode setup','Cursor':'Cursor setup'}};
   function update() {{
     var method=document.getElementById('selected-method'), description=document.getElementById('selected-description'), selectedOs=document.getElementById('selected-os');
     if(method) method.textContent=app;
@@ -1057,11 +1336,16 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
   document.querySelectorAll('[data-instruction-provider]').forEach(function(button) {{ button.addEventListener('click',function() {{ provider=button.dataset.instructionProvider; var first=document.querySelector('[data-instruction-app][data-provider="'+provider+'"]'); if(first) app=first.dataset.instructionApp; update(); }}); }});
   document.querySelectorAll('[data-instruction-app]').forEach(function(button) {{ button.addEventListener('click',function() {{ app=button.dataset.instructionApp; provider=button.dataset.provider; update(); }}); }});
   document.querySelectorAll('[data-instruction-os]').forEach(function(button) {{ button.addEventListener('click',function() {{ os=button.dataset.instructionOs; update(); }}); }});
+  document.querySelectorAll('.instruction-mode').forEach(function(button) {{ button.addEventListener('click',function() {{ var card=button.closest('.instruction-card'), mode=button.dataset.instructionMode; if(!card||!mode) return; card.querySelectorAll('.instruction-mode').forEach(function(item) {{ var selected=item===button; item.classList.toggle('active',selected); item.setAttribute('aria-selected',String(selected)); }}); card.querySelectorAll('[data-instruction-mode-panel]').forEach(function(panel) {{ panel.hidden=panel.dataset.instructionModePanel!==mode; }}); }}); }});
   document.querySelectorAll('.copy-instruction').forEach(function(button) {{ button.addEventListener('click',function() {{ var target=document.getElementById(button.dataset.copyTarget); if(!target) return; navigator.clipboard.writeText(target.textContent).then(function() {{ button.textContent=button.dataset.copiedLabel; setTimeout(function() {{ button.textContent=button.dataset.copyLabel; }},1500); }}); }}); }});
   var balance=document.getElementById('token-balance');
   if(balance) fetch('/ai/tokens/balance',{{cache:'no-store'}}).then(function(response) {{ return response.ok ? response.json() : Promise.reject(); }}).then(function(data) {{ if(data.ok) balance.textContent=data.formatted+' '+(balance.dataset.separator||'/')+' '+data.token_limit_formatted; }}).catch(function() {{ /* Keep the locally saved balance visible. */ }});
   function copyApiKey(cell) {{ var value=cell.dataset.copyApiKey; if(!value) return; navigator.clipboard.writeText(value).then(function() {{ var old=cell.title; cell.title='API key скопирован'; setTimeout(function() {{ cell.title=old; }},1500); }}); }}
   document.querySelectorAll('.copyable-api-key').forEach(function(cell) {{ cell.addEventListener('click',function() {{ copyApiKey(cell); }}); cell.addEventListener('keydown',function(event) {{ if(event.key==='Enter'||event.key===' ') {{ event.preventDefault(); copyApiKey(cell); }} }}); }});
+  var faqSearch=document.getElementById('faq-search'), faqFilter='all', faqEmpty=document.querySelector('.faq-empty');
+  function filterFaq() {{ var query=(faqSearch&&faqSearch.value||'').toLowerCase().trim(), visible=0; document.querySelectorAll('.faq-item').forEach(function(item) {{ var matchesCategory=faqFilter==='all'||item.dataset.faqCategory===faqFilter, matchesText=!query||item.textContent.toLowerCase().indexOf(query)!==-1, show=matchesCategory&&matchesText; item.hidden=!show; if(show) visible++; }}); if(faqEmpty) faqEmpty.hidden=visible!==0; }}
+  document.querySelectorAll('[data-faq-filter]').forEach(function(button) {{ button.addEventListener('click',function() {{ faqFilter=button.dataset.faqFilter||'all'; document.querySelectorAll('[data-faq-filter]').forEach(function(item) {{ item.classList.toggle('active',item===button); }}); filterFaq(); }}); }});
+  if(faqSearch) faqSearch.addEventListener('input',filterFaq);
   var createdKeys=document.querySelector('.created-keys'), copyCreated=document.getElementById('copy-created-keys');
   if(createdKeys&&copyCreated) copyCreated.addEventListener('click',function() {{ navigator.clipboard.writeText(createdKeys.dataset.createdKeys||'').then(function() {{ var old=copyCreated.textContent; copyCreated.textContent='Скопировано'; setTimeout(function() {{ copyCreated.textContent=old; }},1500); }}); }});
   var keyTable=document.getElementById('keys-table'), tableWrap=document.getElementById('keys-table-wrap'), groups=document.getElementById('keys-table-groups');
@@ -1093,7 +1377,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 __all__ = [
     "CheapVibeCodeClient", "SecondaryKeyClient", "SERVICE_OPTIONS", "TokenKey", "TokenKeyStore",
     "create_tokens_routes", "default_instruction_choice", "generate_access_code",
-    "instruction_command", "instruction_remove_command", "instruction_steps",
+    "instruction_command", "instruction_remove_command", "instruction_steps", "manual_instruction_command",
     "normalize_access_code", "trusted_secondary_remaining", "used_tokens_from_remaining",
 ]
 

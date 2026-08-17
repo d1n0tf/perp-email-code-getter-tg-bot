@@ -1,4 +1,4 @@
-﻿import tempfile
+import tempfile
 import unittest
 from html.parser import HTMLParser
 from pathlib import Path
@@ -7,6 +7,10 @@ import httpx
 from fastapi import FastAPI
 
 from src.tokens import (
+    INSTRUCTION_ENDPOINTS,
+    INSTRUCTION_GROUPS,
+    INSTRUCTION_REMOVE_ENDPOINTS,
+    INSTRUCTION_SYSTEMS_BY_APP,
     SERVICE_OPTIONS,
     TokenKey,
     TokenKeyStore,
@@ -15,6 +19,7 @@ from src.tokens import (
     instruction_command,
     instruction_remove_command,
     instruction_steps,
+    manual_instruction_command,
     trusted_secondary_remaining,
     utc_now,
 )
@@ -271,12 +276,18 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Grok Build", response.text)
         self.assertIn("Открой PowerShell.", response.text)
         self.assertIn("Перезапусти терминал и введи grok.", response.text)
-        self.assertIn("https://starimg.ru/ai/common/igw", response.text)
-        self.assertIn("https://starimg.ru/ai/common/rgw", response.text)
-        self.assertIn("https://starimg.ru/ai/common/igm", response.text)
+        self.assertIn("https://ru.cheapvibecode.ru/igw", response.text)
+        self.assertIn("https://ru.cheapvibecode.ru/rgw", response.text)
+        self.assertIn("https://ru.cheapvibecode.ru/igm", response.text)
         self.assertIn("$env:CVC_API_KEY=", response.text)
         self.assertIn("sk-cvc-grok", response.text)
         self.assertIn("data-instruction-app='Claude Code CLI'", response.text)
+        self.assertIn("data-instruction-mode='script'", response.text)
+        self.assertIn("data-instruction-mode='manual'", response.text)
+        self.assertIn('Чем отличаются Codex, OpenAI и Anthropic endpoint&#x27;ы?', response.text)
+        self.assertNotIn('Платёж создан', response.text)
+        self.assertIn("Удалить интеграцию", response.text)
+        self.assertIn("Ответы на вопросы и ошибки", response.text)
 
     async def test_admin_table_refreshes_used_tokens_from_balance_api(self) -> None:
         await self.store.add_many([
@@ -379,17 +390,17 @@ class TokenInstructionHelpersTestCase(unittest.TestCase):
         self.assertEqual(default_instruction_choice("Grok"), ("grok", "Grok Build"))
         self.assertEqual(
             instruction_command("Grok Build", "Windows", "sk-cvc-example"),
-            "$env:CVC_API_KEY='sk-cvc-example'; iex(irm 'https://starimg.ru/ai/common/igw')",
+            "$env:CVC_API_KEY='sk-cvc-example'; iex(irm 'https://ru.cheapvibecode.ru/igw')",
         )
         self.assertEqual(
             instruction_command("Grok Build", "macOS", "sk-cvc-example"),
-            "bash <(curl -fsSL 'https://starimg.ru/ai/common/igm') 'sk-cvc-example'",
+            "bash <(curl -fsSL 'https://ru.cheapvibecode.ru/igm') 'sk-cvc-example'",
         )
         self.assertEqual(
             instruction_command("Grok Build", "Linux", "sk-cvc-example"),
-            "bash <(curl -fsSL 'https://starimg.ru/ai/common/igl') 'sk-cvc-example'",
+            "bash <(curl -fsSL 'https://ru.cheapvibecode.ru/igl') 'sk-cvc-example'",
         )
-        self.assertEqual(instruction_remove_command("Grok Build", "Windows"), "iex(irm 'https://starimg.ru/ai/common/rgw')")
+        self.assertEqual(instruction_remove_command("Grok Build", "Windows"), "iex(irm 'https://ru.cheapvibecode.ru/rgw')")
         self.assertEqual(
             instruction_steps("Grok Build", "Windows", "ru"),
             ["Открой PowerShell.", "Выполни команду ниже.", "Перезапусти терминал и введи grok."],
@@ -398,6 +409,23 @@ class TokenInstructionHelpersTestCase(unittest.TestCase):
             instruction_steps("Grok Build", "macOS", "en"),
             ["Open the terminal.", "Run the command below.", "Restart the terminal and type grok."],
         )
+
+    def test_manual_instructions_and_removal_cover_all_instruction_apps(self) -> None:
+        manual = manual_instruction_command("Grok Build", "Windows", "sk-cvc-example")
+        self.assertIn("~/.grok/config.toml", manual)
+        self.assertIn('api_key = "sk-cvc-example"', manual)
+        self.assertIn("api_backend = \"chat_completions\"", manual)
+        applications = " ".join(app for _, _, apps in INSTRUCTION_GROUPS for app in apps)
+        self.assertIn("Kimi Code CLI", applications)
+        self.assertIn("ZCode", applications)
+        self.assertIsNotNone(instruction_remove_command("Claude Code CLI", "Windows"))
+        self.assertIsNotNone(instruction_remove_command("Cursor", "Linux"))
+        for _, _, instruction_apps in INSTRUCTION_GROUPS:
+            for application in instruction_apps:
+                for system in INSTRUCTION_SYSTEMS_BY_APP[application]:
+                    self.assertIn(system, INSTRUCTION_ENDPOINTS[application])
+                    self.assertIn(system, INSTRUCTION_REMOVE_ENDPOINTS[application])
+                    self.assertTrue(manual_instruction_command(application, system, "sk-cvc-example"))
 
     def test_secondary_remaining_is_rejected_when_it_is_the_primary_balance(self) -> None:
         self.assertIsNone(trusted_secondary_remaining(50_000_000, 2_000_000, 50_000_000))
