@@ -276,9 +276,9 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Grok Build", response.text)
         self.assertIn("Открой PowerShell.", response.text)
         self.assertIn("Перезапусти терминал и введи grok.", response.text)
-        self.assertIn("https://ru.cheapvibecode.ru/igw", response.text)
-        self.assertIn("https://ru.cheapvibecode.ru/rgw", response.text)
-        self.assertIn("https://ru.cheapvibecode.ru/igm", response.text)
+        self.assertIn("https://starimg.ru/ai/common/igw", response.text)
+        self.assertIn("https://starimg.ru/ai/common/rgw", response.text)
+        self.assertIn("https://starimg.ru/ai/common/igm", response.text)
         self.assertIn("$env:CVC_API_KEY=", response.text)
         self.assertIn("sk-cvc-grok", response.text)
         self.assertIn("data-instruction-app='Claude Code CLI'", response.text)
@@ -390,17 +390,17 @@ class TokenInstructionHelpersTestCase(unittest.TestCase):
         self.assertEqual(default_instruction_choice("Grok"), ("grok", "Grok Build"))
         self.assertEqual(
             instruction_command("Grok Build", "Windows", "sk-cvc-example"),
-            "$env:CVC_API_KEY='sk-cvc-example'; iex(irm 'https://ru.cheapvibecode.ru/igw')",
+            "$env:CVC_API_KEY='sk-cvc-example'; iex(irm 'https://starimg.ru/ai/common/igw')",
         )
         self.assertEqual(
             instruction_command("Grok Build", "macOS", "sk-cvc-example"),
-            "bash <(curl -fsSL 'https://ru.cheapvibecode.ru/igm') 'sk-cvc-example'",
+            "bash <(curl -fsSL 'https://starimg.ru/ai/common/igm') 'sk-cvc-example'",
         )
         self.assertEqual(
             instruction_command("Grok Build", "Linux", "sk-cvc-example"),
-            "bash <(curl -fsSL 'https://ru.cheapvibecode.ru/igl') 'sk-cvc-example'",
+            "bash <(curl -fsSL 'https://starimg.ru/ai/common/igl') 'sk-cvc-example'",
         )
-        self.assertEqual(instruction_remove_command("Grok Build", "Windows"), "iex(irm 'https://ru.cheapvibecode.ru/rgw')")
+        self.assertEqual(instruction_remove_command("Grok Build", "Windows"), "iex(irm 'https://starimg.ru/ai/common/rgw')")
         self.assertEqual(
             instruction_steps("Grok Build", "Windows", "ru"),
             ["Открой PowerShell.", "Выполни команду ниже.", "Перезапусти терминал и введи grok."],

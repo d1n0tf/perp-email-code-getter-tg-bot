@@ -1,4 +1,4 @@
-﻿"""Secondary API key activation and administration service."""
+"""Secondary API key activation and administration service."""
 from __future__ import annotations
 
 import asyncio
@@ -37,7 +37,7 @@ TOKEN_TEXT = {
         "choose_service": "1. Выберите сервис", "choose_app": "2. Выберите приложение", "choose_os": "3. Выберите операционную систему", "selected": "Выбрано:", "description": "Описание:", "os": "Операционная система:",
         "manual": "Ручная настройка с готовым скриптом", "shell_windows": "PowerShell", "shell_other": "Терминал", "open": "Откройте {shell} на машине, где запускается выбранное приложение.", "run": "Скопируйте и выполните скрипт ниже. API ключ уже подставлен автоматически.", "restart": "Перезапустите приложение после завершения настройки.", "warning": "⚠️ Копируйте скрипт полностью или воспользуйтесь кнопкой «Скопировать».", "copy": "Скопировать", "copied": "Скопировано", "remove_hint": "Для удаления настройки повторите инструкцию из документации сервиса или удалите добавленные строки из конфигурации.",
         "remaining_sep": "из", "remove_script": "Скрипт удаления настройки",
-        "script": "Скрипт", "manual_mode": "Вручную", "manual_heading": "Ручная настройка", "remove_integration": "Удалить интеграцию", "remove_integration_hint": "Удаляется только интеграция CheapVibeCode для выбранного приложения.", "full_script": "Полный скрипт",
+        "script": "Скрипт", "manual_mode": "Вручную", "manual_heading": "Ручная настройка", "remove_integration": "Удалить интеграцию", "remove_integration_hint": "Удаляется только интеграция для выбранного приложения.", "full_script": "Полный скрипт",
         "grok_open_windows": "Открой PowerShell.", "grok_open_other": "Открой терминал.", "grok_run": "Выполни команду ниже.", "grok_restart": "Перезапусти терминал и введи grok.",
         "required": "Введите ключ доступа.", "missing": "Ключ доступа не существует.", "success": "Ключ успешно активирован. API-ключ готов к использованию.",
         "balance_unavailable": "Не удалось обновить баланс токенов.",
@@ -51,7 +51,7 @@ TOKEN_TEXT = {
         "choose_service": "1. Choose a service", "choose_app": "2. Choose an application", "choose_os": "3. Choose an operating system", "selected": "Selected:", "description": "Description:", "os": "Operating system:",
         "manual": "Setup", "shell_windows": "PowerShell", "shell_other": "Terminal", "open": "Open {shell} on the machine where the selected application runs.", "run": "Copy and run the script below. The API key is already inserted automatically.", "restart": "Restart the application after setup is complete.", "warning": "⚠️ Copy the complete script or use the «Copy» button.", "copy": "Copy", "copied": "Copied", "remove_hint": "To remove the setup, follow the service documentation or remove the added configuration lines.",
         "remaining_sep": "of", "remove_script": "Uninstall script",
-        "script": "Script", "manual_mode": "Manually", "manual_heading": "Manual setup", "remove_integration": "Remove integration", "remove_integration_hint": "This removes only the CheapVibeCode integration for the selected application.", "full_script": "Full script",
+        "script": "Script", "manual_mode": "Manually", "manual_heading": "Manual setup", "remove_integration": "Remove integration", "remove_integration_hint": "This removes only this integration for the selected application.", "full_script": "Full script",
         "grok_open_windows": "Open PowerShell.", "grok_open_other": "Open the terminal.", "grok_run": "Run the command below.", "grok_restart": "Restart the terminal and type grok.",
         "required": "Enter an access key.", "missing": "The access key does not exist.", "success": "The key was activated successfully. The API key is ready to use.",
         "balance_unavailable": "Could not refresh the token balance.",
@@ -818,7 +818,7 @@ def instruction_slug(value: str) -> str:
 
 def instruction_base_url(application: str) -> str:
     """Return the documented proxy endpoint for a client integration."""
-    return "https://cheapvibecode.ru" if application in {"Kimi Code CLI", "ZCode"} else "https://ru.cheapvibecode.ru"
+    return "https://starimg.ru/ai/common"
 
 
 def instruction_command(application: str, system: str, api_key: str, locale: str = "ru") -> str:
@@ -862,7 +862,7 @@ mkdir -p ~/.codex; {{ grep -Ev '^(CVC_API_KEY|OPENAI_API_KEY)=' ~/.codex/.env 2>
         return f'''# ~/.claude/settings.json
 {{
   "env": {{
-    "ANTHROPIC_BASE_URL": "https://ru.cheapvibecode.ru",
+    "ANTHROPIC_BASE_URL": "https://starimg.ru/ai/common",
     "ANTHROPIC_AUTH_TOKEN": "{api_key}"
   }}
 }}'''
@@ -873,7 +873,7 @@ mkdir -p ~/.codex; {{ grep -Ev '^(CVC_API_KEY|OPENAI_API_KEY)=' ~/.codex/.env 2>
   "deploymentMode": "3p",
   "enterpriseConfig": {{
     "inferenceProvider": "gateway",
-    "inferenceGatewayBaseUrl": "https://ru.cheapvibecode.ru",
+    "inferenceGatewayBaseUrl": "https://starimg.ru/ai/common",
     "inferenceGatewayApiKey": "{api_key}",
     "inferenceGatewayAuthScheme": "bearer",
     "modelDiscoveryEnabled": true
@@ -882,13 +882,13 @@ mkdir -p ~/.codex; {{ grep -Ev '^(CVC_API_KEY|OPENAI_API_KEY)=' ~/.codex/.env 2>
     if application == "Hermes Desktop":
         return f'''# config.yaml
 custom_providers:
-  - name: "cheapvibecode"
-    base_url: "https://ru.cheapvibecode.ru/v1"
+  - name: "starimg"
+    base_url: "https://starimg.ru/ai/common/v1"
     key_env: "CVC_API_KEY"
     api_mode: chat_completions
 
 model:
-  provider: "custom:cheapvibecode"
+  provider: "custom:starimg"
   default: "claude-sonnet-4-6"
 
 # .env
@@ -902,7 +902,7 @@ CHEAPCODE_API_KEY={api_key}'''
     "CHEAPCODE_USE_OPENAI": "1",
     "CVC_API_KEY": "{api_key}",
     "OPENAI_API_KEY": "{api_key}",
-    "OPENAI_BASE_URL": "https://ru.cheapvibecode.ru/v1",
+    "OPENAI_BASE_URL": "https://starimg.ru/ai/common/v1",
     "OPENAI_MODEL": "gpt-5.6-terra",
     "OPENAI_API_FORMAT": "responses",
     "CHEAPCODE_CLI_PROFILE": "1"
@@ -919,7 +919,7 @@ default_reasoning_effort = "xhigh"
 
 [model."grok-4.6"]
 model = "grok-4.6"
-base_url = "https://ru.cheapvibecode.ru/v1"
+base_url = "https://starimg.ru/ai/common/v1"
 name = "grok-4.6"
 description = "xAI \u00b7 Grok 4.6"
 api_key = "{api_key}"
@@ -936,7 +936,7 @@ reasoning_efforts = [
 
 [model."grok-composer-2.5-fast"]
 model = "composer-2.5-fast"
-base_url = "https://ru.cheapvibecode.ru/v1"
+base_url = "https://starimg.ru/ai/common/v1"
 name = "composer-2.5-fast"
 description = "xAI \u00b7 Composer 2.5 Fast"
 api_key = "{api_key}"
@@ -944,15 +944,15 @@ api_backend = "chat_completions"
 context_window = 200000'''
     if application == "Kimi Code CLI":
         return f'''# ~/.kimi-code/config.toml
-default_model = "cheapvibecode/gpt-5.6-terra"
+default_model = "starimg/gpt-5.6-terra"
 
-[providers.cheapvibecode]
+[providers.starimg]
 type = "openai"
 base_url = "{base_url}/v1"
 api_key = "{api_key}"
 
-[models."cheapvibecode/gpt-5.6-terra"]
-provider = "cheapvibecode"
+[models."starimg/gpt-5.6-terra"]
+provider = "starimg"
 model = "gpt-5.6-terra"
 max_context_size = 353000
 max_input_size = 225000
@@ -966,11 +966,11 @@ enabled = true
 effort = "high"
 keep = "all"'''
     if application == "ZCode":
-        return f'''# Merge only provider.cheapvibecode into ~/.zcode/v2/config.json.
+        return f'''# Merge only provider.starimg into ~/.zcode/v2/config.json.
 {{
   "provider": {{
-    "cheapvibecode": {{
-      "name": "CheapVibeCode",
+    "starimg": {{
+      "name": "Starimg AI",
       "kind": "openai-compatible",
       "options": {{
         "apiKey": "{api_key}",
@@ -994,7 +994,7 @@ keep = "all"'''
         return f'''# ~/.pi/agent/models.json
 {{
   "providers": {{
-    "cheapvibecode": {{
+    "starimg": {{
       "baseUrl": "{base_url}/v1",
       "api": "openai-completions",
       "authHeader": true,
@@ -1004,20 +1004,20 @@ keep = "all"'''
 }}
 
 # ~/.pi/agent/auth.json
-{{ "cheapvibecode": {{ "type": "api_key", "key": "{api_key}" }} }}
+{{ "starimg": {{ "type": "api_key", "key": "{api_key}" }} }}
 
 # ~/.pi/agent/settings.json
-{{ "defaultProvider": "cheapvibecode", "defaultModel": "gpt-5.6-terra" }}'''
+{{ "defaultProvider": "starimg", "defaultModel": "gpt-5.6-terra" }}'''
     if application == "OpenCode":
-        return f'''File: https://ru.cheapvibecode.ru/downloads/opencode.jsonc
+        return f'''File: https://starimg.ru/ai/common/downloads/opencode.jsonc
 Configuration: ~/.config/opencode/opencode.json
 
-The script creates a backup, downloads the configuration, inserts the API key, sorts models, and selects cheapvibecode/gpt-5.6-terra.
+The script creates a backup, downloads the configuration, inserts the API key, sorts models, and selects starimg/gpt-5.6-terra.
 apiKey: {api_key}
-baseURL: https://ru.cheapvibecode.ru/v1
-model: cheapvibecode/gpt-5.6-terra'''
+baseURL: https://starimg.ru/ai/common/v1
+model: starimg/gpt-5.6-terra'''
     if application == "Cursor":
-        return f'''Base URL : https://ru.cheapvibecode.ru/v1
+        return f'''Base URL : https://starimg.ru/ai/common/v1
 API key  : {api_key}
 Model    : gpt-5.6-terra-cursor
 
@@ -1141,10 +1141,10 @@ def render_faq(locale: str = "ru") -> str:
             ("setup", "Which instruction should I choose?", "Choose the client you actually use: Codex for VS Code/Codex App/Codex CLI, Claude for Claude Code CLI/Claude App, and Others for Hermes, Cheap Code, Grok Build, Kimi, ZCode, Pi, OpenCode, Cursor, and similar clients. Then choose the application and operating system."),
             ("setup", "What is the difference between Codex, OpenAI, and Anthropic endpoints?", "Codex clients use the prepared Codex provider at /backend-api/codex. OpenAI-compatible clients use /v1. Claude Code CLI and other Anthropic-compatible clients use /anthropic/v1. The same API key is used in every case; the selected instruction inserts the right endpoint."),
             ("setup", "What is the difference between Script and Manually?", "Script applies the prepared configuration automatically. Manually shows the configuration values and file locations so that you can add them yourself. In both modes the active API key is already inserted."),
-            ("setup", "Will setup remove my chats or other providers?", "The setup and removal commands are intended to change only the CheapVibeCode integration. Close the selected client before setup, and use the hidden Remove integration block when you need to undo it."),
-            ("errors", "The client asks to sign in or does not see CVC_API_KEY", "Fully close and reopen the client. For remote development, SSH, VPS, or server workspaces, run the setup on the machine where the client or extension host actually runs."),
+            ("setup", "Will setup remove my chats or other providers?", "The setup and removal commands are intended to change only the Starimg AI integration. Close the selected client before setup, and use the hidden Remove integration block when you need to undo it."),
+            ("errors", "The client asks to sign in or does not see the API key", "Fully close and reopen the client. For remote development, SSH, VPS, or server workspaces, run the setup on the machine where the client or extension host actually runs."),
             ("errors", "401 / Incorrect API key / requests go to api.openai.com", "The client is still using its direct provider configuration. Run setup on the correct machine, restart the client, then use Remove integration once and run setup again if an old configuration remains."),
-            ("errors", "Model not found", "Check the exact model ID supported by your selected client. Codex and ZCode use the regular ID, OpenCode and Kimi use cheapvibecode/<model>, while Cursor uses <model>-cursor. Restart the client after changing model or key."),
+            ("errors", "Model not found", "Check the exact model ID supported by your selected client. Codex and ZCode use the regular ID, OpenCode and Kimi use starimg/<model>, while Cursor uses <model>-cursor. Restart the client after changing model or key."),
             ("errors", "What do 429, 502, 503, 504, 524, or capacity_unavailable mean?", "429 is a rate limit: wait and reduce parallel requests. 502/503/capacity_unavailable are temporary upstream availability errors. For 504/524 wait briefly, retry once with backoff, and if needed choose another model."),
             ("errors", "Claude Code is outdated or continually asks yes/no", "Run claude update and restart the CLI for an unsupported version. Yes/no prompts are local Claude permissions, not API-key errors. Claude App and Claude Code CLI are configured separately."),
         )
@@ -1157,10 +1157,10 @@ def render_faq(locale: str = "ru") -> str:
             ("setup", "Чем отличаются Codex, OpenAI и Anthropic endpoint'ы?", "Codex-клиенты используют готовый Codex provider с /backend-api/codex. OpenAI-совместимые клиенты используют Base URL с /v1. Claude Code CLI и другие Anthropic-совместимые клиенты используют /anthropic/v1. Ключ во всех случаях один; нужный endpoint уже подставляет выбранная инструкция."),
             ("setup", "Что выбрать в инструкции: Codex, Claude или «Другие»?", "Выбирайте по клиенту, а не по названию модели: Codex — для VS Code, Codex App и Codex CLI; Claude — для Claude Code CLI и Claude App; «Другие» — для Hermes, Cheap Code, Grok Build, Kimi, ZCode, Pi, OpenCode, Cursor и похожих клиентов. Затем выберите приложение и ОС."),
             ("setup", "Чем отличаются «Скрипт» и «Вручную»?", "Скрипт автоматически применяет готовую настройку. «Вручную» показывает значения и файлы конфигурации, чтобы внести их самостоятельно. В обоих вариантах API-ключ уже подставлен."),
-            ("setup", "Слетят ли другие провайдеры, настройки или чаты?", "Команды настройки и удаления предназначены только для интеграции CheapVibeCode. Перед настройкой полностью закройте выбранный клиент; для отмены используйте скрытый блок «Удалить интеграцию»."),
+            ("setup", "Слетят ли другие провайдеры, настройки или чаты?", "Команды настройки и удаления предназначены только для интеграции Starimg AI. Перед настройкой полностью закройте выбранный клиент; для отмены используйте скрытый блок «Удалить интеграцию»."),
             ("errors", "Клиент просит войти или не видит CVC_API_KEY", "Полностью закройте и снова откройте клиент. Для Remote/SSH/VPS и server workspace запускайте настройку на машине, где реально работает клиент или extension host."),
             ("errors", "401, Incorrect API key или запрос уходит на api.openai.com", "Клиент всё ещё использует прямую конфигурацию провайдера. Запустите настройку на нужной машине и перезапустите клиент. Если осталась старая конфигурация — один раз выполните «Удалить интеграцию», затем повторите настройку."),
-            ("errors", "Модель не появилась или Model not found", "Проверьте точный ID модели для выбранного клиента. В OpenCode и Kimi используется cheapvibecode/<model>, в Cursor — <model>-cursor. После смены модели или ключа перезапустите клиент."),
+            ("errors", "Модель не появилась или Model not found", "Проверьте точный ID модели для выбранного клиента. В OpenCode и Kimi используется starimg/<model>, в Cursor — <model>-cursor. После смены модели или ключа перезапустите клиент."),
             ("errors", "Что означают 429, 502, 503, 504, 524 и capacity_unavailable?", "429 — ограничение частоты: подождите и уменьшите параллельные запросы. 502/503/capacity_unavailable — временная недоступность upstream. При 504/524 немного подождите, повторите запрос один раз с паузой и при необходимости выберите другую модель."),
             ("errors", "Claude Code устарел или постоянно спрашивает yes / no", "При Unsupported Claude Code version выполните claude update и перезапустите CLI. Запросы yes/no — это локальные разрешения Claude, а не ошибка API-ключа. Claude App и Claude Code CLI настраиваются отдельно."),
         )
