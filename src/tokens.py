@@ -95,7 +95,7 @@ def format_tokens(value: int) -> str:
 
 
 def format_datetime(value: datetime | None) -> str:
-    return to_moscow(value).strftime("%d.%m.%Y %H:%M") if value else "\u2014"
+    return to_moscow(value).strftime("%d.%m.%Y %H:%M") if value else "—"
 
 
 @dataclass(frozen=True, slots=True)
@@ -517,14 +517,14 @@ def create_tokens_routes(
         if not admin_password:
             return await admin_response(
                 request,
-                error="\u0410\u0434\u043c\u0438\u043d-\u043f\u0430\u043d\u0435\u043b\u044c \u043d\u0435\u0434\u043e\u0441\u0442\u0443\u043f\u043d\u0430: \u0437\u0430\u0434\u0430\u0439\u0442\u0435 TOKENS_ADMIN_PASSWORD \u0432 .env.",
+                error="Админ-панель недоступна: задайте TOKENS_ADMIN_PASSWORD в .env.",
                 status_code=503,
             )
         supplied = form.get("password", "")
         if not secrets.compare_digest(supplied, admin_password):
             return await admin_response(
                 request,
-                error="\u041d\u0435\u0432\u0435\u0440\u043d\u044b\u0439 \u043f\u0430\u0440\u043e\u043b\u044c.",
+                error="Неверный пароль.",
                 status_code=401,
             )
         session = secrets.token_urlsafe(32)
@@ -548,14 +548,14 @@ def create_tokens_routes(
             return RedirectResponse(url="/ai/tokens/adm", status_code=303)
         session = request.cookies.get(TOKENS_ADMIN_COOKIE, "")
         admin_sessions.discard(session)
-        response = await admin_response(request, notice="\u0412\u044b \u0432\u044b\u0448\u043b\u0438 \u0438\u0437 \u0430\u0434\u043c\u0438\u043d-\u043f\u0430\u043d\u0435\u043b\u0438.")
+        response = await admin_response(request, notice="Вы вышли из админ-панели.")
         response.delete_cookie(TOKENS_ADMIN_COOKIE, path="/ai/tokens/adm")
         return response
 
     async def admin_create(request: Request) -> HTMLResponse:
         form = await read_form(request)
         if not is_admin(request):
-            return await admin_response(request, error="\u0421\u0435\u0441\u0441\u0438\u044f \u0430\u0434\u043c\u0438\u043d\u0438\u0441\u0442\u0440\u0430\u0442\u043e\u0440\u0430 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0430.", status_code=401)
+            return await admin_response(request, error="Сессия администратора завершена.", status_code=401)
         if not valid_csrf(request, form, TOKENS_ADMIN_CSRF_COOKIE):
             return RedirectResponse(url="/ai/tokens/adm", status_code=303)
         service = form.get("service", "")
@@ -563,13 +563,13 @@ def create_tokens_routes(
         token_limit = positive_int(form.get("token_limit", ""))
         quantity = positive_int(form.get("quantity", ""))
         if service not in SERVICE_OPTIONS:
-            return await admin_response(request, error="\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u043d\u044b\u0439 \u0441\u0435\u0440\u0432\u0438\u0441.", status_code=400)
+            return await admin_response(request, error="Выберите доступный сервис.", status_code=400)
         if not name:
-            return await admin_response(request, error="\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u043d\u0430\u0437\u0432\u0430\u043d\u0438\u0435 \u043a\u043b\u044e\u0447\u0430.", status_code=400)
+            return await admin_response(request, error="Введите название ключа.", status_code=400)
         if token_limit is None or token_limit < 1:
-            return await admin_response(request, error="\u041a\u043e\u043b\u0438\u0447\u0435\u0441\u0442\u0432\u043e \u0442\u043e\u043a\u0435\u043d\u043e\u0432 \u0434\u043e\u043b\u0436\u043d\u043e \u0431\u044b\u0442\u044c \u043f\u043e\u043b\u043e\u0436\u0438\u0442\u0435\u043b\u044c\u043d\u044b\u043c \u0446\u0435\u043b\u044b\u043c \u0447\u0438\u0441\u043b\u043e\u043c.", status_code=400)
+            return await admin_response(request, error="Количество токенов должно быть положительным целым числом.", status_code=400)
         if quantity is None or not 1 <= quantity <= 100:
-            return await admin_response(request, error="\u041a\u043e\u043b\u0438\u0447\u0435\u0441\u0442\u0432\u043e \u043a\u043b\u044e\u0447\u0435\u0439 \u0434\u043e\u043b\u0436\u043d\u043e \u0431\u044b\u0442\u044c \u043e\u0442 1 \u0434\u043e 100.", status_code=400)
+            return await admin_response(request, error="Количество ключей должно быть от 1 до 100.", status_code=400)
         async with creation_lock:
             existing = await store.list()
             existing_codes = {key.access_code for key in existing}
@@ -598,49 +598,49 @@ def create_tokens_routes(
                     return await admin_response(
                         request,
                         error=(
-                            f"\u0421\u043e\u0437\u0434\u0430\u043d\u043e \u043a\u043b\u044e\u0447\u0435\u0439: {len(records)} \u0438\u0437 {quantity}. "
-                            f"\u041e\u0441\u0442\u0430\u043b\u044c\u043d\u044b\u0435 \u043d\u0435 \u0441\u043e\u0437\u0434\u0430\u043d\u044b: {str(exc)}"
+                            f"Создано ключей: {len(records)} из {quantity}. "
+                            f"Остальные не созданы: {str(exc)}"
                         ),
                         status_code=502,
                         created_access_codes=[record.access_code for record in records],
                     )
                 return await admin_response(
                     request,
-                    error=f"\u041a\u043b\u044e\u0447\u0438 \u043d\u0435 \u0441\u043e\u0437\u0434\u0430\u043d\u044b: {str(exc)}",
+                    error=f"Ключи не созданы: {str(exc)}",
                     status_code=502,
                 )
             await store.add_many(records)
         return await admin_response(
             request,
-            notice=f"\u0421\u043e\u0437\u0434\u0430\u043d\u043e \u043a\u043b\u044e\u0447\u0435\u0439: {len(records)}.",
+            notice=f"Создано ключей: {len(records)}.",
             created_access_codes=[record.access_code for record in records],
         )
 
     async def admin_update(request: Request, key_id: int) -> HTMLResponse:
         form = await read_form(request)
         if not is_admin(request):
-            return await admin_response(request, error="\u0421\u0435\u0441\u0441\u0438\u044f \u0430\u0434\u043c\u0438\u043d\u0438\u0441\u0442\u0440\u0430\u0442\u043e\u0440\u0430 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0430.", status_code=401)
+            return await admin_response(request, error="Сессия администратора завершена.", status_code=401)
         if not valid_csrf(request, form, TOKENS_ADMIN_CSRF_COOKIE):
             return RedirectResponse(url="/ai/tokens/adm", status_code=303)
         current = await store.get(key_id)
         if current is None:
-            return await admin_response(request, error="\u041a\u043b\u044e\u0447 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d.", status_code=404)
+            return await admin_response(request, error="Ключ не найден.", status_code=404)
         try:
             updated = record_from_admin_form(form, current, await store.list())
         except ValueError as exc:
             return await admin_response(request, error=str(exc), status_code=400)
         await store.update(key_id, updated)
-        return await admin_response(request, notice=f"\u041a\u043b\u044e\u0447 #{key_id} \u043e\u0431\u043d\u043e\u0432\u043b\u0435\u043d.")
+        return await admin_response(request, notice=f"Ключ #{key_id} обновлен.")
 
     async def admin_delete(request: Request, key_id: int) -> HTMLResponse:
         form = await read_form(request)
         if not is_admin(request):
-            return await admin_response(request, error="\u0421\u0435\u0441\u0441\u0438\u044f \u0430\u0434\u043c\u0438\u043d\u0438\u0441\u0442\u0440\u0430\u0442\u043e\u0440\u0430 \u0437\u0430\u0432\u0435\u0440\u0448\u0435\u043d\u0430.", status_code=401)
+            return await admin_response(request, error="Сессия администратора завершена.", status_code=401)
         if not valid_csrf(request, form, TOKENS_ADMIN_CSRF_COOKIE):
             return RedirectResponse(url="/ai/tokens/adm", status_code=303)
         if not await store.delete(key_id):
-            return await admin_response(request, error="\u041a\u043b\u044e\u0447 \u043d\u0435 \u043d\u0430\u0439\u0434\u0435\u043d.", status_code=404)
-        return await admin_response(request, notice=f"\u041a\u043b\u044e\u0447 #{key_id} \u0443\u0434\u0430\u043b\u0435\u043d.")
+            return await admin_response(request, error="Ключ не найден.", status_code=404)
+        return await admin_response(request, notice=f"Ключ #{key_id} удален.")
 
     app.add_api_route("/ai/tokens", page, methods=["GET"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens", activate, methods=["POST"], response_class=HTMLResponse, response_model=None)
@@ -674,24 +674,24 @@ def input_datetime(value: datetime | None) -> str:
 def record_from_admin_form(form: dict[str, str], current: TokenKey, all_keys: list[TokenKey]) -> TokenKey:
     service = form.get("service", "")
     if service not in SERVICE_OPTIONS:
-        raise ValueError("\u0412\u044b\u0431\u0435\u0440\u0438\u0442\u0435 \u0434\u043e\u0441\u0442\u0443\u043f\u043d\u044b\u0439 \u0441\u0435\u0440\u0432\u0438\u0441.")
+        raise ValueError("Выберите доступный сервис.")
     name = form.get("name", "").strip()
     api_key = form.get("api_key", "").strip()
     access_code = normalize_access_code(form.get("access_code", ""))
     token_limit = positive_int(form.get("token_limit", ""))
     used_tokens = positive_int(form.get("used_tokens", ""))
     if not name:
-        raise ValueError("\u041d\u0430\u0437\u0432\u0430\u043d\u0438\u0435 \u043a\u043b\u044e\u0447\u0430 \u043d\u0435 \u043b\u043e\u0436\u0435\u0442 \u0431\u044b\u0442\u044c \u043f\u0443\u0441\u0442\u044b\u043c.")
+        raise ValueError("Название ключа не ложет быть пустым.")
     if not api_key:
-        raise ValueError("API key \u043d\u0435 \u043c\u043e\u0436\u0435\u0442 \u0431\u044b\u0442\u044c \u043f\u0443\u0441\u0442\u044b\u043c.")
+        raise ValueError("API key не может быть пустым.")
     if len(access_code) != 20 or any(char not in TOKEN_CODE_ALPHABET for char in access_code):
-        raise ValueError("\u041a\u043b\u044e\u0447 \u0434\u043e\u0441\u0442\u0443\u043f\u0430 \u0434\u043e\u043b\u0436\u0435\u043d \u0441\u043e\u0441\u0442\u043e\u044f\u0442\u044c \u0438\u0437 20 \u0437\u0430\u0433\u043b\u0430\u0432\u043d\u044b\u0445 \u043b\u0430\u0442\u0438\u043d\u0441\u043a\u0438\u0445 \u0431\u0443\u043a\u0432 \u0438 \u0446\u0438\u0444\u0440.")
+        raise ValueError("Ключ доступа должен состоять из 20 заглавных латинских букв и цифр.")
     if any(key.id != current.id and key.access_code == access_code for key in all_keys):
-        raise ValueError("\u0422\u0430\u043a\u043e\u0439 \u043a\u043b\u044e\u0447 \u0434\u043e\u0441\u0442\u0443\u043f\u0430 \u0443\u0436\u0435 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442.")
+        raise ValueError("Такой ключ доступа уже существует.")
     if token_limit is None or token_limit < 1:
-        raise ValueError("\u041a\u043e\u043b\u0438\u0447\u0435\u0441\u0442\u0432\u043e \u0442\u043e\u043a\u0435\u043d\u043e\u0432 \u0434\u043e\u043b\u0436\u043d\u043e \u0431\u044b\u0442\u044c \u043f\u043e\u043b\u043e\u0436\u0438\u0442\u0435\u043b\u044c\u043d\u044b\u043c \u0446\u0435\u043b\u044b\u043c \u0447\u0438\u0441\u043b\u043e\u043c.")
+        raise ValueError("Количество токенов должно быть положительным целым числом.")
     if used_tokens is None or not 0 <= used_tokens <= token_limit:
-        raise ValueError("\u0418\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u043d\u043e \u0434\u043e\u043b\u0436\u043d\u043e \u0431\u044b\u0442\u044c \u043e\u0442 0 \u0434\u043e \u043b\u0438\u043c\u0438\u0442\u0430 \u0442\u043e\u043a\u0435\u043d\u043e\u0432.")
+        raise ValueError("Использовано должно быть от 0 до лимита токенов.")
     try:
         created_at = parse_admin_datetime(form.get("created_at", ""))
         activated_raw = form.get("activated_at", "").strip()
@@ -699,7 +699,7 @@ def record_from_admin_form(form: dict[str, str], current: TokenKey, all_keys: li
         exhausted_raw = form.get("exhausted_at", "").strip()
         exhausted_at = parse_admin_datetime(exhausted_raw) if exhausted_raw else None
     except (TypeError, ValueError):
-        raise ValueError("\u0412\u0432\u0435\u0434\u0438\u0442\u0435 \u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u044b\u0435 \u0434\u0430\u0442\u044b.") from None
+        raise ValueError("Введите корректные даты.") from None
     if used_tokens >= token_limit:
         exhausted_at = exhausted_at or current.exhausted_at or utc_now()
     else:
@@ -902,7 +902,7 @@ requires_openai_auth = true
 '''
     auth = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": api_key}, ensure_ascii=False, indent=2) + "\n"
     env = f"CVC_API_KEY={api_key}\nOPENAI_API_KEY={api_key}\n"
-    labels = ("Download config.toml", "Download auth.json", "Download .env") if token_locale(locale) == "en" else ("??????? config.toml", "??????? auth.json", "??????? .env")
+    labels = ("Download config.toml", "Download auth.json", "Download .env") if token_locale(locale) == "en" else ("Скачать config.toml", "Скачать auth.json", "Скачать .env")
     files = (("config.toml", "text/plain", config), ("auth.json", "application/json", auth), (".env", "text/plain", env))
     links = "".join(
         f"<a class='download-file' href='data:{mime};charset=utf-8,{quote(content)}' download='{filename}'>{html.escape(label)}</a>"
@@ -982,7 +982,7 @@ default_reasoning_effort = "xhigh"
 model = "grok-4.6"
 base_url = "https://starimg.ru/ai/common/v1"
 name = "grok-4.6"
-description = "xAI \u00b7 Grok 4.6"
+description = "xAI · Grok 4.6"
 api_key = "{api_key}"
 api_backend = "chat_completions"
 context_window = 500000
@@ -999,7 +999,7 @@ reasoning_efforts = [
 model = "composer-2.5-fast"
 base_url = "https://starimg.ru/ai/common/v1"
 name = "composer-2.5-fast"
-description = "xAI \u00b7 Composer 2.5 Fast"
+description = "xAI · Composer 2.5 Fast"
 api_key = "{api_key}"
 api_backend = "chat_completions"
 context_window = 200000'''
@@ -1253,19 +1253,19 @@ def render_tokens_admin(
     elif notice:
         flash = f"<div class='flash success'>{html.escape(notice)}</div>"
     if not authenticated:
-        unavailable = "" if password_configured else "<p class='warning'>TOKENS_ADMIN_PASSWORD \u043d\u0435 \u0437\u0430\u0434\u0430\u043d \u0432 .env. \u0412\u0445\u043e\u0434 \u043e\u0442\u043a\u043b\u044e\u0447\u0435\u043d.</p>"
+        unavailable = "" if password_configured else "<p class='warning'>TOKENS_ADMIN_PASSWORD не задан в .env. Вход отключен.</p>"
         content = f"""
         <main class='page narrow'><section class='card'>
-          <h1>\u0421\u041e\u0417\u0414\u0410\u041d\u0418\u042f \u041a\u041b\u042e\u0427\u0415\u0419</h1>
+          <h1>СОЗДАНИЯ КЛЮЧЕЙ</h1>
           {flash}{unavailable}
           <form method='post' action='/ai/tokens/adm/login'>
             <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
-            <label for='password'>\u041f\u0430\u0440\u043e\u043b\u044c \u0430\u0434\u043c\u0438\u043d\u0438\u0441\u0442\u0440\u0430\u0442\u043e\u0440\u0430</label>
+            <label for='password'>Пароль администратора</label>
             <input id='password' type='password' name='password' autocomplete='current-password' required>
-            <button class='primary wide' type='submit' {'disabled' if not password_configured else ''}>\u0412\u043e\u0439\u0442\u0438</button>
+            <button class='primary wide' type='submit' {'disabled' if not password_configured else ''}>Войти</button>
           </form>
         </section></main>"""
-        return HTMLResponse(render_layout("\u0410\u0434\u043c\u0438\u043d-\u043f\u0430\u043d\u0435\u043b\u044c \u043a\u043b\u044e\u0447\u0435\u0439", content))
+        return HTMLResponse(render_layout("Админ-панель ключей", content))
     rows = render_admin_rows(keys, csrf_token)
     created_access_codes = created_access_codes or []
     created_codes = "\n".join(created_access_codes)
@@ -1280,45 +1280,45 @@ def render_tokens_admin(
     content = f"""
     <main class='page admin-page'>
       <section class='card'>
-        <div class='title-row'><h1>\u0421\u041e\u0417\u0414\u0410\u041d\u0418\u042f \u041a\u041b\u042e\u0427\u0415\u0419</h1>
-        <form method='post' action='/ai/tokens/adm/logout'><input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><button class='secondary' type='submit'>\u0412\u044b\u0439\u0442\u0438</button></form></div>
+        <div class='title-row'><h1>СОЗДАНИЯ КЛЮЧЕЙ</h1>
+        <form method='post' action='/ai/tokens/adm/logout'><input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><button class='secondary' type='submit'>Выйти</button></form></div>
         {flash}{copy_created}
         <form method='post' action='/ai/tokens/adm/create' class='create-form'>
           <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
-          <label>\u0412\u042b\u0411\u0420\u0410\u0422\u042c \u0421\u0415\u0420\u0412\u0418\u0421:<select name='service' required>{service_options}</select></label>
-          <label>\u0412\u042b\u0411\u0420\u0410\u0422\u042c \u041d\u0410\u0417\u0412\u0410\u041d\u0418\u0415:<input name='name' required maxlength='200' placeholder='\u041d\u0430\u0437\u0432\u0430\u043d\u0438\u0435'></label>
-          <label>\u0412\u042b\u0411\u0420\u0410\u0422\u042c \u041a\u041e\u041b\u0418\u0427\u0415\u0421\u0422\u0412\u041e:<input type='number' name='token_limit' min='1' step='1' required placeholder='\u041a\u043e\u043b\u0438\u0447\u0435\u0441\u0442\u0432\u043e \u0442\u043e\u043a\u0435\u043d\u043e\u0432'></label>
-          <label>\u0412\u042b\u0411\u0420\u0410\u0422\u042c \u041a\u041e\u041b\u0418\u0427\u0415\u0421\u0422\u0412\u041e \u041a\u041b\u042e\u0427\u0415\u0419:<input type='number' name='quantity' min='1' max='100' step='1' required value='1'></label>
-          <button class='primary wide' type='submit'>\u0421\u041e\u0417\u0414\u0410\u0422\u042c</button>
+          <label>ВЫБРАТЬ СЕРВИС:<select name='service' required>{service_options}</select></label>
+          <label>ВЫБРАТЬ НАЗВАНИЕ:<input name='name' required maxlength='200' placeholder='Название'></label>
+          <label>ВЫБРАТЬ КОЛИЧЕСТВО:<input type='number' name='token_limit' min='1' step='1' required placeholder='Количество токенов'></label>
+          <label>ВЫБРАТЬ КОЛИЧЕСТВО КЛЮЧЕЙ:<input type='number' name='quantity' min='1' max='100' step='1' required value='1'></label>
+          <button class='primary wide' type='submit'>СОЗДАТЬ</button>
         </form>
       </section>
       <section class='card'>
-        <h2>\u0423\u041f\u0420\u0410\u0412\u041b\u0415\u041d\u0418\u0415 \u041a\u041b\u042e\u0427\u0410\u041c\u0418</h2>
-        <p class='hint'>\u041d\u0430\u0436\u043c\u0438\u0442\u0435 \u00ab\u0423\u043f\u0440\u0430\u0432\u043b\u044f\u0442\u044c\u00bb, \u0447\u0442\u043e\u0431\u044b \u0438\u0437\u043c\u0435\u043d\u0438\u0442\u044c \u0432\u0441\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 \u043a\u043b\u044e\u0447\u0430.</p>
-        <div class='table-wrap' id='keys-table-wrap'><table id='keys-table'><thead><tr><th data-sort='number'>ID</th><th data-sort='date'>\u0414\u0430\u0442\u0430 \u0441\u043e\u0437\u0434\u0430\u043d\u0438\u044f</th><th data-group-service data-sort='service'>\u0421\u0415\u0420\u0412\u0418\u0421</th><th data-sort='text'>\u041a\u041b\u042e\u0427</th><th data-sort='text'>API KEY</th><th data-sort='number'>\u0422\u041e\u041a\u0415\u041d\u041e\u0412</th><th data-sort='number'>\u0418\u0421\u041f\u041e\u041b\u042c\u0417\u041e\u0412\u0410\u041d\u041e</th><th data-sort='text'>\u0421\u0422\u0410\u0422\u0423\u0421</th><th data-sort='text'>\u0423\u041f\u0420\u0410\u0412\u041b\u0415\u041d\u0418\u0415</th></tr></thead>
-        <tbody>{rows or "<tr><td colspan='9' class='empty'>\u041a\u043b\u044e\u0447\u0435\u0439 \u043f\u043e\u043a\u0430 \u043d\u0435\u0442.</td></tr>"}</tbody></table></div>
+        <h2>УПРАВЛЕНИЕ КЛЮЧАМИ</h2>
+        <p class='hint'>Нажмите «Управлять», чтобы изменить все данные ключа.</p>
+        <div class='table-wrap' id='keys-table-wrap'><table id='keys-table'><thead><tr><th data-sort='number'>ID</th><th data-sort='date'>Дата создания</th><th data-group-service data-sort='service'>СЕРВИС</th><th data-sort='text'>КЛЮЧ</th><th data-sort='text'>API KEY</th><th data-sort='number'>ТОКЕНОВ</th><th data-sort='number'>ИСПОЛЬЗОВАНО</th><th data-sort='text'>СТАТУС</th><th data-sort='text'>УПРАВЛЕНИЕ</th></tr></thead>
+        <tbody>{rows or "<tr><td colspan='9' class='empty'>Ключей пока нет.</td></tr>"}</tbody></table></div>
         <div id='keys-table-groups' hidden></div>
       </section>
     </main>"""
-    return HTMLResponse(render_layout("\u0410\u0434\u043c\u0438\u043d-\u043f\u0430\u043d\u0435\u043b\u044c \u043a\u043b\u044e\u0447\u0435\u0439", content))
+    return HTMLResponse(render_layout("Админ-панель ключей", content))
 
 
 def render_admin_rows(keys: list[TokenKey], csrf_token: str) -> str:
     rows: list[str] = []
     for key in keys:
         status = (
-            f"\u0418\u0441\u0442\u0440\u0430\u0447\u0435\u043d ({format_datetime(key.exhausted_at or key.activated_at)})"
+            f"Истрачен ({format_datetime(key.exhausted_at or key.activated_at)})"
             if key.is_exhausted else
-            (f"\u0410\u043a\u0442\u0438\u0432\u0438\u0440\u043e\u0432\u0430\u043d ({format_datetime(key.activated_at)})" if key.activated_at else "\u041d\u0435 \u0430\u043a\u0442\u0438\u0432\u0438\u0440\u043e\u0432\u0430\u043d")
+            (f"Активирован ({format_datetime(key.activated_at)})" if key.activated_at else "Не активирован")
         )
         rows.append(f"""
         <tr data-service='{html.escape(key.service, quote=True)}'><td data-sort-value='{key.id}'>{key.id}</td><td data-sort-value='{key.created_at.timestamp()}'>{format_datetime(key.created_at)}</td><td data-sort-value='{html.escape(key.service, quote=True)}'>{html.escape(key.service)}</td><td data-sort-value='{html.escape(key.access_code, quote=True)}'><code>{html.escape(key.access_code)}</code></td>
         <td data-sort-value='{html.escape(key.api_key, quote=True)}' class='copyable-api-key' data-copy-api-key='{html.escape(key.api_key, quote=True)}' role='button' tabindex='0' title='Нажмите, чтобы скопировать API key' aria-label='Скопировать API key'><code class='api-preview'>{html.escape(key.api_key)}</code></td><td data-sort-value='{key.token_limit}'>{format_tokens(key.token_limit)}</td>
         <td data-sort-value='{key.used_tokens}'>{format_tokens(key.used_tokens)}<br><span class='hint'>ост. {format_tokens(key.remaining_tokens)}</span></td><td data-sort-value='{html.escape(status, quote=True)}'>{status}</td>
-        <td data-sort-value='\u0423\u043f\u0440\u0430\u0432\u043b\u0435\u043d\u0438\u0435'><div class='management-actions'><button type='button' class='secondary' data-edit='row'>\u0423\u043f\u0440\u0430\u0432\u043b\u044f\u0442\u044c</button>
+        <td data-sort-value='Управление'><div class='management-actions'><button type='button' class='secondary' data-edit='row'>Управлять</button>
         <form method='post' action='/ai/tokens/adm/{key.id}/delete' class='inline-delete-form'>
           <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
-          <button class='danger' type='submit' onclick="return confirm('\u0423\u0434\u0430\u043b\u0438\u0442\u044c \u043a\u043b\u044e\u0447 #{key.id}?')">\u0423\u0434\u0430\u043b\u0438\u0442\u044c</button>
+          <button class='danger' type='submit' onclick="return confirm('Удалить ключ #{key.id}?')">Удалить</button>
         </form></div></td></tr>""")
         options = "".join(
             f"<option value='{html.escape(service, quote=True)}' {'selected' if service == key.service else ''}>{html.escape(service)}</option>"

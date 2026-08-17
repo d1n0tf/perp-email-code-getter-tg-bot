@@ -440,7 +440,7 @@ class TokenInstructionHelpersTestCase(unittest.TestCase):
         self.assertIn('api_key = "sk-cvc-example"', manual)
         self.assertIn("api_backend = \"chat_completions\"", manual)
         downloads = manual_download_buttons("VS Code", "sk-cvc-example", "ru")
-        self.assertIn("??????? config.toml", downloads)
+        self.assertIn("Скачать config.toml", downloads)
         self.assertIn("download='auth.json'", downloads)
         self.assertIn("https%3A//starimg.ru/ai/common/v1", downloads)
         self.assertNotIn("cheapvibecode", downloads.lower())
