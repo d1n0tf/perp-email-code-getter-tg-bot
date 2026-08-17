@@ -731,7 +731,7 @@ def render_tokens_page(
     text = TOKEN_TEXT[locale]
     flash = f"<div class='flash error'>{html.escape(error)}</div>" if error else (f"<div class='flash success'>{html.escape(notice)}</div>" if notice else "")
     info = render_key_information(key, locale) if key is not None else ""
-    instructions = render_instructions(key, locale) if key is not None and not key.is_exhausted else ""
+    instructions = render_instructions(key, locale) if key is not None else ""
     faq = render_faq(locale)
     opposite_locale = "ru" if locale == "en" else "en"
     faq_label = "Help / errors" if locale == "en" else "Ответы на вопросы / ошибки"
@@ -1300,20 +1300,20 @@ def render_admin_rows(keys: list[TokenKey], csrf_token: str) -> str:
         <tr class='edit-row' hidden><td colspan='9'>
           <form class='edit-form' method='post' action='/ai/tokens/adm/{key.id}/update'>
             <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
-            <h3>?????????? ?????? #{key.id}</h3>
+            <h3>Управление ключом #{key.id}</h3>
             <div class='edit-grid'>
-              <label>??????<select name='service'>{options}</select></label>
-              <label>????????<input name='name' value='{html.escape(key.name, quote=True)}' required></label>
-              <label>???? ????????<input type='datetime-local' name='created_at' value='{input_datetime(key.created_at)}' required></label>
-              <label>???? ???????<input name='access_code' minlength='20' maxlength='20' pattern='[A-Z0-9]{{20}}' value='{html.escape(key.access_code, quote=True)}' required></label>
+              <label>Сервис<select name='service'>{options}</select></label>
+              <label>Название<input name='name' value='{html.escape(key.name, quote=True)}' required></label>
+              <label>Дата создания<input type='datetime-local' name='created_at' value='{input_datetime(key.created_at)}' required></label>
+              <label>Ключ доступа<input name='access_code' minlength='20' maxlength='20' pattern='[A-Z0-9]{{20}}' value='{html.escape(key.access_code, quote=True)}' required></label>
               <label>API key<input name='api_key' value='{html.escape(key.api_key, quote=True)}' required></label>
-              <label>????? ???????<input type='number' name='token_limit' min='1' step='1' value='{key.token_limit}' required></label>
-              <label>????????????<input type='number' name='used_tokens' min='0' step='1' value='{key.used_tokens}' required></label>
-              <label>???? ?????????<input type='datetime-local' name='activated_at' value='{input_datetime(key.activated_at)}'></label>
-              <label>???? ??????????<input type='datetime-local' name='exhausted_at' value='{input_datetime(key.exhausted_at)}'></label>
+              <label>Лимит токенов<input type='number' name='token_limit' min='1' step='1' value='{key.token_limit}' required></label>
+              <label>Использовано<input type='number' name='used_tokens' min='0' step='1' value='{key.used_tokens}' required></label>
+              <label>Дата активации<input type='datetime-local' name='activated_at' value='{input_datetime(key.activated_at)}'></label>
+              <label>Дата истрачения<input type='datetime-local' name='exhausted_at' value='{input_datetime(key.exhausted_at)}'></label>
             </div>
-            <div class='edit-actions'><button class='primary' type='submit'>?????????</button>
-            <button class='secondary cancel-edit' type='button' data-edit='row'>??????</button></div>
+            <div class='edit-actions'><button class='primary' type='submit'>Сохранить</button>
+            <button class='secondary cancel-edit' type='button' data-edit='row'>Отмена</button></div>
           </form>
         </td></tr>
 """)

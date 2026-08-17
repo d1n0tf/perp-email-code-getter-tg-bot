@@ -250,6 +250,28 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(stored)
         self.assertEqual(stored.used_tokens if stored else None, 10)
 
+    async def test_exhausted_key_keeps_setup_instructions_visible(self) -> None:
+        access_code = "ZZZZZZZZZZZZZZZZZZZZ"
+        await self.store.add_many([
+            TokenKey(
+                id=99,
+                created_at=utc_now(),
+                access_code=access_code,
+                api_key="sk-cvc-exhausted",
+                service="Grok",
+                name="Exhausted Grok key",
+                token_limit=100,
+                used_tokens=100,
+                activated_at=utc_now(),
+                exhausted_at=utc_now(),
+            )
+        ])
+        response = await self.client.get("/ai/tokens", headers={"Cookie": f"tokens_access_key={access_code}"})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("class='card instructions'", response.text)
+        self.assertIn("data-default-app='Grok Build'", response.text)
+        self.assertIn("data-provider-app='Grok Build'", response.text)
+
     async def test_grok_instructions_use_html_scripts_and_top_level_service(self) -> None:
         access_code = "ABCDEFGHIJKLMNOPQRST"
         await self.store.add_many([
