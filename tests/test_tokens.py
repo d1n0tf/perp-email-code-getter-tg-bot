@@ -20,7 +20,7 @@ from src.tokens import (
     instruction_remove_command,
     instruction_steps,
     manual_instruction_command,
-    manual_instruction_notes,
+    manual_instruction_note,
     trusted_secondary_remaining,
     utc_now,
 )
@@ -416,9 +416,8 @@ class TokenInstructionHelpersTestCase(unittest.TestCase):
         self.assertIn("~/.grok/config.toml", manual)
         self.assertIn('api_key = "sk-cvc-example"', manual)
         self.assertIn("api_backend = \"chat_completions\"", manual)
-        notes = manual_instruction_notes("Grok Build", "Windows", "ru")
-        self.assertEqual(len(notes), 3)
-        self.assertFalse(any("?" in note for note in notes))
+        self.assertIn("api_backend = chat_completions", manual_instruction_note("Grok Build", "Windows", "ru"))
+        self.assertIn("Grok models", manual_instruction_note("Grok Build", "Windows", "en"))
         applications = " ".join(app for _, _, apps in INSTRUCTION_GROUPS for app in apps)
         self.assertIn("Kimi Code CLI", applications)
         self.assertIn("ZCode", applications)
@@ -430,8 +429,8 @@ class TokenInstructionHelpersTestCase(unittest.TestCase):
                     self.assertIn(system, INSTRUCTION_ENDPOINTS[application])
                     self.assertIn(system, INSTRUCTION_REMOVE_ENDPOINTS[application])
                     self.assertTrue(manual_instruction_command(application, system, "sk-cvc-example"))
-                    self.assertTrue(manual_instruction_notes(application, system, "ru"))
-                    self.assertTrue(manual_instruction_notes(application, system, "en"))
+                    self.assertTrue(manual_instruction_note(application, system, "ru"))
+                    self.assertTrue(manual_instruction_note(application, system, "en"))
 
     def test_secondary_remaining_is_rejected_when_it_is_the_primary_balance(self) -> None:
         self.assertIsNone(trusted_secondary_remaining(50_000_000, 2_000_000, 50_000_000))
