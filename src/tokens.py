@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, quote
 
 import aiohttp
 from fastapi import FastAPI, Request
@@ -883,6 +883,33 @@ def manual_instruction_note(application: str, system: str, locale: str = "ru") -
         "Cursor": "If the script does not suit your Cursor version, you can enter these values manually in Settings -> Models.",
     }
     return (notes_en if token_locale(locale) == "en" else notes_ru)[application]
+
+def manual_download_buttons(application: str, api_key: str, locale: str = "ru") -> str:
+    """Download ready-to-place Codex files without exposing the upstream domain."""
+    if application not in {"VS Code", "App", "CLI"}:
+        return ""
+    base_url = f"{instruction_base_url(application)}/v1"
+    config = f'''model = "gpt-5.6-terra"
+model_reasoning_effort = "high"
+model_provider = "starimg"
+web_search = "live"
+
+[model_providers.starimg]
+name = "Starimg AI"
+base_url = "{base_url}"
+wire_api = "responses"
+requires_openai_auth = true
+'''
+    auth = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": api_key}, ensure_ascii=False, indent=2) + "\n"
+    env = f"CVC_API_KEY={api_key}\nOPENAI_API_KEY={api_key}\n"
+    labels = ("Download config.toml", "Download auth.json", "Download .env") if token_locale(locale) == "en" else ("??????? config.toml", "??????? auth.json", "??????? .env")
+    files = (("config.toml", "text/plain", config), ("auth.json", "application/json", auth), (".env", "text/plain", env))
+    links = "".join(
+        f"<a class='download-file' href='data:{mime};charset=utf-8,{quote(content)}' download='{filename}'>{html.escape(label)}</a>"
+        for (filename, mime, content), label in zip(files, labels, strict=True)
+    )
+    return f"<div class='manual-downloads'>{links}</div>"
+
 def manual_instruction_command(application: str, system: str, api_key: str) -> str:
     """Render a manual setup based on the supplied CVC instruction document."""
     base_url = instruction_base_url(application)
@@ -1101,6 +1128,7 @@ def render_instructions(key: TokenKey, locale: str = "ru") -> str:
                 command = html.escape(instruction_command(application, system, key.api_key, locale))
                 manual_command = html.escape(manual_instruction_command(application, system, key.api_key))
                 manual_note = html.escape(manual_instruction_note(application, system, locale))
+                manual_downloads = manual_download_buttons(application, key.api_key, locale)
                 description = text["manual"]
                 steps = "".join(f"<li>{html.escape(step)}</li>" for step in instruction_steps(application, system, locale))
                 remove_command = instruction_remove_command(application, system)
@@ -1130,7 +1158,7 @@ def render_instructions(key: TokenKey, locale: str = "ru") -> str:
                   </div>
                   <div class='instruction-mode-panel' data-instruction-mode-panel='manual' hidden>
                     <p class='manual-heading'>{html.escape(manual_heading)}</p>
-                    <p class='manual-note'>{manual_note}</p>
+                    <p class='manual-note'>{manual_note}</p>{manual_downloads}
                     <pre id='instruction-manual-{slug}'>{manual_command}</pre>
                     <button type='button' class='primary copy-instruction' data-copy-target='instruction-manual-{slug}' data-copy-label='{html.escape(text['copy'])}' data-copied-label='{html.escape(text['copied'])}'>{html.escape(text['copy'])}</button>
                   </div>
@@ -1335,7 +1363,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 .top-links {{ display:flex; justify-content:space-between; gap:8px; margin:0 0 -4px; }} .top-links a {{ color:var(--text); font-weight:700; text-decoration:none; padding:7px 10px; border:1px solid var(--line); border-radius:7px; }} .top-links a:hover {{ border-color:var(--accent); color:var(--accent); }}
 .details {{ display:grid; grid-template-columns:minmax(210px,auto) 1fr; gap:8px 18px; margin:0; }} .details dt {{ color:var(--muted); }} .details dd {{ margin:0; min-width:0; overflow-wrap:anywhere; }} code,pre {{ font-family:Consolas,'Courier New',monospace; }} .api-key {{ color:#b9d4ff; }}
 .choice-row {{ display:flex; flex-wrap:wrap; gap:8px; margin:14px 0; }} .instruction-apps .choice[hidden] {{ display:none; }} .instruction-card {{ margin-top:18px; }} .choice {{ color:var(--text); background:#1b2940; border:1px solid var(--line); }} .choice.active {{ color:#08101e; background:var(--accent); border-color:var(--accent); }} .selected-line {{ padding:12px; margin:16px 0; border-left:3px solid var(--accent); background:#0b1321; }} ol {{ padding-left:24px; }} pre {{ max-width:100%; overflow:auto; padding:14px; white-space:pre-wrap; overflow-wrap:anywhere; background:#080e18; border:1px solid var(--line); border-radius:9px; color:#d9e7ff; }}
-.instruction-mode-tabs {{ display:flex; gap:6px; margin:16px 0 10px; border-bottom:1px solid var(--line); }} .instruction-mode {{ color:var(--muted); background:transparent; border-radius:8px 8px 0 0; padding:9px 12px; }} .instruction-mode.active {{ color:var(--text); background:#1b2940; box-shadow:inset 0 -2px 0 var(--accent); }} .instruction-mode-panel {{ padding:2px 0 4px; }} .manual-heading {{ color:var(--text); font-weight:700; }} .manual-note {{ margin:8px 0 14px; color:var(--muted); line-height:1.55; }} .remove-integration {{ margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:10px; background:#0b1321; }} .remove-integration summary,.faq-item summary {{ cursor:pointer; padding:12px 14px; font-weight:700; }} .remove-integration pre {{ margin:0 12px 12px; }} .remove-integration {{ border-color:rgba(255,120,133,.42); background:rgba(255,120,133,.07); }} .remove-integration summary {{ color:#ffdce0; }} .remove-integration .hint,.remove-integration button {{ margin-left:12px; margin-right:12px; }} .remove-integration button {{ margin-bottom:12px; }}
+.instruction-mode-tabs {{ display:flex; gap:6px; margin:16px 0 10px; border-bottom:1px solid var(--line); }} .instruction-mode {{ color:var(--muted); background:transparent; border-radius:8px 8px 0 0; padding:9px 12px; }} .instruction-mode.active {{ color:var(--text); background:#1b2940; box-shadow:inset 0 -2px 0 var(--accent); }} .instruction-mode-panel {{ padding:2px 0 4px; }} .manual-heading {{ color:var(--text); font-weight:700; }} .manual-downloads {{ display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 14px; }} .download-file {{ color:var(--text); background:#1b2940; border:1px solid var(--line); border-radius:8px; padding:8px 11px; font-size:14px; font-weight:700; text-decoration:none; }} .download-file:hover,.download-file:focus {{ border-color:var(--accent); color:var(--accent); }} .manual-note {{ margin:8px 0 14px; color:var(--muted); line-height:1.55; }} .remove-integration {{ margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:10px; background:#0b1321; }} .remove-integration summary,.faq-item summary {{ cursor:pointer; padding:12px 14px; font-weight:700; }} .remove-integration pre {{ margin:0 12px 12px; }} .remove-integration {{ border-color:rgba(255,120,133,.42); background:rgba(255,120,133,.07); }} .remove-integration summary {{ color:#ffdce0; }} .remove-integration .hint,.remove-integration button {{ margin-left:12px; margin-right:12px; }} .remove-integration button {{ margin-bottom:12px; }}
 .faq {{ scroll-margin-top:24px; }} .faq-items {{ border-top:1px solid var(--line); }} .faq-item {{ display:block; border-bottom:1px solid var(--line); }} .faq-item summary {{ list-style:none; padding-right:38px; position:relative; }} .faq-item summary::-webkit-details-marker {{ display:none; }} .faq-item summary::after {{ content:'+'; position:absolute; right:14px; color:var(--accent); font-size:20px; line-height:1; }} .faq-item[open] summary::after {{ content:'−'; }} .faq-item p {{ color:var(--muted); padding:0 14px 14px; margin:0; }}
 .title-row {{ display:flex; justify-content:space-between; gap:16px; align-items:start; }} .title-row form {{ margin:0; }} .create-form,.edit-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); column-gap:18px; }} .create-form .wide {{ grid-column:1 / -1; }}
 .table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th[data-sort],th[data-group-service] {{ cursor:pointer; user-select:none; }} th[data-sort]:hover,th[data-group-service]:hover,th.grouped {{ color:var(--accent); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .service-group-toggle {{ color:var(--text); background:transparent; padding:0; font-size:16px; }} .service-group-toggle:hover,.service-group-toggle:focus {{ color:var(--accent); }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-row>td {{ padding:0 8px 14px; border-bottom:1px solid var(--line); }} .edit-form {{ margin:0; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
@@ -1402,7 +1430,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 __all__ = [
     "CheapVibeCodeClient", "SecondaryKeyClient", "SERVICE_OPTIONS", "TokenKey", "TokenKeyStore",
     "create_tokens_routes", "default_instruction_choice", "generate_access_code",
-    "instruction_command", "instruction_remove_command", "instruction_steps", "manual_instruction_command", "manual_instruction_note",
+    "instruction_command", "instruction_remove_command", "instruction_steps", "manual_instruction_command", "manual_instruction_note", "manual_download_buttons",
     "normalize_access_code", "trusted_secondary_remaining", "used_tokens_from_remaining",
 ]
 

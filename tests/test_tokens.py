@@ -21,6 +21,7 @@ from src.tokens import (
     instruction_steps,
     manual_instruction_command,
     manual_instruction_note,
+    manual_download_buttons,
     trusted_secondary_remaining,
     utc_now,
 )
@@ -438,6 +439,12 @@ class TokenInstructionHelpersTestCase(unittest.TestCase):
         self.assertIn("~/.grok/config.toml", manual)
         self.assertIn('api_key = "sk-cvc-example"', manual)
         self.assertIn("api_backend = \"chat_completions\"", manual)
+        downloads = manual_download_buttons("VS Code", "sk-cvc-example", "ru")
+        self.assertIn("??????? config.toml", downloads)
+        self.assertIn("download='auth.json'", downloads)
+        self.assertIn("https%3A//starimg.ru/ai/common/v1", downloads)
+        self.assertNotIn("cheapvibecode", downloads.lower())
+        self.assertEqual(manual_download_buttons("Grok Build", "sk-cvc-example"), "")
         self.assertIn("api_backend = chat_completions", manual_instruction_note("Grok Build", "Windows", "ru"))
         self.assertIn("Grok models", manual_instruction_note("Grok Build", "Windows", "en"))
         applications = " ".join(app for _, _, apps in INSTRUCTION_GROUPS for app in apps)
