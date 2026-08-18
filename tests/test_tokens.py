@@ -53,6 +53,7 @@ class FakeKeyClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []
         self.add_token_calls: list[tuple[str, int]] = []
+        self.set_active_calls: list[tuple[str, bool]] = []
         self.add_tokens_error: Exception | None = None
         self.balance_calls: list[str] = []
         self.balance_value: int = 1_234_567
@@ -67,10 +68,15 @@ class FakeKeyClient:
         self.calls.append((name, token_limit))
         return "sk-test-" + str(len(self.calls))
 
-    async def add_tokens(self, *, api_key: str, additional_tokens: int) -> None:
+    async def add_tokens(self, *, api_key: str, additional_tokens: int, active: bool = True) -> None:
         if self.add_tokens_error is not None:
             raise self.add_tokens_error
         self.add_token_calls.append((api_key, additional_tokens))
+
+    async def set_key_active(self, *, api_key: str, active: bool) -> None:
+        if self.add_tokens_error is not None:
+            raise self.add_tokens_error
+        self.set_active_calls.append((api_key, active))
 
     async def get_token_balance(self, *, api_key: str) -> int:
         self.balance_calls.append(api_key)
@@ -177,12 +183,8 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("id='get-bonus'", response.text)
         self.assertIn("Получить бонус", response.text)
         self.assertIn("lucide", response.text)
-        self.assertIn("id='download-logs'", response.text)
-        self.assertIn("Скачать логи", response.text)
-        self.assertIn("/ai/tokens/logs/export", response.text)
-        self.assertIn("sk-cvc-log-export", response.text)
-        self.assertNotIn("'Authorization':'Bearer '+apiKey", response.text)
-        self.assertIn("credentials:'same-origin'", response.text)
+        self.assertNotIn("download-logs", response.text)
+        self.assertNotIn("/ai/tokens/logs/export", response.text)
         self.assertNotIn("cheapvibecode", response.text.lower())
 
     async def test_log_export_uses_server_side_owner_client_and_streams_download(self) -> None:
@@ -508,6 +510,68 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({key.api_key for key in keys}, {"sk-test-1", "sk-test-2"})
         self.assertTrue(all(len(key.access_code) == 20 and key.access_code.isalnum() for key in keys))
         self.assertIn("value='Grok'", response.text)
+
+    async def test_admin_freezes_and_unfreezes_key_with_its_owner_client(self) -> None:
+        await self.store.add_many([
+            TokenKey(1, utc_now(), "ABCDEFGHIJKLMNOPQRST", "sk-cvc-freeze", "Grok", "Frozen", 100)
+        ])
+        login_form, login_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        login = await self.client.post(
+            "/ai/tokens/adm/login",
+            data={**login_form, "password": "secret"},
+            headers=login_headers,
+            follow_redirects=False,
+        )
+        session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        page_form, csrf_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        headers = {"Cookie": csrf_headers["Cookie"] + "; " + session_cookie}
+
+        frozen = await self.client.post(
+            "/ai/tokens/adm/1/freeze",
+            data=page_form,
+            headers=headers,
+        )
+        stored = await self.store.get(1)
+        self.assertEqual(frozen.status_code, 200)
+        self.assertFalse(stored.active if stored else True)
+        self.assertEqual(self.key_client.set_active_calls, [("sk-cvc-freeze", False)])
+        self.assertIn("Разморозить", frozen.text)
+        self.assertIn("freeze-key frozen", frozen.text)
+
+        refreshed_form, refreshed_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        unfrozen = await self.client.post(
+            "/ai/tokens/adm/1/freeze",
+            data=refreshed_form,
+            headers={"Cookie": refreshed_headers["Cookie"] + "; " + session_cookie},
+        )
+        stored = await self.store.get(1)
+        self.assertEqual(unfrozen.status_code, 200)
+        self.assertTrue(stored.active if stored else False)
+        self.assertEqual(self.key_client.set_active_calls, [("sk-cvc-freeze", False), ("sk-cvc-freeze", True)])
+        self.assertIn("Заморозить", unfrozen.text)
+
+    async def test_admin_does_not_change_local_state_when_upstream_freeze_fails(self) -> None:
+        await self.store.add_many([
+            TokenKey(1, utc_now(), "ABCDEFGHIJKLMNOPQRST", "sk-cvc-freeze-error", "Claude", "Freeze", 100)
+        ])
+        self.key_client.add_tokens_error = RuntimeError("upstream down")
+        login_form, login_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        login = await self.client.post(
+            "/ai/tokens/adm/login",
+            data={**login_form, "password": "secret"},
+            headers=login_headers,
+            follow_redirects=False,
+        )
+        page_form, csrf_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        response = await self.client.post(
+            "/ai/tokens/adm/1/freeze",
+            data=page_form,
+            headers={"Cookie": csrf_headers["Cookie"] + "; " + login.headers["set-cookie"].split(";", 1)[0]},
+        )
+        stored = await self.store.get(1)
+        self.assertEqual(response.status_code, 502)
+        self.assertTrue(stored.active if stored else False)
+        self.assertIn("Не удалось заморозить ключ #1.", response.text)
 
     async def test_admin_creates_and_lists_read_only_owner_promo_codes(self) -> None:
         other_store = TokenKeyStore(Path(self.directory.name) / "token_keys_2.json")

@@ -170,6 +170,8 @@ def filter_token_admin_keys(keys: list[TokenKey], search_query: str) -> list[Tok
 
 def token_admin_status_sort_value(key: TokenKey) -> tuple[int, datetime, int]:
     """Stable non-localized ordering for the human-readable status column."""
+    if not key.active:
+        return (-1, key.created_at, key.id)
     if key.is_exhausted:
         return (2, key.exhausted_at or key.activated_at or key.created_at, key.id)
     if key.activated_at:
@@ -226,6 +228,9 @@ class TokenKey:
     used_tokens: int = 0
     activated_at: datetime | None = None
     exhausted_at: datetime | None = None
+    # This mirrors the upstream ``active`` flag.  Older store files did not
+    # have it, so their keys remain active after migration.
+    active: bool = True
 
     @property
     def remaining_tokens(self) -> int:
@@ -250,6 +255,7 @@ class TokenKey:
             used_tokens=max(0, int(data.get("used_tokens") or 0)),
             activated_at=parse_datetime(activated) if activated else None,
             exhausted_at=parse_datetime(exhausted) if exhausted else None,
+            active=bool(data.get("active", True)),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -628,7 +634,9 @@ def trusted_secondary_remaining(
 class SecondaryKeyClient(Protocol):
     async def create_key(self, *, name: str, token_limit: int) -> str: ...
 
-    async def add_tokens(self, *, api_key: str, additional_tokens: int) -> None: ...
+    async def add_tokens(self, *, api_key: str, additional_tokens: int, active: bool = True) -> None: ...
+
+    async def set_key_active(self, *, api_key: str, active: bool) -> None: ...
 
     async def get_token_balance(self, *, api_key: str) -> int: ...
 
@@ -682,7 +690,7 @@ class CheapVibeCodeClient:
             raise RuntimeError("The key service response did not contain an API key.")
         return api_key.strip()
 
-    async def add_tokens(self, *, api_key: str, additional_tokens: int) -> None:
+    async def add_tokens(self, *, api_key: str, additional_tokens: int, active: bool = True) -> None:
         if not self.primary_key:
             raise RuntimeError("CVC_PRIMARY_API_KEY is not configured.")
         if additional_tokens < 1:
@@ -692,7 +700,30 @@ class CheapVibeCodeClient:
                 async with session.post(
                     f"{self.base_url}/v1/keys/edit",
                     headers={"Authorization": f"Bearer {self.primary_key}", "Content-Type": "application/json"},
-                    json={"key": api_key, "additional_tokens": additional_tokens, "active": True},
+                    json={"key": api_key, "additional_tokens": additional_tokens, "active": active},
+                ) as response:
+                    status, raw = response.status, await response.text()
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            raise RuntimeError("Could not connect to the key service.") from exc
+        if status >= 400:
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                detail = raw
+            else:
+                detail = payload.get("detail") if isinstance(payload, dict) else raw
+            raise RuntimeError(f"Key service rejected the request: {detail}")
+
+    async def set_key_active(self, *, api_key: str, active: bool) -> None:
+        """Freeze or unfreeze a secondary key without changing its balance."""
+        if not self.primary_key:
+            raise RuntimeError("CVC_PRIMARY_API_KEY is not configured.")
+        try:
+            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                async with session.post(
+                    f"{self.base_url}/v1/keys/edit",
+                    headers={"Authorization": f"Bearer {self.primary_key}", "Content-Type": "application/json"},
+                    json={"key": api_key, "additional_tokens": 0, "active": active},
                 ) as response:
                     status, raw = response.status, await response.text()
         except (aiohttp.ClientError, TimeoutError) as exc:
@@ -1095,6 +1126,7 @@ def create_tokens_routes(
             await client.add_tokens(
                 api_key=found.key.api_key,
                 additional_tokens=promo.additional_tokens,
+                active=found.key.active,
             )
         except (RuntimeError, ValueError):
             await promo_codes.restore_unclaimed(promo.code, access_code, found.owner_index)
@@ -1303,6 +1335,40 @@ def create_tokens_routes(
             return await admin_response(request, error="Ключ не найден.", status_code=404)
         return await admin_response(request, notice=f"Ключ #{key_id} удален.")
 
+    async def admin_toggle_freeze(request: Request, key_id: int) -> HTMLResponse:
+        """Mirror the upstream active flag before changing the local record."""
+        form = await read_form(request)
+        owner_index = admin_owner(request)
+        owner_store = token_stores.for_owner(owner_index) if owner_index is not None else None
+        if owner_store is None:
+            return await admin_response(request, error="Сессия администратора завершена.", status_code=401)
+        if not valid_csrf(request, form, TOKENS_ADMIN_CSRF_COOKIE):
+            return RedirectResponse(url="/ai/tokens/adm", status_code=303)
+        current = await owner_store.get(key_id)
+        if current is None:
+            return await admin_response(request, error="Ключ не найден.", status_code=404)
+        client = owner_client(owner_index)
+        if client is None:
+            return await admin_response(
+                request,
+                error="Не настроен основной API-ключ администратора.",
+                status_code=503,
+            )
+        target_active = not current.active
+        try:
+            await client.set_key_active(api_key=current.api_key, active=target_active)
+        except (RuntimeError, ValueError):
+            return await admin_response(
+                request,
+                error=f"Не удалось {'разморозить' if target_active else 'заморозить'} ключ #{key_id}.",
+                status_code=502,
+            )
+        await owner_store.update(key_id, replace(current, active=target_active))
+        return await admin_response(
+            request,
+            notice=f"Ключ #{key_id} {'разморожен' if target_active else 'заморожен'}.",
+        )
+
     app.add_api_route("/ai/tokens", page, methods=["GET"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens", activate, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/balance", balance, methods=["GET"], response_model=None)
@@ -1314,6 +1380,7 @@ def create_tokens_routes(
     app.add_api_route("/ai/tokens/adm/create", admin_create, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm/promos/create", admin_create_promos, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm/{key_id}/update", admin_update, methods=["POST"], response_class=HTMLResponse, response_model=None)
+    app.add_api_route("/ai/tokens/adm/{key_id}/freeze", admin_toggle_freeze, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm/{key_id}/delete", admin_delete, methods=["POST"], response_class=HTMLResponse, response_model=None)
 
 
@@ -1379,6 +1446,7 @@ def record_from_admin_form(form: dict[str, str], current: TokenKey, all_keys: li
         used_tokens=used_tokens,
         activated_at=activated_at,
         exhausted_at=exhausted_at,
+        active=current.active,
     )
 
 
@@ -1431,7 +1499,6 @@ def render_key_information(key: TokenKey, *, csrf_token: str, locale: str = "ru"
         <svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' class='lucide lucide-gift h-5 w-5' aria-hidden='true'><rect x='3' y='8' width='18' height='4' rx='1'></rect><path d='M12 8v13'></path><path d='M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7'></path><path d='M7.5 8a2.5 2.5 0 0 1 0-5A4.8 8 0 0 1 12 8a4.8 8 0 0 1 4.5-5 2.5 2.5 0 0 1 0 5'></path></svg>
         <span>{html.escape(text['bonus'])}</span>
       </button>
-      <button class='secondary log-download-button' type='button' id='download-logs' data-api-key='{html.escape(key.api_key, quote=True)}' data-label='{html.escape(text['download_logs'], quote=True)}' data-loading-label='{html.escape(text['logs_downloading'], quote=True)}' data-error-label='{html.escape(text['logs_error'], quote=True)}'>{html.escape(text['download_logs'])}</button>
     </div>
     <section class='bonus-claim' id='bonus-claim' hidden>
       <p>{html.escape(text['bonus_instructions'])}</p>
@@ -1442,7 +1509,7 @@ def render_key_information(key: TokenKey, *, csrf_token: str, locale: str = "ru"
         <input id='promo-code' name='promo_code' autocomplete='off' autocapitalize='characters' required>
         <button class='bonus-button wide' type='submit'>{html.escape(text['claim_bonus'])}</button>
       </form>
-    </section><p class='log-download-status hint' id='log-download-status' role='status' aria-live='polite'></p></section>"""
+    </section></section>"""
 
 
 INSTRUCTION_GROUPS = (
@@ -2172,15 +2239,24 @@ def render_admin_rows(
     })
     for key in keys:
         status = (
-            f"Истрачен ({format_datetime(key.exhausted_at or key.activated_at)})"
-            if key.is_exhausted else
-            (f"Активирован ({format_datetime(key.activated_at)})" if key.activated_at else "Не активирован")
+            "Заморожен"
+            if not key.active else
+            (f"Истрачен ({format_datetime(key.exhausted_at or key.activated_at)})"
+             if key.is_exhausted else
+             (f"Активирован ({format_datetime(key.activated_at)})" if key.activated_at else "Не активирован"))
         )
+        freeze_label = "Заморозить" if key.active else "Разморозить"
+        freeze_title = "Приостановить работу ключа" if key.active else "Возобновить работу ключа"
+        freeze_class = "freeze-key frozen" if not key.active else "freeze-key"
         rows.append(f"""
         <tr data-service='{html.escape(key.service, quote=True)}'><td data-sort-value='{key.id}'>{key.id}</td><td data-sort-value='{key.created_at.timestamp()}'>{format_datetime(key.created_at)}</td><td data-sort-value='{html.escape(key.service, quote=True)}'>{html.escape(key.service)}</td><td data-sort-value='{html.escape(key.access_code, quote=True)}'><code>{html.escape(key.access_code)}</code></td>
         <td data-sort-value='{html.escape(key.api_key, quote=True)}' class='copyable-api-key' data-copy-api-key='{html.escape(key.api_key, quote=True)}' role='button' tabindex='0' title='Нажмите, чтобы скопировать API key' aria-label='Скопировать API key'><code class='api-preview'>{html.escape(key.api_key)}</code></td><td data-sort-value='{key.token_limit}'>{format_tokens(key.token_limit)}</td>
         <td data-sort-value='{key.used_tokens}'>{format_tokens(key.used_tokens)}<br><span class='hint'>ост. {format_tokens(key.remaining_tokens)}</span></td><td data-sort-value='{html.escape(status, quote=True)}'>{status}</td>
         <td data-sort-value='Управление'><div class='management-actions'><button type='button' class='secondary' data-edit='row'>Управлять</button>
+        <form method='post' action='/ai/tokens/adm/{key.id}/freeze?{html.escape(action_query, quote=True)}' class='inline-freeze-form'>
+          <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
+          <button class='{freeze_class}' type='submit' title='{freeze_title}'>{freeze_label}</button>
+        </form>
         <form method='post' action='/ai/tokens/adm/{key.id}/delete?{html.escape(action_query, quote=True)}' class='inline-delete-form'>
           <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
           <button class='danger' type='submit' onclick="return confirm('Удалить ключ #{key.id}?')">Удалить</button>
@@ -2232,7 +2308,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 .instruction-mode-tabs {{ display:flex; gap:6px; margin:16px 0 10px; border-bottom:1px solid var(--line); }} .instruction-mode {{ color:var(--muted); background:transparent; border-radius:8px 8px 0 0; padding:9px 12px; }} .instruction-mode.active {{ color:var(--text); background:#1b2940; box-shadow:inset 0 -2px 0 var(--accent); }} .instruction-mode-panel {{ padding:2px 0 4px; }} .manual-heading {{ color:var(--text); font-weight:700; }} .manual-downloads {{ display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 14px; }} .download-file {{ color:var(--text); background:#1b2940; border:1px solid var(--line); border-radius:8px; padding:8px 11px; font-size:14px; font-weight:700; text-decoration:none; }} .download-file:hover,.download-file:focus {{ border-color:var(--accent); color:var(--accent); }} .manual-note {{ margin:8px 0 14px; color:var(--muted); line-height:1.55; }} .remove-integration {{ margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:10px; background:#0b1321; }} .remove-integration summary,.faq-item summary {{ cursor:pointer; padding:12px 14px; font-weight:700; }} .remove-integration pre {{ margin:0 12px 12px; }} .remove-integration {{ border-color:rgba(255,120,133,.42); background:rgba(255,120,133,.07); }} .remove-integration summary {{ color:#ffdce0; }} .remove-integration .hint,.remove-integration button {{ margin-left:12px; margin-right:12px; }} .remove-integration button {{ margin-bottom:12px; }}
 .faq {{ scroll-margin-top:24px; }} .faq-items {{ border-top:1px solid var(--line); }} .faq-item {{ display:block; border-bottom:1px solid var(--line); }} .faq-item summary {{ list-style:none; padding-right:38px; position:relative; }} .faq-item summary::-webkit-details-marker {{ display:none; }} .faq-item summary::after {{ content:'+'; position:absolute; right:14px; color:var(--accent); font-size:20px; line-height:1; }} .faq-item[open] summary::after {{ content:'−'; }} .faq-item p {{ color:var(--muted); padding:0 14px 14px; margin:0; }}
 .title-row {{ display:flex; justify-content:space-between; gap:16px; align-items:start; }} .title-row form {{ margin:0; }} .create-form,.edit-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); column-gap:18px; }} .create-form .wide {{ grid-column:1 / -1; }}
-.table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} .promos-table {{ min-width:640px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} .sort-link,.service-group-header {{ color:inherit; font:inherit; font-weight:700; text-align:left; text-decoration:none; }} .sort-link:hover,.sort-link:focus,.service-group-header:hover,.service-group-header:focus,th[data-group-service].grouped {{ color:var(--accent); }} th[data-group-service] {{ cursor:pointer; user-select:none; }} .service-group-header {{ padding:0; background:transparent; border-radius:0; }} .keys-search-form {{ margin:14px 0 18px; }} .keys-search-form label {{ margin-top:0; }} .keys-search-controls {{ display:flex; gap:9px; align-items:end; }} .keys-search-controls input {{ margin-top:0; min-width:0; flex:1 1 auto; }} .keys-search-controls .secondary,.reset-search {{ white-space:nowrap; }} .reset-search {{ display:inline-flex; align-items:center; justify-content:center; min-height:46px; text-decoration:none; }} .admin-page.is-updating {{ opacity:.64; pointer-events:none; transition:opacity .12s ease; }} .pagination {{ display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; margin-top:18px; }} .pagination-summary {{ margin:0; color:var(--muted); }} .pagination-links {{ display:flex; flex-wrap:wrap; gap:6px; align-items:center; }} .page-link {{ display:inline-flex; align-items:center; justify-content:center; min-width:38px; min-height:36px; padding:7px 10px; border-radius:8px; color:var(--text); background:#263652; font-weight:700; text-decoration:none; }} .page-link:hover,.page-link:focus {{ color:#08101e; background:var(--accent); }} .page-link.current {{ color:#08101e; background:var(--accent); cursor:default; }} .page-link.disabled {{ color:var(--muted); opacity:.55; cursor:not-allowed; }} .page-ellipsis {{ padding:0 3px; color:var(--muted); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .service-group-toggle {{ color:var(--text); background:transparent; padding:0; font-size:16px; }} .service-group-toggle:hover,.service-group-toggle:focus {{ color:var(--accent); }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-row>td {{ padding:0 8px 14px; border-bottom:1px solid var(--line); }} .edit-form {{ margin:0; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
+.table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form,.inline-freeze-form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .freeze-key {{ margin:0; color:#e3f3ff; background:#375d80; }} .freeze-key:hover,.freeze-key:focus {{ background:#48789f; }} .freeze-key.frozen {{ color:#05233c; background:linear-gradient(135deg,#d9f6ff,#83d5f4); box-shadow:0 0 0 1px rgba(174,235,255,.55),0 0 16px rgba(106,210,247,.35); }} .freeze-key.frozen:hover,.freeze-key.frozen:focus {{ background:linear-gradient(135deg,#e9faff,#a9e5fa); }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} .promos-table {{ min-width:640px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} .sort-link,.service-group-header {{ color:inherit; font:inherit; font-weight:700; text-align:left; text-decoration:none; }} .sort-link:hover,.sort-link:focus,.service-group-header:hover,.service-group-header:focus,th[data-group-service].grouped {{ color:var(--accent); }} th[data-group-service] {{ cursor:pointer; user-select:none; }} .service-group-header {{ padding:0; background:transparent; border-radius:0; }} .keys-search-form {{ margin:14px 0 18px; }} .keys-search-form label {{ margin-top:0; }} .keys-search-controls {{ display:flex; gap:9px; align-items:end; }} .keys-search-controls input {{ margin-top:0; min-width:0; flex:1 1 auto; }} .keys-search-controls .secondary,.reset-search {{ white-space:nowrap; }} .reset-search {{ display:inline-flex; align-items:center; justify-content:center; min-height:46px; text-decoration:none; }} .admin-page.is-updating {{ opacity:.64; pointer-events:none; transition:opacity .12s ease; }} .pagination {{ display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; margin-top:18px; }} .pagination-summary {{ margin:0; color:var(--muted); }} .pagination-links {{ display:flex; flex-wrap:wrap; gap:6px; align-items:center; }} .page-link {{ display:inline-flex; align-items:center; justify-content:center; min-width:38px; min-height:36px; padding:7px 10px; border-radius:8px; color:var(--text); background:#263652; font-weight:700; text-decoration:none; }} .page-link:hover,.page-link:focus {{ color:#08101e; background:var(--accent); }} .page-link.current {{ color:#08101e; background:var(--accent); cursor:default; }} .page-link.disabled {{ color:var(--muted); opacity:.55; cursor:not-allowed; }} .page-ellipsis {{ padding:0 3px; color:var(--muted); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .service-group-toggle {{ color:var(--text); background:transparent; padding:0; font-size:16px; }} .service-group-toggle:hover,.service-group-toggle:focus {{ color:var(--accent); }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-row>td {{ padding:0 8px 14px; border-bottom:1px solid var(--line); }} .edit-form {{ margin:0; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
 @media(max-width:650px) {{ .page,.admin-page {{ width:min(100% - 20px,960px); margin-top:12px; }} .card {{ padding:18px; border-radius:12px; }} h1 {{ font-size:24px; }} .details,.create-form,.edit-grid,.info-actions {{ grid-template-columns:1fr; }} .title-row {{ display:block; }} .title-row form {{ margin-top:12px; }} .keys-search-controls {{ flex-wrap:wrap; }} .keys-search-controls input {{ flex-basis:100%; }} .pagination {{ align-items:start; flex-direction:column; }} }}
 </style></head><body>{content}<script data-tokens-admin-refresh>
 (function() {{
@@ -2263,21 +2339,6 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
   if(balance) fetch('/ai/tokens/balance',{{cache:'no-store'}}).then(function(response) {{ return response.ok ? response.json() : Promise.reject(); }}).then(function(data) {{ if(data.ok) balance.textContent=data.formatted+' '+(balance.dataset.separator||'/')+' '+data.token_limit_formatted; }}).catch(function() {{ /* Keep the locally saved balance visible. */ }});
   var bonusButton=document.getElementById('get-bonus'), bonusClaim=document.getElementById('bonus-claim');
   if(bonusButton&&bonusClaim) bonusButton.addEventListener('click',function() {{ bonusClaim.hidden=!bonusClaim.hidden; if(!bonusClaim.hidden) {{ var promoInput=document.getElementById('promo-code'); if(promoInput) promoInput.focus(); }} }});
-  var downloadLogs=document.getElementById('download-logs'), logDownloadStatus=document.getElementById('log-download-status');
-  if(downloadLogs) downloadLogs.addEventListener('click',async function() {{
-    var label=downloadLogs.dataset.label||downloadLogs.textContent, loadingLabel=downloadLogs.dataset.loadingLabel||label, errorLabel=downloadLogs.dataset.errorLabel||'Download failed.';
-    downloadLogs.disabled=true; downloadLogs.textContent=loadingLabel; if(logDownloadStatus) {{ logDownloadStatus.textContent=''; logDownloadStatus.classList.remove('error'); }}
-    try {{
-      // The upstream portal export is authenticated as the reseller. The
-      // server resolves the user's activated secondary key from its HttpOnly
-      // cookie and forwards the request through Starimg; no upstream name,
-      // session cookie, or primary API key reaches the browser.
-      var response=await fetch('/ai/tokens/logs/export',{{method:'GET',credentials:'same-origin'}});
-      if(!response.ok) throw new Error('logs export failed');
-      var blob=await response.blob(), disposition=response.headers.get('Content-Disposition')||'', match=/filename\\*?=(?:UTF-8''|"?)([^;"\\n]+)/i.exec(disposition), filename=match?decodeURIComponent(match[1]):'logs.json';
-      var objectUrl=URL.createObjectURL(blob), link=document.createElement('a'); link.href=objectUrl; link.download=filename; document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(objectUrl);
-    }} catch(error) {{ if(logDownloadStatus) {{ logDownloadStatus.textContent=errorLabel; logDownloadStatus.classList.add('error'); }} }} finally {{ downloadLogs.disabled=false; downloadLogs.textContent=label; }}
-  }});
   function copyApiKey(cell) {{ var value=cell.dataset.copyApiKey; if(!value) return; navigator.clipboard.writeText(value).then(function() {{ var old=cell.title; cell.title='API key скопирован'; setTimeout(function() {{ cell.title=old; }},1500); }}); }}
   document.querySelectorAll('.copyable-api-key').forEach(function(cell) {{ cell.addEventListener('click',function() {{ copyApiKey(cell); }}); cell.addEventListener('keydown',function(event) {{ if(event.key==='Enter'||event.key===' ') {{ event.preventDefault(); copyApiKey(cell); }} }}); }});
   document.querySelectorAll('.copy-created-codes').forEach(function(container) {{ var button=container.querySelector('.copy-created-codes-button'); if(!button) return; button.addEventListener('click',function() {{ navigator.clipboard.writeText(container.dataset.createdCodes||'').then(function() {{ var old=button.textContent; button.textContent='Скопировано'; setTimeout(function() {{ button.textContent=old; }},1500); }}); }}); }});
@@ -2304,7 +2365,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
   if(adminPage) {{
     adminPage.addEventListener('submit',function(event) {{
       var form=event.target;
-      if(!(form instanceof HTMLFormElement) || !form.matches('.create-form,.keys-search-form')) return;
+      if(!(form instanceof HTMLFormElement) || !form.matches('.create-form,.keys-search-form,.inline-freeze-form')) return;
       event.preventDefault();
       var method=(form.method||'get').toUpperCase(), target=new URL(form.action,window.location.href), data=new FormData(form);
       if(method==='GET') {{ target.search=''; data.forEach(function(value,name) {{ target.searchParams.append(name,String(value)); }}); refreshAdmin(target.toString(),{{historyUrl:target.pathname+target.search}}); return; }}
