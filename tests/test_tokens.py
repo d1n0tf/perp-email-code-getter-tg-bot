@@ -59,6 +59,9 @@ class FakeKeyClient:
         self.primary_balance_value: int = 10_000_000
         self.balance_error: Exception | None = None
         self.primary_balance_error: Exception | None = None
+        self.export_log_calls: list[str] = []
+        self.export_logs_error: Exception | None = None
+        self.exported_log_content: bytes = b'{"entries":[]}'
 
     async def create_key(self, *, name: str, token_limit: int) -> str:
         self.calls.append((name, token_limit))
@@ -79,6 +82,18 @@ class FakeKeyClient:
         if self.primary_balance_error is not None:
             raise self.primary_balance_error
         return self.primary_balance_value
+
+    async def export_logs(self, *, api_key: str):
+        from src.tokens import LogExport
+
+        if self.export_logs_error is not None:
+            raise self.export_logs_error
+        self.export_log_calls.append(api_key)
+        return LogExport(
+            content=self.exported_log_content,
+            content_type="application/json",
+            content_disposition='attachment; filename="key-logs.json"',
+        )
 
 
 class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
@@ -164,11 +179,42 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("lucide", response.text)
         self.assertIn("id='download-logs'", response.text)
         self.assertIn("Скачать логи", response.text)
-        self.assertIn("/ai/common/api/portal/reseller/logs/export", response.text)
+        self.assertIn("/ai/tokens/logs/export", response.text)
         self.assertIn("sk-cvc-log-export", response.text)
-        self.assertIn("'Authorization':'Bearer '+apiKey", response.text)
+        self.assertNotIn("'Authorization':'Bearer '+apiKey", response.text)
         self.assertIn("credentials:'same-origin'", response.text)
-        self.assertNotIn("cheapvibecode.ru/api/portal/reseller/logs/export", response.text)
+        self.assertNotIn("cheapvibecode", response.text.lower())
+
+    async def test_log_export_uses_server_side_owner_client_and_streams_download(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(1, utc_now(), access_code, "sk-cvc-log-download", "Claude", "Logs", 100)
+        ])
+
+        response = await self.client.get(
+            "/ai/tokens/logs/export",
+            headers={"Cookie": f"tokens_access_key={access_code}"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content, b'{"entries":[]}')
+        self.assertEqual(response.headers["content-type"], "application/json")
+        self.assertEqual(response.headers["content-disposition"], 'attachment; filename="key-logs.json"')
+        self.assertEqual(self.key_client.export_log_calls, ["sk-cvc-log-download"])
+
+    async def test_log_export_never_accepts_api_key_from_browser_request(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(1, utc_now(), access_code, "sk-cvc-stored", "Claude", "Logs", 100)
+        ])
+
+        response = await self.client.get(
+            "/ai/tokens/logs/export?api_key=sk-cvc-attacker",
+            headers={"Cookie": f"tokens_access_key={access_code}"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.key_client.export_log_calls, ["sk-cvc-stored"])
 
     async def test_bonus_promo_credits_owner_key_once(self) -> None:
         access_code = "ABCDEFGHIJKLMNOPQRST"

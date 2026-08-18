@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, quote, urlencode
 
 import aiohttp
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from src.time_utils import MOSCOW_TZ, to_moscow, to_utc
 
 TOKENS_ACCESS_COOKIE = "tokens_access_key"
@@ -634,6 +634,17 @@ class SecondaryKeyClient(Protocol):
 
     async def get_primary_token_balance(self) -> int: ...
 
+    async def export_logs(self, *, api_key: str) -> "LogExport": ...
+
+
+@dataclass(frozen=True, slots=True)
+class LogExport:
+    """Downloaded log archive returned by the upstream reseller portal."""
+
+    content: bytes
+    content_type: str = "application/octet-stream"
+    content_disposition: str | None = None
+
 
 class CheapVibeCodeClient:
     def __init__(self, primary_key: str, base_url: str, timeout_seconds: float = 30.0) -> None:
@@ -723,6 +734,41 @@ class CheapVibeCodeClient:
         if not self.primary_key:
             raise RuntimeError("CVC_PRIMARY_API_KEY is not configured.")
         return await self.get_token_balance(api_key=self.primary_key)
+
+    async def export_logs(self, *, api_key: str) -> LogExport:
+        """Export one secondary key's logs with its owner's primary key.
+
+        The reseller portal's browser endpoint is session-protected.  A
+        visitor on starimg.ru has no cookie for the upstream portal, so the
+        browser cannot call it directly.  This server-side call keeps the
+        primary credential private and reaches the configured Starimg proxy.
+        """
+        if not self.primary_key:
+            raise RuntimeError("CVC_PRIMARY_API_KEY is not configured.")
+        try:
+            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                async with session.post(
+                    f"{self.base_url}/api/portal/reseller/logs/export",
+                    headers={
+                        "Accept": "*/*",
+                        "Authorization": f"Bearer {self.primary_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json={"api_key": api_key},
+                ) as response:
+                    status = response.status
+                    content = await response.read()
+                    content_type = response.headers.get("Content-Type", "application/octet-stream")
+                    disposition = response.headers.get("Content-Disposition")
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            raise RuntimeError("Could not connect to the log service.") from exc
+        if status >= 400:
+            raise RuntimeError("The log service rejected the request.")
+        return LogExport(
+            content=content,
+            content_type=content_type,
+            content_disposition=disposition,
+        )
 
 
 async def read_form(request: Request) -> dict[str, str]:
@@ -990,6 +1036,44 @@ def create_tokens_routes(
             headers={"Cache-Control": "no-store"},
         )
 
+    async def export_logs(request: Request) -> Response:
+        """Download logs without exposing an upstream portal credential."""
+        access_code = request.cookies.get(TOKENS_ACCESS_COOKIE, "")
+        found = await token_stores.find_by_code(access_code) if access_code else None
+        if found is None:
+            return JSONResponse(
+                {"ok": False, "error": "access_key_missing"},
+                status_code=401,
+                headers={"Cache-Control": "no-store"},
+            )
+        client = owner_client(found.owner_index)
+        if client is None:
+            return JSONResponse(
+                {"ok": False, "error": "logs_unavailable"},
+                status_code=502,
+                headers={"Cache-Control": "no-store"},
+            )
+        try:
+            exported = await client.export_logs(api_key=found.key.api_key)
+        except RuntimeError:
+            return JSONResponse(
+                {"ok": False, "error": "logs_unavailable"},
+                status_code=502,
+                headers={"Cache-Control": "no-store"},
+            )
+        content_type = exported.content_type if "\r" not in exported.content_type and "\n" not in exported.content_type else "application/octet-stream"
+        disposition = exported.content_disposition or 'attachment; filename="logs.json"'
+        if "\r" in disposition or "\n" in disposition:
+            disposition = 'attachment; filename="logs.json"'
+        return Response(
+            content=exported.content,
+            media_type=content_type,
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Disposition": disposition,
+            },
+        )
+
     async def claim_bonus(request: Request) -> HTMLResponse:
         form = await read_form(request)
         locale = token_locale(form.get("lang"))
@@ -1222,6 +1306,7 @@ def create_tokens_routes(
     app.add_api_route("/ai/tokens", page, methods=["GET"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens", activate, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/balance", balance, methods=["GET"], response_model=None)
+    app.add_api_route("/ai/tokens/logs/export", export_logs, methods=["GET"], response_model=None)
     app.add_api_route("/ai/tokens/bonus", claim_bonus, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm", admin_page, methods=["GET"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm/login", admin_login, methods=["POST"], response_class=HTMLResponse, response_model=None)
@@ -2183,14 +2268,11 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
     var label=downloadLogs.dataset.label||downloadLogs.textContent, loadingLabel=downloadLogs.dataset.loadingLabel||label, errorLabel=downloadLogs.dataset.errorLabel||'Download failed.';
     downloadLogs.disabled=true; downloadLogs.textContent=loadingLabel; if(logDownloadStatus) {{ logDownloadStatus.textContent=''; logDownloadStatus.classList.remove('error'); }}
     try {{
-      var apiKey=downloadLogs.dataset.apiKey||'';
-      if(!apiKey) throw new Error('missing API key');
-      // The browser is on starimg.ru, so it cannot possess the upstream
-      // portal-session cookie from ru.cheapvibecode.ru. Authenticate the
-      // proxy request with the activated secondary key instead; nginx passes
-      // this standard header through to the upstream service.
-      var headers={{'Accept':'*/*','Content-Type':'application/json','Authorization':'Bearer '+apiKey}};
-      var response=await fetch('/ai/common/api/portal/reseller/logs/export',{{method:'POST',headers:headers,body:JSON.stringify({{api_key:apiKey}}),credentials:'same-origin'}});
+      // The upstream portal export is authenticated as the reseller. The
+      // server resolves the user's activated secondary key from its HttpOnly
+      // cookie and forwards the request through Starimg; no upstream name,
+      // session cookie, or primary API key reaches the browser.
+      var response=await fetch('/ai/tokens/logs/export',{{method:'GET',credentials:'same-origin'}});
       if(!response.ok) throw new Error('logs export failed');
       var blob=await response.blob(), disposition=response.headers.get('Content-Disposition')||'', match=/filename\\*?=(?:UTF-8''|"?)([^;"\\n]+)/i.exec(disposition), filename=match?decodeURIComponent(match[1]):'logs.json';
       var objectUrl=URL.createObjectURL(blob), link=document.createElement('a'); link.href=objectUrl; link.download=filename; document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(objectUrl);
