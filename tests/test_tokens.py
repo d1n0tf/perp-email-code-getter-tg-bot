@@ -527,6 +527,11 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIn(".admin-page { width:calc(100% - 48px); max-width:1800px; }", response.text)
+        self.assertIn("data-tokens-admin-refresh", response.text)
+        self.assertIn("fetch(url, Object.assign", response.text)
+        self.assertIn("adminPage.replaceWith(replacement)", response.text)
+        self.assertIn(".create-form,.keys-search-form", response.text)
+        self.assertIn("refreshAdmin(link.href", response.text)
 
     async def test_admin_search_filters_access_code_and_api_key_before_pagination(self) -> None:
         records = [
