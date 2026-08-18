@@ -255,6 +255,29 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 404)
         self.assertIn("\u041a\u043b\u044e\u0447 \u0434\u043e\u0441\u0442\u0443\u043f\u0430 \u043d\u0435 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442", response.text)
 
+    async def test_public_page_with_legacy_store_and_no_admin_client_does_not_crash(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(1, utc_now(), access_code, "sk-cvc-legacy", "Claude", "Legacy", 100)
+        ])
+        app = FastAPI()
+        create_tokens_routes(
+            app,
+            stores=TokenKeyStores([self.store]),
+            # Mirrors a deployment with local keys but no configured owner
+            # primary API client yet.
+            admins=[],
+            owner_key_clients=[],
+        )
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://testserver") as client:
+            page = await client.get("/ai/tokens", headers={"Cookie": f"tokens_access_key={access_code}"})
+            balance = await client.get("/ai/tokens/balance", headers={"Cookie": f"tokens_access_key={access_code}"})
+
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("sk-cvc-legacy", page.text)
+        self.assertEqual(balance.status_code, 502)
+        self.assertEqual(balance.json()["error"], "balance_unavailable")
+
     async def test_public_activation_finds_code_in_another_owner_store(self) -> None:
         other_store = TokenKeyStore(Path(self.directory.name) / "token_keys_2.json")
         other_code = "QRSTUVWXYZABCDEFGHIJ"

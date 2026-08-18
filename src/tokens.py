@@ -830,12 +830,23 @@ def create_tokens_routes(
     def is_admin(request: Request) -> bool:
         return admin_owner(request) is not None
 
-    def owner_client(owner_index: int) -> SecondaryKeyClient:
+    def owner_client(owner_index: int) -> SecondaryKeyClient | None:
+        """Return the owner's upstream client when it is configured.
+
+        The public activation page may still have legacy local key files when
+        no admin/primary-key configuration has been deployed yet.  That must
+        show the saved balance, not crash the whole page with ``IndexError``.
+        """
+        if not 1 <= owner_index <= len(configured_clients):
+            return None
         return configured_clients[owner_index - 1]
 
     async def read_primary_remaining(owner_index: int) -> int | None:
+        client = owner_client(owner_index)
+        if client is None:
+            return None
         try:
-            return await owner_client(owner_index).get_primary_token_balance()
+            return await client.get_primary_token_balance()
         except RuntimeError:
             return None
 
@@ -845,8 +856,11 @@ def create_tokens_routes(
         owner_index: int,
         primary_remaining: int | None = None,
     ) -> TokenKey:
+        client = owner_client(owner_index)
+        if client is None:
+            return key
         try:
-            reported = await owner_client(owner_index).get_token_balance(api_key=key.api_key)
+            reported = await client.get_token_balance(api_key=key.api_key)
         except RuntimeError:
             return key
         remaining = trusted_secondary_remaining(reported, key.token_limit, primary_remaining)
@@ -949,8 +963,11 @@ def create_tokens_routes(
         if found is None:
             return JSONResponse({"ok": False, "error": "access_key_missing"}, status_code=401, headers={"Cache-Control": "no-store"})
         key = found.key
+        client = owner_client(found.owner_index)
+        if client is None:
+            return JSONResponse({"ok": False, "error": "balance_unavailable"}, status_code=502, headers={"Cache-Control": "no-store"})
         try:
-            reported = await owner_client(found.owner_index).get_token_balance(api_key=key.api_key)
+            reported = await client.get_token_balance(api_key=key.api_key)
         except RuntimeError:
             return JSONResponse({"ok": False, "error": "balance_unavailable"}, status_code=502, headers={"Cache-Control": "no-store"})
         remaining = trusted_secondary_remaining(
@@ -988,7 +1005,10 @@ def create_tokens_routes(
         if promo is None:
             return user_response(locale=locale, key=found.key, error=TOKEN_TEXT[locale]["promo_missing"], status_code=404)
         try:
-            await owner_client(found.owner_index).add_tokens(
+            client = owner_client(found.owner_index)
+            if client is None:
+                raise RuntimeError("Primary key client is not configured.")
+            await client.add_tokens(
                 api_key=found.key.api_key,
                 additional_tokens=promo.additional_tokens,
             )
@@ -1087,7 +1107,10 @@ def create_tokens_routes(
             records: list[TokenKey] = []
             try:
                 for index in range(quantity):
-                    api_key = await owner_client(owner_index).create_key(name=name, token_limit=token_limit)
+                    client = owner_client(owner_index)
+                    if client is None:
+                        raise RuntimeError("Не настроен основной API-ключ администратора.")
+                    api_key = await client.create_key(name=name, token_limit=token_limit)
                     access_code = generate_access_code(existing_codes)
                     existing_codes.add(access_code)
                     records.append(TokenKey(
