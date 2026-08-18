@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import html
 import json
+import logging
 import secrets
 import string
 from dataclasses import asdict, dataclass, field, replace
@@ -23,6 +24,7 @@ TOKENS_USER_CSRF_COOKIE = "tokens_user_csrf"
 TOKENS_ADMIN_CSRF_COOKIE = "tokens_admin_csrf"
 TOKEN_CODE_ALPHABET = string.ascii_uppercase + string.digits
 PROMO_CODE_ALPHABET = string.ascii_uppercase + string.digits
+logger = logging.getLogger(__name__)
 TOKEN_ADMIN_PAGE_SIZE = 100
 TOKEN_ADMIN_SORT_KEYS = frozenset({
     "id", "created_at", "access_code", "api_key", "token_limit", "used_tokens", "status",
@@ -45,7 +47,7 @@ TOKEN_TEXT = {
         "script": "Скрипт", "manual_mode": "Вручную", "manual_heading": "Ручная настройка", "remove_integration": "Удалить интеграцию", "remove_integration_hint": "Удаляется только интеграция для выбранного приложения.",
         "grok_open_windows": "Открой PowerShell.", "grok_open_other": "Открой терминал.", "grok_run": "Выполни команду ниже.", "grok_restart": "Перезапусти терминал и введи grok.",
         "required": "Введите ключ доступа.", "missing": "Ключ доступа не существует.", "success": "Ключ успешно активирован. API-ключ готов к использованию.",
-        "balance_unavailable": "Не удалось обновить баланс токенов.",
+        "balance_unavailable": "Не удалось обновить баланс токенов.", "active": "Активен", "frozen": "Заморожен", "freeze": "Заморозить ключ", "unfreeze": "Разморозить ключ", "freeze_success": "Ключ успешно заморожен.", "unfreeze_success": "Ключ успешно разморожен.", "freeze_error": "Не удалось изменить статус ключа. Попробуйте ещё раз.",
     },
     "en": {
         "switch": "Русский", "title": "Activation Service", "intro": "Activate and use token-based API keys for Claude / Codex / Grok / Google and other services.<br>Follow the instructions below.",
@@ -59,7 +61,7 @@ TOKEN_TEXT = {
         "script": "Script", "manual_mode": "Manually", "manual_heading": "Manual setup", "remove_integration": "Remove integration", "remove_integration_hint": "This removes only this integration for the selected application.",
         "grok_open_windows": "Open PowerShell.", "grok_open_other": "Open the terminal.", "grok_run": "Run the command below.", "grok_restart": "Restart the terminal and type grok.",
         "required": "Enter an access key.", "missing": "The access key does not exist.", "success": "The key was activated successfully. The API key is ready to use.",
-        "balance_unavailable": "Could not refresh the token balance.",
+        "balance_unavailable": "Could not refresh the token balance.", "active": "Active", "frozen": "Frozen", "freeze": "Freeze key", "unfreeze": "Unfreeze key", "freeze_success": "The key was frozen successfully.", "unfreeze_success": "The key was unfrozen successfully.", "freeze_error": "Could not change the key status. Please try again.",
     },
 }
 
@@ -654,6 +656,34 @@ class LogExport:
     content_disposition: str | None = None
 
 
+class KeyServiceError(RuntimeError):
+    """An upstream key-service response safe to identify by HTTP status."""
+
+    def __init__(self, status_code: int, detail: str = "") -> None:
+        self.status_code = status_code
+        self.detail = detail[:500]
+        super().__init__(f"Key service rejected the request (HTTP {status_code}): {self.detail}")
+
+
+def log_key_state_failure(*, owner_index: int | None, key_id: int, error: RuntimeError) -> None:
+    """Record actionable upstream diagnostics without logging either API key."""
+    if isinstance(error, KeyServiceError):
+        logger.warning(
+            "Secondary-key state update rejected (owner=%s, key_id=%s, HTTP %s): %s",
+            owner_index,
+            key_id,
+            error.status_code,
+            error.detail,
+        )
+    else:
+        logger.warning(
+            "Secondary-key state update failed (owner=%s, key_id=%s): %s",
+            owner_index,
+            key_id,
+            error,
+        )
+
+
 class CheapVibeCodeClient:
     def __init__(self, primary_key: str, base_url: str, timeout_seconds: float = 30.0) -> None:
         self.primary_key = primary_key.strip()
@@ -715,7 +745,13 @@ class CheapVibeCodeClient:
             raise RuntimeError(f"Key service rejected the request: {detail}")
 
     async def set_key_active(self, *, api_key: str, active: bool) -> None:
-        """Freeze or unfreeze a secondary key without changing its balance."""
+        """Freeze or unfreeze a secondary key without changing its balance.
+
+        ``additional_tokens`` is deliberately omitted here.  It is an
+        additive field on this endpoint, and sending a speculative zero was
+        rejected by the upstream service on production.  The active-state
+        update has its own default token delta and must not alter the balance.
+        """
         if not self.primary_key:
             raise RuntimeError("CVC_PRIMARY_API_KEY is not configured.")
         try:
@@ -723,7 +759,7 @@ class CheapVibeCodeClient:
                 async with session.post(
                     f"{self.base_url}/v1/keys/edit",
                     headers={"Authorization": f"Bearer {self.primary_key}", "Content-Type": "application/json"},
-                    json={"key": api_key, "additional_tokens": 0, "active": active},
+                    json={"key": api_key, "active": active},
                 ) as response:
                     status, raw = response.status, await response.text()
         except (aiohttp.ClientError, TimeoutError) as exc:
@@ -735,7 +771,7 @@ class CheapVibeCodeClient:
                 detail = raw
             else:
                 detail = payload.get("detail") if isinstance(payload, dict) else raw
-            raise RuntimeError(f"Key service rejected the request: {detail}")
+            raise KeyServiceError(status, str(detail))
 
     async def get_token_balance(self, *, api_key: str) -> int:
         try:
@@ -1142,6 +1178,33 @@ def create_tokens_routes(
             ),
         )
 
+    async def toggle_user_key_freeze(request: Request) -> HTMLResponse:
+        """Let the holder of an activated access key freeze only that key."""
+        form = await read_form(request)
+        locale = token_locale(form.get("lang"))
+        if not valid_csrf(request, form, TOKENS_USER_CSRF_COOKIE):
+            return RedirectResponse(url=f"/ai/tokens?lang={locale}", status_code=303)
+        access_code = request.cookies.get(TOKENS_ACCESS_COOKIE, "")
+        found = await token_stores.find_by_code(access_code) if access_code else None
+        if found is None:
+            return user_response(locale=locale, error=TOKEN_TEXT[locale]["missing"], status_code=401)
+        client = owner_client(found.owner_index)
+        if client is None:
+            return user_response(locale=locale, key=found.key, error=TOKEN_TEXT[locale]["freeze_error"], status_code=503)
+        target_active = not found.key.active
+        try:
+            await client.set_key_active(api_key=found.key.api_key, active=target_active)
+        except (RuntimeError, ValueError) as exc:
+            log_key_state_failure(owner_index=found.owner_index, key_id=found.key.id, error=exc)
+            return user_response(locale=locale, key=found.key, error=TOKEN_TEXT[locale]["freeze_error"], status_code=502)
+        updated_key = replace(found.key, active=target_active)
+        await found.store.update(found.key.id, updated_key)
+        return user_response(
+            locale=locale,
+            key=updated_key,
+            notice=TOKEN_TEXT[locale]["unfreeze_success" if target_active else "freeze_success"],
+        )
+
     async def admin_page(request: Request) -> HTMLResponse:
         return await admin_response(request)
 
@@ -1357,7 +1420,8 @@ def create_tokens_routes(
         target_active = not current.active
         try:
             await client.set_key_active(api_key=current.api_key, active=target_active)
-        except (RuntimeError, ValueError):
+        except (RuntimeError, ValueError) as exc:
+            log_key_state_failure(owner_index=owner_index, key_id=key_id, error=exc)
             return await admin_response(
                 request,
                 error=f"Не удалось {'разморозить' if target_active else 'заморозить'} ключ #{key_id}.",
@@ -1374,6 +1438,7 @@ def create_tokens_routes(
     app.add_api_route("/ai/tokens/balance", balance, methods=["GET"], response_model=None)
     app.add_api_route("/ai/tokens/logs/export", export_logs, methods=["GET"], response_model=None)
     app.add_api_route("/ai/tokens/bonus", claim_bonus, methods=["POST"], response_class=HTMLResponse, response_model=None)
+    app.add_api_route("/ai/tokens/freeze", toggle_user_key_freeze, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm", admin_page, methods=["GET"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm/login", admin_login, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm/logout", admin_logout, methods=["POST"], response_class=HTMLResponse, response_model=None)
@@ -1484,7 +1549,9 @@ def render_tokens_page(
 
 def render_key_information(key: TokenKey, *, csrf_token: str, locale: str = "ru") -> str:
     text = TOKEN_TEXT[token_locale(locale)]
-    status = text["exhausted_status"].format(date=format_datetime(key.exhausted_at or key.activated_at)) if key.is_exhausted else (text["activated_status"].format(date=format_datetime(key.activated_at)) if key.activated_at else text["not_activated"])
+    status = text["frozen"] if not key.active else (text["exhausted_status"].format(date=format_datetime(key.exhausted_at or key.activated_at)) if key.is_exhausted else (text["activated_status"].format(date=format_datetime(key.activated_at)) if key.activated_at else text["not_activated"]))
+    freeze_label = text["freeze"] if key.active else text["unfreeze"]
+    freeze_class = "freeze-key frozen" if not key.active else "freeze-key"
     return f"""
     <section class='card info-card'><h2>{html.escape(text['info'])}</h2><dl class='details'>
       <dt>{html.escape(text['service'])}</dt><dd>{html.escape(key.service.upper())}</dd>
@@ -1499,6 +1566,11 @@ def render_key_information(key: TokenKey, *, csrf_token: str, locale: str = "ru"
         <svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' class='lucide lucide-gift h-5 w-5' aria-hidden='true'><rect x='3' y='8' width='18' height='4' rx='1'></rect><path d='M12 8v13'></path><path d='M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7'></path><path d='M7.5 8a2.5 2.5 0 0 1 0-5A4.8 8 0 0 1 12 8a4.8 8 0 0 1 4.5-5 2.5 2.5 0 0 1 0 5'></path></svg>
         <span>{html.escape(text['bonus'])}</span>
       </button>
+      <form method='post' action='/ai/tokens/freeze' class='user-freeze-form'>
+        <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
+        <input type='hidden' name='lang' value='{locale}'>
+        <button class='{freeze_class}' type='submit'>{html.escape(freeze_label)}</button>
+      </form>
     </div>
     <section class='bonus-claim' id='bonus-claim' hidden>
       <p>{html.escape(text['bonus_instructions'])}</p>
@@ -2303,7 +2375,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 .hint {{ color:var(--muted); font-size:14px; }} .warning {{ color:var(--warn); font-weight:700; }} .flash {{ border-radius:9px; padding:11px 13px; margin:12px 0; }} .error {{ color:#ffdce0; background:rgba(255,120,133,.18); border:1px solid rgba(255,120,133,.45); }} .success {{ color:#d8ffec; background:rgba(95,213,160,.15); border:1px solid rgba(95,213,160,.45); }}
 .top-links {{ display:flex; justify-content:space-between; gap:8px; margin:0 0 -4px; }} .top-links a {{ color:var(--text); font-weight:700; text-decoration:none; padding:7px 10px; border:1px solid var(--line); border-radius:7px; }} .top-links a:hover {{ border-color:var(--accent); color:var(--accent); }}
 .details {{ display:grid; grid-template-columns:minmax(210px,auto) 1fr; gap:8px 18px; margin:0; }} .details dt {{ color:var(--muted); }} .details dd {{ margin:0; min-width:0; overflow-wrap:anywhere; }} code,pre {{ font-family:Consolas,'Courier New',monospace; }} .api-key {{ color:#b9d4ff; }}
-.info-actions {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:22px; }} .info-actions button {{ display:inline-flex; justify-content:center; align-items:center; gap:9px; min-height:46px; }} .bonus-button {{ color:#281500; background:linear-gradient(135deg,#ffd46b,#f59e0b); }} .bonus-button:hover,.bonus-button:focus {{ background:linear-gradient(135deg,#ffe191,#fbbf24); }} .bonus-button svg {{ width:20px; height:20px; flex:0 0 auto; }} .bonus-claim {{ margin-top:14px; padding:16px; border:1px solid rgba(245,158,11,.45); border-radius:11px; background:rgba(245,158,11,.09); }} .bonus-claim p {{ margin:0 0 12px; color:#ffe2a2; }} .bonus-claim label {{ margin-top:0; }} .log-download-status {{ min-height:22px; margin:8px 0 0; }} .log-download-status.error {{ color:#ffdce0; }}
+.info-actions {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:22px; }} .info-actions button,.user-freeze-form {{ width:100%; }} .info-actions button {{ display:inline-flex; justify-content:center; align-items:center; gap:9px; min-height:46px; }} .info-actions .bonus-button {{ font-size:16px; }} .bonus-button {{ color:#281500; background:linear-gradient(135deg,#ffd46b,#f59e0b); }} .bonus-button:hover,.bonus-button:focus {{ background:linear-gradient(135deg,#ffe191,#fbbf24); }} .bonus-button svg {{ width:20px; height:20px; flex:0 0 auto; }} .bonus-claim {{ margin-top:14px; padding:16px; border:1px solid rgba(245,158,11,.45); border-radius:11px; background:rgba(245,158,11,.09); }} .bonus-claim p {{ margin:0 0 12px; color:#ffe2a2; }} .bonus-claim label {{ margin-top:0; }} .log-download-status {{ min-height:22px; margin:8px 0 0; }} .log-download-status.error {{ color:#ffdce0; }}
 .choice-row {{ display:flex; flex-wrap:wrap; gap:8px; margin:14px 0; }} .instruction-apps .choice[hidden] {{ display:none; }} .instruction-card {{ margin-top:18px; }} .choice {{ color:var(--text); background:#1b2940; border:1px solid var(--line); }} .choice.active {{ color:#08101e; background:var(--accent); border-color:var(--accent); }} .selected-line {{ padding:12px; margin:16px 0; border-left:3px solid var(--accent); background:#0b1321; }} ol {{ padding-left:24px; }} pre {{ max-width:100%; overflow:auto; padding:14px; white-space:pre-wrap; overflow-wrap:anywhere; background:#080e18; border:1px solid var(--line); border-radius:9px; color:#d9e7ff; }}
 .instruction-mode-tabs {{ display:flex; gap:6px; margin:16px 0 10px; border-bottom:1px solid var(--line); }} .instruction-mode {{ color:var(--muted); background:transparent; border-radius:8px 8px 0 0; padding:9px 12px; }} .instruction-mode.active {{ color:var(--text); background:#1b2940; box-shadow:inset 0 -2px 0 var(--accent); }} .instruction-mode-panel {{ padding:2px 0 4px; }} .manual-heading {{ color:var(--text); font-weight:700; }} .manual-downloads {{ display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 14px; }} .download-file {{ color:var(--text); background:#1b2940; border:1px solid var(--line); border-radius:8px; padding:8px 11px; font-size:14px; font-weight:700; text-decoration:none; }} .download-file:hover,.download-file:focus {{ border-color:var(--accent); color:var(--accent); }} .manual-note {{ margin:8px 0 14px; color:var(--muted); line-height:1.55; }} .remove-integration {{ margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:10px; background:#0b1321; }} .remove-integration summary,.faq-item summary {{ cursor:pointer; padding:12px 14px; font-weight:700; }} .remove-integration pre {{ margin:0 12px 12px; }} .remove-integration {{ border-color:rgba(255,120,133,.42); background:rgba(255,120,133,.07); }} .remove-integration summary {{ color:#ffdce0; }} .remove-integration .hint,.remove-integration button {{ margin-left:12px; margin-right:12px; }} .remove-integration button {{ margin-bottom:12px; }}
 .faq {{ scroll-margin-top:24px; }} .faq-items {{ border-top:1px solid var(--line); }} .faq-item {{ display:block; border-bottom:1px solid var(--line); }} .faq-item summary {{ list-style:none; padding-right:38px; position:relative; }} .faq-item summary::-webkit-details-marker {{ display:none; }} .faq-item summary::after {{ content:'+'; position:absolute; right:14px; color:var(--accent); font-size:20px; line-height:1; }} .faq-item[open] summary::after {{ content:'−'; }} .faq-item p {{ color:var(--muted); padding:0 14px 14px; margin:0; }}

@@ -7,6 +7,7 @@ import httpx
 from fastapi import FastAPI
 
 from src.tokens import (
+    CheapVibeCodeClient,
     INSTRUCTION_ENDPOINTS,
     INSTRUCTION_GROUPS,
     INSTRUCTION_REMOVE_ENDPOINTS,
@@ -267,6 +268,59 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("id='bonus-claim' hidden", response.text)
         self.assertIn("/ai/tokens/bonus", response.text)
         self.assertIn("Чтобы получить бонусные токены", response.text)
+
+    async def test_key_holder_can_freeze_and_unfreeze_own_key(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(1, utc_now(), access_code, "sk-cvc-user-freeze", "Grok", "Grok key", 100, activated_at=utc_now())
+        ])
+        form, headers = await self.csrf("/ai/tokens", "tokens_user_csrf")
+        headers["Cookie"] += f"; tokens_access_key={access_code}"
+
+        frozen = await self.client.post(
+            "/ai/tokens/freeze",
+            data={**form, "lang": "ru"},
+            headers=headers,
+        )
+        stored = await self.store.get_by_code(access_code)
+        self.assertEqual(frozen.status_code, 200)
+        self.assertFalse(stored.active if stored else True)
+        self.assertEqual(self.key_client.set_active_calls, [("sk-cvc-user-freeze", False)])
+        self.assertIn("Ключ успешно заморожен.", frozen.text)
+        self.assertIn("Разморозить ключ", frozen.text)
+        self.assertIn("freeze-key frozen", frozen.text)
+
+        fresh_form, fresh_headers = await self.csrf("/ai/tokens", "tokens_user_csrf")
+        fresh_headers["Cookie"] += f"; tokens_access_key={access_code}"
+        unfrozen = await self.client.post(
+            "/ai/tokens/freeze",
+            data={**fresh_form, "lang": "ru"},
+            headers=fresh_headers,
+        )
+        stored = await self.store.get_by_code(access_code)
+        self.assertEqual(unfrozen.status_code, 200)
+        self.assertTrue(stored.active if stored else False)
+        self.assertEqual(self.key_client.set_active_calls, [("sk-cvc-user-freeze", False), ("sk-cvc-user-freeze", True)])
+        self.assertIn("Ключ успешно разморожен.", unfrozen.text)
+        self.assertIn("Заморозить ключ", unfrozen.text)
+
+    async def test_user_freeze_failure_preserves_local_key_state(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(1, utc_now(), access_code, "sk-cvc-user-freeze-error", "Claude", "Key", 100)
+        ])
+        self.key_client.add_tokens_error = RuntimeError("upstream down")
+        form, headers = await self.csrf("/ai/tokens", "tokens_user_csrf")
+        headers["Cookie"] += f"; tokens_access_key={access_code}"
+        response = await self.client.post(
+            "/ai/tokens/freeze",
+            data={**form, "lang": "ru"},
+            headers=headers,
+        )
+        stored = await self.store.get_by_code(access_code)
+        self.assertEqual(response.status_code, 502)
+        self.assertTrue(stored.active if stored else False)
+        self.assertIn("Не удалось изменить статус ключа", response.text)
 
     async def test_failed_bonus_credit_leaves_promo_available_for_retry(self) -> None:
         access_code = "ABCDEFGHIJKLMNOPQRST"
@@ -572,6 +626,44 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 502)
         self.assertTrue(stored.active if stored else False)
         self.assertIn("Не удалось заморозить ключ #1.", response.text)
+
+    async def test_key_state_request_does_not_send_a_token_delta(self) -> None:
+        client = CheapVibeCodeClient("primary", "https://example.test")
+        captured: dict[str, object] = {}
+
+        class Response:
+            status = 200
+
+            async def text(self) -> str:
+                return "{}"
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args) -> None:
+                return None
+
+        class Session:
+            def __init__(self, **kwargs) -> None:
+                pass
+
+            def post(self, url: str, **kwargs):
+                captured["url"] = url
+                captured.update(kwargs)
+                return Response()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args) -> None:
+                return None
+
+        from unittest.mock import patch
+        with patch("src.tokens.aiohttp.ClientSession", Session):
+            await client.set_key_active(api_key="sk-cvc-example", active=False)
+
+        self.assertEqual(captured["url"], "https://example.test/v1/keys/edit")
+        self.assertEqual(captured["json"], {"key": "sk-cvc-example", "active": False})
 
     async def test_admin_creates_and_lists_read_only_owner_promo_codes(self) -> None:
         other_store = TokenKeyStore(Path(self.directory.name) / "token_keys_2.json")
