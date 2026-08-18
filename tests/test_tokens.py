@@ -11,10 +11,13 @@ from src.tokens import (
     INSTRUCTION_GROUPS,
     INSTRUCTION_REMOVE_ENDPOINTS,
     INSTRUCTION_SYSTEMS_BY_APP,
+    PromoCode,
+    PromoCodeStore,
     SERVICE_OPTIONS,
     TokenKey,
     TokenKeyStore,
     TokenKeyStores,
+    TokenAdmin,
     create_token_key_stores,
     create_tokens_routes,
     default_instruction_choice,
@@ -24,6 +27,11 @@ from src.tokens import (
     manual_instruction_command,
     manual_instruction_note,
     manual_download_buttons,
+    filter_token_admin_keys,
+    paginate_token_admin_keys,
+    sort_token_admin_keys,
+    token_admin_page_state,
+    TokenAdminPageState,
     trusted_secondary_remaining,
     utc_now,
 )
@@ -44,6 +52,8 @@ class HiddenInputParser(HTMLParser):
 class FakeKeyClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []
+        self.add_token_calls: list[tuple[str, int]] = []
+        self.add_tokens_error: Exception | None = None
         self.balance_calls: list[str] = []
         self.balance_value: int = 1_234_567
         self.primary_balance_value: int = 10_000_000
@@ -53,6 +63,11 @@ class FakeKeyClient:
     async def create_key(self, *, name: str, token_limit: int) -> str:
         self.calls.append((name, token_limit))
         return "sk-test-" + str(len(self.calls))
+
+    async def add_tokens(self, *, api_key: str, additional_tokens: int) -> None:
+        if self.add_tokens_error is not None:
+            raise self.add_tokens_error
+        self.add_token_calls.append((api_key, additional_tokens))
 
     async def get_token_balance(self, *, api_key: str) -> int:
         self.balance_calls.append(api_key)
@@ -70,11 +85,13 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.store = TokenKeyStore(Path(self.directory.name) / "token_keys.json")
+        self.promo_store = PromoCodeStore(Path(self.directory.name) / "promo_codes.json")
         self.key_client = FakeKeyClient()
         self.app = FastAPI()
         create_tokens_routes(
             self.app,
             store=self.store,
+            promo_store=self.promo_store,
             key_client=self.key_client,
             admin_password="secret",
         )
@@ -121,6 +138,115 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(activated)
         self.assertIsNotNone(activated.activated_at if activated else None)
 
+    async def test_information_block_has_bonus_placeholder_and_proxy_log_download(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(
+                id=1,
+                created_at=utc_now(),
+                access_code=access_code,
+                api_key="sk-cvc-log-export",
+                service="Claude",
+                name="Claude integration",
+                token_limit=2_000_000,
+                activated_at=utc_now(),
+            )
+        ])
+
+        response = await self.client.get(
+            "/ai/tokens",
+            headers={"Cookie": f"tokens_access_key={access_code}"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("id='get-bonus'", response.text)
+        self.assertIn("Получить бонус", response.text)
+        self.assertIn("lucide", response.text)
+        self.assertIn("id='download-logs'", response.text)
+        self.assertIn("Скачать логи", response.text)
+        self.assertIn("/ai/common/api/portal/reseller/logs/export", response.text)
+        self.assertIn("sk-cvc-log-export", response.text)
+        self.assertNotIn("cheapvibecode.ru/api/portal/reseller/logs/export", response.text)
+
+    async def test_bonus_promo_credits_owner_key_once(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(
+                id=1,
+                created_at=utc_now(),
+                access_code=access_code,
+                api_key="sk-cvc-bonus",
+                service="Grok",
+                name="Grok integration",
+                token_limit=2_000_000,
+                activated_at=utc_now(),
+            )
+        ])
+        await self.promo_store.add(PromoCode("BONUS2026", 250_000))
+        form, headers = await self.csrf("/ai/tokens", "tokens_user_csrf")
+        headers["Cookie"] += f"; tokens_access_key={access_code}"
+
+        claimed = await self.client.post(
+            "/ai/tokens/bonus",
+            data={**form, "lang": "ru", "promo_code": "bonus2026"},
+            headers=headers,
+        )
+        repeated = await self.client.post(
+            "/ai/tokens/bonus",
+            data={**form, "lang": "ru", "promo_code": "BONUS2026"},
+            headers=headers,
+        )
+
+        self.assertEqual(claimed.status_code, 200)
+        self.assertIn("Промокод #BONUS2026 был активирован и вам начислено 250 000 токенов.", claimed.text)
+        self.assertEqual(self.key_client.add_token_calls, [("sk-cvc-bonus", 250_000)])
+        updated = await self.store.get_by_code(access_code)
+        self.assertEqual(updated.token_limit if updated else None, 2_250_000)
+        self.assertEqual(repeated.status_code, 404)
+        self.assertIn("Промокод не существует или уже был использован ранее.", repeated.text)
+
+    async def test_bonus_panel_is_hidden_until_requested(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(1, utc_now(), access_code, "sk-cvc-bonus", "Claude", "Claude integration", 100, activated_at=utc_now())
+        ])
+
+        response = await self.client.get("/ai/tokens", headers={"Cookie": f"tokens_access_key={access_code}"})
+
+        self.assertIn("id='get-bonus'", response.text)
+        self.assertIn("id='bonus-claim' hidden", response.text)
+        self.assertIn("/ai/tokens/bonus", response.text)
+        self.assertIn("Чтобы получить бонусные токены", response.text)
+
+    async def test_failed_bonus_credit_leaves_promo_available_for_retry(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(1, utc_now(), access_code, "sk-cvc-bonus", "Claude", "Claude integration", 100, activated_at=utc_now())
+        ])
+        await self.promo_store.add(PromoCode("RETRY2026", 50))
+        self.key_client.add_tokens_error = RuntimeError("upstream down")
+        form, headers = await self.csrf("/ai/tokens", "tokens_user_csrf")
+        headers["Cookie"] += f"; tokens_access_key={access_code}"
+
+        failed = await self.client.post(
+            "/ai/tokens/bonus",
+            data={**form, "lang": "ru", "promo_code": "RETRY2026"},
+            headers=headers,
+        )
+        self.key_client.add_tokens_error = None
+        refreshed_form, refreshed_headers = await self.csrf("/ai/tokens", "tokens_user_csrf")
+        refreshed_headers["Cookie"] += f"; tokens_access_key={access_code}"
+        retried = await self.client.post(
+            "/ai/tokens/bonus",
+            data={**refreshed_form, "lang": "ru", "promo_code": "RETRY2026"},
+            headers=refreshed_headers,
+        )
+
+        self.assertEqual(failed.status_code, 502)
+        self.assertIn("Не удалось начислить бонус", failed.text)
+        self.assertEqual(retried.status_code, 200)
+        self.assertEqual(self.key_client.add_token_calls, [("sk-cvc-bonus", 50)])
+
     async def test_unknown_access_key_is_reported(self) -> None:
         form, headers = await self.csrf("/ai/tokens", "tokens_user_csrf")
         response = await self.client.post(
@@ -147,8 +273,11 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         create_tokens_routes(
             app,
             stores=TokenKeyStores([self.store, other_store]),
-            key_client=self.key_client,
-            admin_passwords=["first", "second"],
+            admins=[
+                TokenAdmin("first", "pk-first"),
+                TokenAdmin("second", "pk-second"),
+            ],
+            owner_key_clients=[self.key_client, self.key_client],
         )
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://testserver") as client:
             page = await client.get("/ai/tokens")
@@ -179,8 +308,11 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         create_tokens_routes(
             app,
             stores=TokenKeyStores([self.store, other_store]),
-            key_client=self.key_client,
-            admin_passwords=["first", "second"],
+            admins=[
+                TokenAdmin("first", "pk-first"),
+                TokenAdmin("second", "pk-second"),
+            ],
+            owner_key_clients=[self.key_client, self.key_client],
         )
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://testserver") as client:
             login_page = await client.get("/ai/tokens/adm")
@@ -196,6 +328,48 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("sk-second", page.text)
         self.assertNotIn("sk-first", page.text)
+
+    async def test_admin_creates_key_with_its_own_primary_client(self) -> None:
+        second_client = FakeKeyClient()
+        app = FastAPI()
+        create_tokens_routes(
+            app,
+            stores=TokenKeyStores([self.store, TokenKeyStore(Path(self.directory.name) / "token_keys_2.json")]),
+            admins=[
+                TokenAdmin("first", "pk-first"),
+                TokenAdmin("second", "pk-second"),
+            ],
+            owner_key_clients=[self.key_client, second_client],
+        )
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://testserver") as client:
+            login_page = await client.get("/ai/tokens/adm")
+            parser = HiddenInputParser()
+            parser.feed(login_page.text)
+            login = await client.post(
+                "/ai/tokens/adm/login",
+                data={"csrf_token": parser.values["csrf_token"], "password": "second"},
+                headers={"Cookie": f"tokens_admin_csrf={parser.values['csrf_token']}"},
+                follow_redirects=False,
+            )
+            session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+            create_page = await client.get("/ai/tokens/adm", headers={"Cookie": session_cookie})
+            parser = HiddenInputParser()
+            parser.feed(create_page.text)
+            response = await client.post(
+                "/ai/tokens/adm/create",
+                data={
+                    "csrf_token": parser.values["csrf_token"],
+                    "service": "Grok",
+                    "name": "Second owner's key",
+                    "token_limit": "100",
+                    "quantity": "1",
+                },
+                headers={"Cookie": f"tokens_admin_csrf={parser.values['csrf_token']}; {session_cookie}"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.key_client.calls, [])
+        self.assertEqual(second_client.calls, [("Second owner's key", 100)])
 
     async def test_public_page_supports_english_locale(self) -> None:
         response = await self.client.get("/ai/tokens?lang=en")
@@ -263,6 +437,164 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({key.api_key for key in keys}, {"sk-test-1", "sk-test-2"})
         self.assertTrue(all(len(key.access_code) == 20 and key.access_code.isalnum() for key in keys))
         self.assertIn("value='Grok'", response.text)
+
+    async def test_admin_creates_and_lists_read_only_owner_promo_codes(self) -> None:
+        other_store = TokenKeyStore(Path(self.directory.name) / "token_keys_2.json")
+        app = FastAPI()
+        create_tokens_routes(
+            app,
+            stores=TokenKeyStores([self.store, other_store]),
+            promo_store=self.promo_store,
+            admins=[
+                TokenAdmin("first", "pk-first"),
+                TokenAdmin("second", "pk-second"),
+            ],
+            owner_key_clients=[self.key_client, FakeKeyClient()],
+        )
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://testserver") as client:
+            login_page = await client.get("/ai/tokens/adm")
+            parser = HiddenInputParser()
+            parser.feed(login_page.text)
+            login = await client.post(
+                "/ai/tokens/adm/login",
+                data={"csrf_token": parser.values["csrf_token"], "password": "second"},
+                headers={"Cookie": f"tokens_admin_csrf={parser.values['csrf_token']}"},
+                follow_redirects=False,
+            )
+            session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+            admin_page = await client.get("/ai/tokens/adm", headers={"Cookie": session_cookie})
+            parser = HiddenInputParser()
+            parser.feed(admin_page.text)
+            response = await client.post(
+                "/ai/tokens/adm/promos/create",
+                data={
+                    "csrf_token": parser.values["csrf_token"],
+                    "additional_tokens": "250000",
+                    "quantity": "2",
+                },
+                headers={"Cookie": f"tokens_admin_csrf={parser.values['csrf_token']}; {session_cookie}"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("СОЗДАНИЯ ПРОМОКОДОВ", response.text)
+        self.assertIn("УПРАВЛЕНИЕ ПРОМОКОДАМИ", response.text)
+        self.assertIn("Создано промокодов: 2.", response.text)
+        self.assertIn("Скопировать все", response.text)
+        self.assertNotIn("Управлять промокод", response.text)
+        promos = await self.promo_store.list_for_owner(2)
+        self.assertEqual(len(promos), 2)
+        self.assertTrue(all(promo.additional_tokens == 250_000 for promo in promos))
+        self.assertTrue(all(len(promo.code) == 20 and promo.code.isalnum() for promo in promos))
+        self.assertEqual(await self.promo_store.list_for_owner(1), [])
+
+    async def test_authenticated_admin_page_uses_wide_desktop_layout(self) -> None:
+        login_form, login_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        login = await self.client.post(
+            "/ai/tokens/adm/login",
+            data={**login_form, "password": "secret"},
+            headers=login_headers,
+            follow_redirects=False,
+        )
+        response = await self.client.get(
+            "/ai/tokens/adm",
+            headers={"Cookie": login.headers["set-cookie"].split(";", 1)[0]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(".admin-page { width:calc(100% - 48px); max-width:1800px; }", response.text)
+
+    async def test_admin_search_filters_access_code_and_api_key_before_pagination(self) -> None:
+        records = [
+            TokenKey(
+                id=index,
+                created_at=utc_now(),
+                access_code=f"ACCESS{index:014d}",
+                api_key=f"sk-cvc-api-{index:03d}",
+                service="Claude",
+                name=f"Key {index}",
+                token_limit=100,
+            )
+            for index in range(1, 152)
+        ]
+        await self.store.add_many(records)
+        login_form, login_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        login = await self.client.post(
+            "/ai/tokens/adm/login",
+            data={**login_form, "password": "secret"},
+            headers=login_headers,
+            follow_redirects=False,
+        )
+        session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+
+        access_response = await self.client.get(
+            "/ai/tokens/adm?search=ACCESS000000000001&sort=id&order=asc",
+            headers={"Cookie": session_cookie},
+        )
+        api_response = await self.client.get(
+            "/ai/tokens/adm?search=API-151&sort=id&order=asc",
+            headers={"Cookie": session_cookie},
+        )
+
+        self.assertEqual(access_response.status_code, 200)
+        self.assertIn("ACCESS000000000001", access_response.text)
+        self.assertNotIn("ACCESS000000000002", access_response.text)
+        self.assertEqual(api_response.status_code, 200)
+        self.assertIn("ACCESS00000000000151", api_response.text)
+        self.assertNotIn("ACCESS00000000000150", api_response.text)
+
+    async def test_admin_sorts_all_keys_before_selecting_page(self) -> None:
+        records = [
+            TokenKey(
+                id=index,
+                created_at=utc_now(),
+                access_code=f"CODE{index:016d}",
+                api_key=f"sk-cvc-{index:03d}",
+                service="Claude",
+                name=f"Key {index}",
+                token_limit=100,
+            )
+            for index in range(1, 102)
+        ]
+        await self.store.add_many(records)
+        login_form, login_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        login = await self.client.post(
+            "/ai/tokens/adm/login",
+            data={**login_form, "password": "secret"},
+            headers=login_headers,
+            follow_redirects=False,
+        )
+        session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        page = await self.client.get(
+            "/ai/tokens/adm?page=2&sort=id&order=asc",
+            headers={"Cookie": session_cookie},
+        )
+
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("CODE0000000000000101", page.text)
+        self.assertNotIn("CODE0000000000000100", page.text)
+        self.assertIn("Показаны 101–101 из 101 ключей", page.text)
+
+    async def test_admin_page_clamps_out_of_range_page_and_preserves_controls(self) -> None:
+        await self.store.add_many([
+            TokenKey(1, utc_now(), "ABCDEFGHIJKLMNOPQRST", "sk-cvc-target", "Grok", "Target", 100)
+        ])
+        login_form, login_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        login = await self.client.post(
+            "/ai/tokens/adm/login",
+            data={**login_form, "password": "secret"},
+            headers=login_headers,
+            follow_redirects=False,
+        )
+        response = await self.client.get(
+            "/ai/tokens/adm?page=999&search=target&sort=api_key&order=asc",
+            headers={"Cookie": login.headers["set-cookie"].split(";", 1)[0]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("name='search' value='target'", response.text)
+        self.assertIn("name='sort' value='api_key'", response.text)
+        self.assertIn("name='order' value='asc'", response.text)
+        self.assertIn("/ai/tokens/adm?page=1&amp;sort=api_key&amp;order=desc&amp;search=target", response.text)
 
     async def test_page_refreshes_remaining_tokens_from_balance_api(self) -> None:
         access_code = "ABCDEFGHIJKLMNOPQRST"

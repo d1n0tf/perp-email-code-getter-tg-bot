@@ -40,11 +40,12 @@ class Settings(BaseSettings):
     grok_activation_api_url: str = "https://bypriceactivate.pro"
     grok_activation_timeout_seconds: float = 30.0
     token_key_store_path: Path = Path("token_keys.json")
+    promo_code_store_path: Path = Path("promo_codes.json")
     cvc_primary_api_key: str | None = None
-    cvc_api_base_url: str = "https://cheapvibecode.ru"
+    cvc_api_base_url: str = "https://starimg.ru/ai/common"
     cvc_api_timeout_seconds: float = 30.0
     tokens_admin_password: str | None = None
-    tokens_admin_passwords: list[str] = []
+    tokens_admins: list[dict[str, str]] = []
 
     @field_validator("tg_admins", mode="before")
     @classmethod
@@ -76,25 +77,25 @@ class Settings(BaseSettings):
             return [str(item) for item in value]
         raise TypeError("mail_folders must be a list of strings or a comma-separated string")
 
-    @field_validator("tokens_admin_passwords", mode="before")
+    @field_validator("tokens_admins", mode="before")
     @classmethod
-    def parse_tokens_admin_passwords(cls, value: Any) -> list[str]:
-        """Accept a JSON list or a comma-separated list of admin passwords."""
+    def parse_tokens_admins(cls, value: Any) -> list[dict[str, str]]:
+        """Read per-owner passwords and primary API keys from a JSON list."""
         if value in (None, "", []):
             return []
-        if isinstance(value, str):
-            stripped = value.strip()
-            if not stripped:
-                return []
-            if stripped.startswith("["):
-                parsed = json.loads(stripped)
-                if not isinstance(parsed, list):
-                    raise TypeError("tokens_admin_passwords must be a list")
-                return [str(item) for item in parsed if str(item)]
-            return [item.strip() for item in stripped.split(",") if item.strip()]
-        if isinstance(value, (list, tuple, set)):
-            return [str(item) for item in value if str(item)]
-        raise TypeError("tokens_admin_passwords must be a list or a comma-separated string")
+        parsed = json.loads(value) if isinstance(value, str) else value
+        if not isinstance(parsed, list):
+            raise TypeError("tokens_admins must be a JSON list")
+        admins: list[dict[str, str]] = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                raise TypeError("every tokens_admins item must be an object")
+            password = str(item.get("password") or "").strip()
+            primary_api_key = str(item.get("primary_api_key") or "").strip()
+            if not password or not primary_api_key:
+                raise ValueError("every tokens admin needs password and primary_api_key")
+            admins.append({"password": password, "primary_api_key": primary_api_key})
+        return admins
 
 
 settings = Settings()  # type: ignore[call-arg]

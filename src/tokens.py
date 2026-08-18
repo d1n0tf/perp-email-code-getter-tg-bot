@@ -6,11 +6,11 @@ import html
 import json
 import secrets
 import string
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
-from urllib.parse import parse_qs, quote
+from urllib.parse import parse_qs, quote, urlencode
 
 import aiohttp
 from fastapi import FastAPI, Request
@@ -22,6 +22,11 @@ TOKENS_ADMIN_COOKIE = "tokens_admin_session"
 TOKENS_USER_CSRF_COOKIE = "tokens_user_csrf"
 TOKENS_ADMIN_CSRF_COOKIE = "tokens_admin_csrf"
 TOKEN_CODE_ALPHABET = string.ascii_uppercase + string.digits
+PROMO_CODE_ALPHABET = string.ascii_uppercase + string.digits
+TOKEN_ADMIN_PAGE_SIZE = 100
+TOKEN_ADMIN_SORT_KEYS = frozenset({
+    "id", "created_at", "access_code", "api_key", "token_limit", "used_tokens", "status",
+})
 SERVICE_OPTIONS = (
     "Claude", "OpenAI", "Google", "Grok", "DeepSeek", "Alibaba Cloud",
     "Z.AI (GLM)", "KIMI", "Xiaomi", "NVIDIA",
@@ -31,7 +36,7 @@ TOKEN_TEXT = {
     "ru": {
         "switch": "English", "title": "Сервис активации", "intro": "Здесь вы сможете активировать и использовать API ключи с токенами для сервисов Claude / Codex / Grok / Google и другие.<br>Для этого следуйте инструкции ниже.",
         "activation": "Активация ключа", "access": "Ключ доступа", "access_hint": "➥ Здесь вводите ключ доступа который получили от продавца.", "activate": "АКТИВИРОВАТЬ КЛЮЧ",
-        "info": "ИНФОРМАЦИЯ", "service": "Подключенный сервис:", "activated": "Дата активации ключа:", "limit": "Количество токенов:", "remaining": "Оставшиеся токены:", "status": "Статус:", "api": "API ключ:",
+        "info": "ИНФОРМАЦИЯ", "service": "Подключенный сервис:", "activated": "Дата активации ключа:", "limit": "Количество токенов:", "remaining": "Оставшиеся токены:", "status": "Статус:", "api": "API ключ:", "bonus": "Получить бонус", "bonus_instructions": "Чтобы получить бонусные токены, оставьте положительный отзыв на странице оплаты у продавца. После этого продавец отправит вам промокод в чат. Введите его в поле ниже и нажмите «Получить».", "promo_code": "Промокод", "claim_bonus": "Получить", "promo_missing": "🔴 Промокод не существует или уже был использован ранее.", "promo_success": "✅ Промокод #{code} был активирован и вам начислено {tokens} токенов.", "promo_error": "Не удалось начислить бонус. Попробуйте ещё раз.", "download_logs": "Скачать логи", "logs_downloading": "Скачивание…", "logs_error": "Не удалось скачать логи. Попробуйте ещё раз.",
         "exhausted": "Токены были полностью использованы. Дата: {date}", "not_activated": "Не активирован", "activated_status": "Активирован ({date})", "exhausted_status": "Исчерпан ({date})",
         "instructions": "ИНСТРУКЦИЯ ПО ИСПОЛЬЗОВАНИЮ", "instructions_intro": "Если вы не знаете как использовать API ключ, мы поможем, для начала выберите через что вы будете использовать API",
         "choose_service": "1. Выберите сервис", "choose_app": "2. Выберите приложение", "choose_os": "3. Выберите операционную систему", "selected": "Выбрано:", "description": "Описание:", "os": "Операционная система:",
@@ -45,7 +50,7 @@ TOKEN_TEXT = {
     "en": {
         "switch": "Русский", "title": "Activation Service", "intro": "Activate and use token-based API keys for Claude / Codex / Grok / Google and other services.<br>Follow the instructions below.",
         "activation": "Key activation", "access": "Access key", "access_hint": "➥ Enter the access key received from the seller.", "activate": "ACTIVATE KEY",
-        "info": "INFORMATION", "service": "Connected service:", "activated": "Key activation date:", "limit": "Token amount:", "remaining": "Remaining tokens:", "status": "Status:", "api": "API key:",
+        "info": "INFORMATION", "service": "Connected service:", "activated": "Key activation date:", "limit": "Token amount:", "remaining": "Remaining tokens:", "status": "Status:", "api": "API key:", "bonus": "Get bonus", "bonus_instructions": "To receive bonus tokens, leave a positive review on the seller's payment page. The seller will then send you a promo code in the chat. Enter it below and click “Get”.", "promo_code": "Promo code", "claim_bonus": "Get", "promo_missing": "🔴 The promo code does not exist or has already been used.", "promo_success": "✅ Promo code #{code} was activated and {tokens} tokens were credited to your account.", "promo_error": "Could not credit the bonus. Please try again.", "download_logs": "Download logs", "logs_downloading": "Downloading…", "logs_error": "Could not download logs. Please try again.",
         "exhausted": "All tokens have been used. Date: {date}", "not_activated": "Not activated", "activated_status": "Activated ({date})", "exhausted_status": "Exhausted ({date})",
         "instructions": "INSTRUCTIONS FOR USE", "instructions_intro": "If you do not know how to use the API key, we can help. First choose how you will use the API.",
         "choose_service": "1. Choose a service", "choose_app": "2. Choose an application", "choose_os": "3. Choose an operating system", "selected": "Selected:", "description": "Description:", "os": "Operating system:",
@@ -83,9 +88,21 @@ def normalize_access_code(value: str) -> str:
     return "".join(value.strip().upper().split())
 
 
+def normalize_promo_code(value: str) -> str:
+    return "".join(value.strip().upper().split())
+
+
 def generate_access_code(existing: set[str]) -> str:
     while True:
         code = "".join(secrets.choice(TOKEN_CODE_ALPHABET) for _ in range(20))
+        if code not in existing:
+            return code
+
+
+def generate_promo_code(existing: set[str]) -> str:
+    """Generate a globally unique, seller-friendly promo code."""
+    while True:
+        code = "".join(secrets.choice(PROMO_CODE_ALPHABET) for _ in range(20))
         if code not in existing:
             return code
 
@@ -96,6 +113,105 @@ def format_tokens(value: int) -> str:
 
 def format_datetime(value: datetime | None) -> str:
     return to_moscow(value).strftime("%d.%m.%Y %H:%M") if value else "—"
+
+
+@dataclass(frozen=True, slots=True)
+class TokenAdminPageState:
+    """Server-side state for the keys table.
+
+    Sorting and filtering deliberately happen before slicing the result into
+    pages.  Keeping this state in the URL also makes every page bookmarkable
+    and avoids client-side sorting of just the currently rendered 100 rows.
+    """
+
+    page: int = 1
+    search_query: str = ""
+    sort_key: str = "id"
+    sort_order: str = "desc"
+
+
+def normalize_token_admin_page(value: str | None) -> int:
+    try:
+        return max(1, int((value or "").strip()))
+    except (TypeError, ValueError):
+        return 1
+
+
+def normalize_token_admin_sort_key(value: str | None) -> str:
+    candidate = (value or "").strip().lower()
+    return candidate if candidate in TOKEN_ADMIN_SORT_KEYS else "id"
+
+
+def normalize_token_admin_sort_order(value: str | None) -> str:
+    return "asc" if (value or "").strip().lower() == "asc" else "desc"
+
+
+def token_admin_page_state(query: object) -> TokenAdminPageState:
+    """Read only the supported table controls from FastAPI query parameters."""
+    get = getattr(query, "get")
+    return TokenAdminPageState(
+        page=normalize_token_admin_page(get("page")),
+        search_query=str(get("search") or "").strip(),
+        sort_key=normalize_token_admin_sort_key(get("sort")),
+        sort_order=normalize_token_admin_sort_order(get("order")),
+    )
+
+
+def filter_token_admin_keys(keys: list[TokenKey], search_query: str) -> list[TokenKey]:
+    """Find an access code or an upstream API key, case-insensitively."""
+    needle = search_query.strip().lower()
+    if not needle:
+        return list(keys)
+    return [
+        key for key in keys
+        if needle in key.access_code.lower() or needle in key.api_key.lower()
+    ]
+
+
+def token_admin_status_sort_value(key: TokenKey) -> tuple[int, datetime, int]:
+    """Stable non-localized ordering for the human-readable status column."""
+    if key.is_exhausted:
+        return (2, key.exhausted_at or key.activated_at or key.created_at, key.id)
+    if key.activated_at:
+        return (1, key.activated_at, key.id)
+    return (0, key.created_at, key.id)
+
+
+def token_admin_sort_value(key: TokenKey, sort_key: str):
+    if sort_key == "created_at":
+        return (key.created_at, key.id)
+    if sort_key == "access_code":
+        return (key.access_code, key.id)
+    if sort_key == "api_key":
+        return (key.api_key, key.id)
+    if sort_key == "token_limit":
+        return (key.token_limit, key.id)
+    if sort_key == "used_tokens":
+        return (key.used_tokens, key.id)
+    if sort_key == "status":
+        return token_admin_status_sort_value(key)
+    return key.id
+
+
+def sort_token_admin_keys(keys: list[TokenKey], state: TokenAdminPageState) -> list[TokenKey]:
+    """Return the full filtered set ordered before pagination is applied."""
+    return sorted(
+        keys,
+        key=lambda key: token_admin_sort_value(key, state.sort_key),
+        reverse=state.sort_order == "desc",
+    )
+
+
+def paginate_token_admin_keys(
+    keys: list[TokenKey], page: int, page_size: int = TOKEN_ADMIN_PAGE_SIZE,
+) -> tuple[list[TokenKey], int, int]:
+    """Return ``(items, current_page, total_pages)`` for an already sorted list."""
+    if page_size < 1:
+        raise ValueError("page_size must be positive")
+    total_pages = max(1, (len(keys) + page_size - 1) // page_size)
+    current_page = min(max(1, page), total_pages)
+    start = (current_page - 1) * page_size
+    return keys[start:start + page_size], current_page, total_pages
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,6 +359,148 @@ class TokenKeyStore:
 
 
 @dataclass(frozen=True, slots=True)
+class PromoCode:
+    code: str
+    additional_tokens: int
+    used_at: datetime | None = None
+    used_access_code: str | None = None
+    owner_index: int = 1
+    # Kept last to preserve the positional constructor used by existing
+    # callers: PromoCode(code, additional_tokens, used_at, ...).
+    created_at: datetime = field(default_factory=utc_now)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "PromoCode":
+        used_at = data.get("used_at")
+        created_at = data.get("created_at")
+        return cls(
+            code=normalize_promo_code(str(data["code"])),
+            additional_tokens=max(0, int(data["additional_tokens"])),
+            # Old promo files did not record this field. Preserve the best
+            # known timestamp instead of making a legacy record unreadable.
+            created_at=parse_datetime(created_at) if created_at else (
+                parse_datetime(used_at) if used_at else utc_now()
+            ),
+            used_at=parse_datetime(used_at) if used_at else None,
+            used_access_code=(
+                normalize_access_code(str(data["used_access_code"]))
+                if data.get("used_access_code") else None
+            ),
+            owner_index=max(1, int(data.get("owner_index") or 1)),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "code": self.code,
+            "additional_tokens": self.additional_tokens,
+            "created_at": self.created_at.astimezone(timezone.utc).isoformat(),
+            "used_at": self.used_at.astimezone(timezone.utc).isoformat() if self.used_at else None,
+            "used_access_code": self.used_access_code,
+            "owner_index": self.owner_index,
+        }
+
+
+class PromoCodeStore:
+    """Persistent one-time promo codes shared by all token-key owners."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = asyncio.Lock()
+
+    def _read(self) -> list[PromoCode]:
+        if not self.path.exists():
+            return []
+        raw = self.path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return []
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, list):
+                raise ValueError("root is not a list")
+            return [PromoCode.from_dict(item) for item in payload if isinstance(item, dict)]
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Promo code store is unreadable: {exc}") from exc
+
+    def _write(self, promos: list[PromoCode]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps([promo.to_dict() for promo in promos], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(self.path)
+
+    async def add(self, promo: PromoCode) -> None:
+        await self.add_many([promo])
+
+    async def add_many(self, created: list[PromoCode]) -> None:
+        """Atomically append promo codes after checking global uniqueness."""
+        if not created:
+            return
+        async with self._lock:
+            promos = self._read()
+            new_codes = [promo.code for promo in created]
+            if len(set(new_codes)) != len(new_codes) or any(
+                promo.code in {item.code for item in promos} for promo in created
+            ):
+                raise ValueError("Promo code already exists.")
+            promos.extend(created)
+            self._write(promos)
+
+    async def list(self) -> list[PromoCode]:
+        async with self._lock:
+            return list(self._read())
+
+    async def list_for_owner(self, owner_index: int) -> list[PromoCode]:
+        async with self._lock:
+            return sorted(
+                (promo for promo in self._read() if promo.owner_index == owner_index),
+                key=lambda promo: promo.created_at,
+                reverse=True,
+            )
+
+    async def claim(self, code: str, access_code: str, owner_index: int) -> PromoCode | None:
+        normalized_code = normalize_promo_code(code)
+        normalized_access_code = normalize_access_code(access_code)
+        async with self._lock:
+            promos = self._read()
+            for index, promo in enumerate(promos):
+                if (
+                    promo.code != normalized_code
+                    or promo.owner_index != owner_index
+                    or promo.used_at is not None
+                ):
+                    continue
+                claimed = replace(
+                    promo,
+                    used_at=utc_now(),
+                    used_access_code=normalized_access_code,
+                )
+                promos[index] = claimed
+                self._write(promos)
+                return claimed
+        return None
+
+    async def restore_unclaimed(self, code: str, access_code: str, owner_index: int) -> bool:
+        """Undo a provisional claim when the upstream credit was rejected."""
+        normalized_code = normalize_promo_code(code)
+        normalized_access_code = normalize_access_code(access_code)
+        async with self._lock:
+            promos = self._read()
+            for index, promo in enumerate(promos):
+                if (
+                    promo.code != normalized_code
+                    or promo.owner_index != owner_index
+                    or promo.used_access_code != normalized_access_code
+                ):
+                    continue
+                promos[index] = replace(promo, used_at=None, used_access_code=None)
+                self._write(promos)
+                return True
+        return False
+
+
+@dataclass(frozen=True, slots=True)
 class StoredTokenKey:
     """A key together with the private store that owns it.
 
@@ -297,6 +555,14 @@ class TokenKeyStores:
             if key is not None:
                 return StoredTokenKey(owner_index=owner_index, store=store, key=key)
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class TokenAdmin:
+    """One password-protected owner area and its primary upstream key."""
+
+    password: str
+    primary_api_key: str
 
 
 def indexed_token_store_path(base_path: Path, owner_index: int) -> Path:
@@ -362,6 +628,8 @@ def trusted_secondary_remaining(
 class SecondaryKeyClient(Protocol):
     async def create_key(self, *, name: str, token_limit: int) -> str: ...
 
+    async def add_tokens(self, *, api_key: str, additional_tokens: int) -> None: ...
+
     async def get_token_balance(self, *, api_key: str) -> int: ...
 
     async def get_primary_token_balance(self) -> int: ...
@@ -402,6 +670,30 @@ class CheapVibeCodeClient:
         if not isinstance(api_key, str) or not api_key.strip():
             raise RuntimeError("The key service response did not contain an API key.")
         return api_key.strip()
+
+    async def add_tokens(self, *, api_key: str, additional_tokens: int) -> None:
+        if not self.primary_key:
+            raise RuntimeError("CVC_PRIMARY_API_KEY is not configured.")
+        if additional_tokens < 1:
+            raise ValueError("Additional token amount must be positive.")
+        try:
+            async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                async with session.post(
+                    f"{self.base_url}/v1/keys/edit",
+                    headers={"Authorization": f"Bearer {self.primary_key}", "Content-Type": "application/json"},
+                    json={"key": api_key, "additional_tokens": additional_tokens, "active": False},
+                ) as response:
+                    status, raw = response.status, await response.text()
+        except (aiohttp.ClientError, TimeoutError) as exc:
+            raise RuntimeError("Could not connect to the key service.") from exc
+        if status >= 400:
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                detail = raw
+            else:
+                detail = payload.get("detail") if isinstance(payload, dict) else raw
+            raise RuntimeError(f"Key service rejected the request: {detail}")
 
     async def get_token_balance(self, *, api_key: str) -> int:
         try:
@@ -454,8 +746,11 @@ def attach_csrf(response: HTMLResponse, token: str, cookie_name: str, path: str)
 def create_tokens_routes(
     app: FastAPI,
     *,
-    key_client: SecondaryKeyClient,
+    key_client: SecondaryKeyClient | None = None,
+    owner_key_clients: list[SecondaryKeyClient] | tuple[SecondaryKeyClient, ...] | None = None,
     stores: TokenKeyStores | list[TokenKeyStore] | tuple[TokenKeyStore, ...] | None = None,
+    promo_store: PromoCodeStore | None = None,
+    admins: list[TokenAdmin] | tuple[TokenAdmin, ...] | None = None,
     admin_passwords: list[str] | tuple[str, ...] | None = None,
     # Kept temporarily for callers that still use the single-admin API.
     store: TokenKeyStore | None = None,
@@ -476,18 +771,33 @@ def create_tokens_routes(
         token_stores = TokenKeyStores(stores)
     if token_stores.count < 1:
         raise ValueError("At least one token key store must be configured.")
+    promo_codes = promo_store or PromoCodeStore(Path("promo_codes.json"))
 
-    configured_passwords = tuple(password for password in (admin_passwords or ()) if password)
-    if not configured_passwords and admin_password:
-        configured_passwords = (admin_password,)
-    if len(set(configured_passwords)) != len(configured_passwords):
+    configured_admins = tuple(admin for admin in (admins or ()) if admin.password and admin.primary_api_key)
+    if not configured_admins:
+        configured_passwords = tuple(password for password in (admin_passwords or ()) if password)
+        if not configured_passwords and admin_password:
+            configured_passwords = (admin_password,)
+        if key_client is None and configured_passwords:
+            raise ValueError("A primary key client is required for every tokens admin.")
+        configured_admins = tuple(
+            TokenAdmin(password=password, primary_api_key="") for password in configured_passwords
+        )
+        configured_clients = tuple(key_client for _ in configured_admins)
+    else:
+        configured_clients = tuple(owner_key_clients or ())
+        if len(configured_clients) != len(configured_admins):
+            raise ValueError("Every tokens admin needs its own primary key client.")
+    if len({admin.password for admin in configured_admins}) != len(configured_admins):
         raise ValueError("Tokens admin passwords must be unique.")
-    if len(configured_passwords) > token_stores.count:
+    if len(configured_admins) > token_stores.count:
         raise ValueError("Every configured admin password needs its own token key store.")
 
     app.state.token_key_store = token_stores.for_owner(1)
     app.state.token_key_stores = token_stores
+    app.state.promo_code_store = promo_codes
     app.state.secondary_key_client = key_client
+    app.state.owner_secondary_key_clients = configured_clients
     admin_sessions: dict[str, int] = {}
     creation_lock = asyncio.Lock()
 
@@ -520,19 +830,23 @@ def create_tokens_routes(
     def is_admin(request: Request) -> bool:
         return admin_owner(request) is not None
 
-    async def read_primary_remaining() -> int | None:
+    def owner_client(owner_index: int) -> SecondaryKeyClient:
+        return configured_clients[owner_index - 1]
+
+    async def read_primary_remaining(owner_index: int) -> int | None:
         try:
-            return await key_client.get_primary_token_balance()
+            return await owner_client(owner_index).get_primary_token_balance()
         except RuntimeError:
             return None
 
     async def refresh_stored_balance(
         key: TokenKey,
         key_store: TokenKeyStore,
+        owner_index: int,
         primary_remaining: int | None = None,
     ) -> TokenKey:
         try:
-            reported = await key_client.get_token_balance(api_key=key.api_key)
+            reported = await owner_client(owner_index).get_token_balance(api_key=key.api_key)
         except RuntimeError:
             return key
         remaining = trusted_secondary_remaining(reported, key.token_limit, primary_remaining)
@@ -541,12 +855,12 @@ def create_tokens_routes(
         updated = await key_store.apply_remaining(key.id, remaining)
         return updated or key
 
-    async def refresh_stored_balances(keys: list[TokenKey], key_store: TokenKeyStore) -> list[TokenKey]:
+    async def refresh_stored_balances(keys: list[TokenKey], key_store: TokenKeyStore, owner_index: int) -> list[TokenKey]:
         if not keys:
             return keys
-        primary_remaining = await read_primary_remaining()
+        primary_remaining = await read_primary_remaining(owner_index)
         refreshed = await asyncio.gather(
-            *(refresh_stored_balance(key, key_store, primary_remaining) for key in keys)
+            *(refresh_stored_balance(key, key_store, owner_index, primary_remaining) for key in keys)
         )
         return sorted(refreshed, key=lambda key: key.id, reverse=True)
 
@@ -557,20 +871,42 @@ def create_tokens_routes(
         notice: str = "",
         status_code: int = 200,
         created_access_codes: list[str] | None = None,
+        created_promo_codes: list[str] | None = None,
     ) -> HTMLResponse:
         csrf_token = secrets.token_urlsafe(32)
+        table_state = token_admin_page_state(request.query_params)
         owner_index = admin_owner(request)
         owner_store = token_stores.for_owner(owner_index) if owner_index is not None else None
         authenticated = owner_store is not None
-        keys = await refresh_stored_balances(await owner_store.list(), owner_store) if owner_store else []
+        all_keys = await owner_store.list() if owner_store else []
+        promos = await promo_codes.list_for_owner(owner_index) if owner_index is not None else []
+        # Search and global ordering must happen before the list is sliced for
+        # the 100-row page.  Doing it in the browser would order only the
+        # currently visible rows and make later pages inconsistent.
+        matching_keys = filter_token_admin_keys(all_keys, table_state.search_query)
+        ordered_keys = sort_token_admin_keys(matching_keys, table_state)
+        keys, current_page, total_pages = paginate_token_admin_keys(ordered_keys, table_state.page)
+        table_state = replace(table_state, page=current_page)
+        # Only displayed records need a live balance request.  Filtering and
+        # ordering still use the complete local store above, but opening one
+        # page must not fan out into an upstream request for every key owned
+        # by this admin.
+        if owner_store is not None and owner_index is not None:
+            keys = await refresh_stored_balances(keys, owner_store, owner_index)
         response = render_tokens_admin(
             csrf_token=csrf_token,
             authenticated=authenticated,
-            password_configured=bool(configured_passwords),
+            password_configured=bool(configured_admins),
             keys=keys,
+            total_key_count=len(all_keys),
+            matching_key_count=len(matching_keys),
+            page_state=table_state,
+            total_pages=total_pages,
+            promos=promos,
             error=error,
             notice=notice,
             created_access_codes=created_access_codes or [],
+            created_promo_codes=created_promo_codes or [],
         )
         response.status_code = status_code
         return attach_csrf(response, csrf_token, TOKENS_ADMIN_CSRF_COOKIE, "/ai/tokens/adm")
@@ -581,7 +917,7 @@ def create_tokens_routes(
         found = await token_stores.find_by_code(access_code) if access_code else None
         key = found.key if found is not None else None
         if found is not None:
-            key = await refresh_stored_balance(key, found.store, await read_primary_remaining())
+            key = await refresh_stored_balance(key, found.store, found.owner_index, await read_primary_remaining(found.owner_index))
         error = exhausted_message(key, locale) if key is not None and key.is_exhausted else ""
         return user_response(locale=locale, key=key, error=error)
 
@@ -596,7 +932,7 @@ def create_tokens_routes(
         found = await token_stores.activate(access_code)
         if found is None:
             return user_response(locale=locale, error=TOKEN_TEXT[locale]["missing"], submitted_code=access_code, status_code=404)
-        key = await refresh_stored_balance(found.key, found.store, await read_primary_remaining())
+        key = await refresh_stored_balance(found.key, found.store, found.owner_index, await read_primary_remaining(found.owner_index))
         if key.is_exhausted:
             response = user_response(locale=locale, key=key, error=exhausted_message(key, locale), submitted_code=access_code)
         else:
@@ -614,11 +950,11 @@ def create_tokens_routes(
             return JSONResponse({"ok": False, "error": "access_key_missing"}, status_code=401, headers={"Cache-Control": "no-store"})
         key = found.key
         try:
-            reported = await key_client.get_token_balance(api_key=key.api_key)
+            reported = await owner_client(found.owner_index).get_token_balance(api_key=key.api_key)
         except RuntimeError:
             return JSONResponse({"ok": False, "error": "balance_unavailable"}, status_code=502, headers={"Cache-Control": "no-store"})
         remaining = trusted_secondary_remaining(
-            reported, key.token_limit, await read_primary_remaining()
+            reported, key.token_limit, await read_primary_remaining(found.owner_index)
         )
         if remaining is None:
             return JSONResponse({"ok": False, "error": "balance_unavailable"}, status_code=502, headers={"Cache-Control": "no-store"})
@@ -637,6 +973,39 @@ def create_tokens_routes(
             headers={"Cache-Control": "no-store"},
         )
 
+    async def claim_bonus(request: Request) -> HTMLResponse:
+        form = await read_form(request)
+        locale = token_locale(form.get("lang"))
+        if not valid_csrf(request, form, TOKENS_USER_CSRF_COOKIE):
+            return RedirectResponse(url=f"/ai/tokens?lang={locale}", status_code=303)
+        access_code = request.cookies.get(TOKENS_ACCESS_COOKIE, "")
+        found = await token_stores.find_by_code(access_code) if access_code else None
+        if found is None:
+            return user_response(locale=locale, error=TOKEN_TEXT[locale]["missing"], status_code=401)
+        promo = await promo_codes.claim(
+            form.get("promo_code", ""), access_code, found.owner_index
+        )
+        if promo is None:
+            return user_response(locale=locale, key=found.key, error=TOKEN_TEXT[locale]["promo_missing"], status_code=404)
+        try:
+            await owner_client(found.owner_index).add_tokens(
+                api_key=found.key.api_key,
+                additional_tokens=promo.additional_tokens,
+            )
+        except (RuntimeError, ValueError):
+            await promo_codes.restore_unclaimed(promo.code, access_code, found.owner_index)
+            return user_response(locale=locale, key=found.key, error=TOKEN_TEXT[locale]["promo_error"], status_code=502)
+        updated_key = replace(found.key, token_limit=found.key.token_limit + promo.additional_tokens)
+        await found.store.update(found.key.id, updated_key)
+        return user_response(
+            locale=locale,
+            key=updated_key,
+            notice=TOKEN_TEXT[locale]["promo_success"].format(
+                code=promo.code,
+                tokens=format_tokens(promo.additional_tokens),
+            ),
+        )
+
     async def admin_page(request: Request) -> HTMLResponse:
         return await admin_response(request)
 
@@ -644,18 +1013,18 @@ def create_tokens_routes(
         form = await read_form(request)
         if not valid_csrf(request, form, TOKENS_ADMIN_CSRF_COOKIE):
             return RedirectResponse(url="/ai/tokens/adm", status_code=303)
-        if not configured_passwords:
+        if not configured_admins:
             return await admin_response(
                 request,
-                error="Админ-панель недоступна: задайте TOKENS_ADMIN_PASSWORDS в .env.",
+                error="Админ-панель недоступна: задайте TOKENS_ADMINS в .env.",
                 status_code=503,
             )
         supplied = form.get("password", "")
         owner_index = next(
             (
                 index
-                for index, password in enumerate(configured_passwords, start=1)
-                if secrets.compare_digest(supplied, password)
+                for index, admin in enumerate(configured_admins, start=1)
+                if secrets.compare_digest(supplied, admin.password)
             ),
             None,
         )
@@ -718,7 +1087,7 @@ def create_tokens_routes(
             records: list[TokenKey] = []
             try:
                 for index in range(quantity):
-                    api_key = await key_client.create_key(name=name, token_limit=token_limit)
+                    api_key = await owner_client(owner_index).create_key(name=name, token_limit=token_limit)
                     access_code = generate_access_code(existing_codes)
                     existing_codes.add(access_code)
                     records.append(TokenKey(
@@ -757,6 +1126,45 @@ def create_tokens_routes(
             created_access_codes=[record.access_code for record in records],
         )
 
+    async def admin_create_promos(request: Request) -> HTMLResponse:
+        form = await read_form(request)
+        owner_index = admin_owner(request)
+        if owner_index is None:
+            return await admin_response(request, error="Сессия администратора завершена.", status_code=401)
+        if not valid_csrf(request, form, TOKENS_ADMIN_CSRF_COOKIE):
+            return RedirectResponse(url="/ai/tokens/adm", status_code=303)
+        additional_tokens = positive_int(form.get("additional_tokens", ""))
+        quantity = positive_int(form.get("quantity", ""))
+        if additional_tokens is None or additional_tokens < 1:
+            return await admin_response(
+                request,
+                error="Количество начисляемых токенов должно быть положительным целым числом.",
+                status_code=400,
+            )
+        if quantity is None or not 1 <= quantity <= 100:
+            return await admin_response(
+                request,
+                error="Количество промокодов должно быть от 1 до 100.",
+                status_code=400,
+            )
+        async with creation_lock:
+            existing_codes = {promo.code for promo in await promo_codes.list()}
+            records: list[PromoCode] = []
+            for _ in range(quantity):
+                code = generate_promo_code(existing_codes)
+                existing_codes.add(code)
+                records.append(PromoCode(
+                    code=code,
+                    additional_tokens=additional_tokens,
+                    owner_index=owner_index,
+                ))
+            await promo_codes.add_many(records)
+        return await admin_response(
+            request,
+            notice=f"Создано промокодов: {len(records)}.",
+            created_promo_codes=[record.code for record in records],
+        )
+
     async def admin_update(request: Request, key_id: int) -> HTMLResponse:
         form = await read_form(request)
         owner_index = admin_owner(request)
@@ -791,10 +1199,12 @@ def create_tokens_routes(
     app.add_api_route("/ai/tokens", page, methods=["GET"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens", activate, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/balance", balance, methods=["GET"], response_model=None)
+    app.add_api_route("/ai/tokens/bonus", claim_bonus, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm", admin_page, methods=["GET"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm/login", admin_login, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm/logout", admin_logout, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm/create", admin_create, methods=["POST"], response_class=HTMLResponse, response_model=None)
+    app.add_api_route("/ai/tokens/adm/promos/create", admin_create_promos, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm/{key_id}/update", admin_update, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm/{key_id}/delete", admin_delete, methods=["POST"], response_class=HTMLResponse, response_model=None)
 
@@ -876,7 +1286,7 @@ def render_tokens_page(
     locale = token_locale(locale)
     text = TOKEN_TEXT[locale]
     flash = f"<div class='flash error'>{html.escape(error)}</div>" if error else (f"<div class='flash success'>{html.escape(notice)}</div>" if notice else "")
-    info = render_key_information(key, locale) if key is not None else ""
+    info = render_key_information(key, csrf_token=csrf_token, locale=locale) if key is not None else ""
     instructions = render_instructions(key, locale) if key is not None else ""
     faq = render_faq(locale)
     opposite_locale = "ru" if locale == "en" else "en"
@@ -896,7 +1306,7 @@ def render_tokens_page(
     return HTMLResponse(render_layout(text['title'], content, locale))
 
 
-def render_key_information(key: TokenKey, locale: str = "ru") -> str:
+def render_key_information(key: TokenKey, *, csrf_token: str, locale: str = "ru") -> str:
     text = TOKEN_TEXT[token_locale(locale)]
     status = text["exhausted_status"].format(date=format_datetime(key.exhausted_at or key.activated_at)) if key.is_exhausted else (text["activated_status"].format(date=format_datetime(key.activated_at)) if key.activated_at else text["not_activated"])
     return f"""
@@ -907,7 +1317,24 @@ def render_key_information(key: TokenKey, locale: str = "ru") -> str:
       <dt>{html.escape(text['remaining'])}</dt><dd id='token-balance' data-separator='{html.escape(text['remaining_sep'], quote=True)}' data-fallback='{format_tokens(key.remaining_tokens)}'>{format_tokens(key.remaining_tokens)} {html.escape(text['remaining_sep'])} {format_tokens(key.token_limit)}</dd>
       <dt>{html.escape(text['status'])}</dt><dd>{html.escape(status)}</dd>
       <dt>{html.escape(text['api'])}</dt><dd><code class='api-key'>{html.escape(key.api_key)}</code></dd>
-    </dl></section>"""
+    </dl>
+    <div class='info-actions'>
+      <button class='bonus-button' type='button' id='get-bonus' aria-label='{html.escape(text['bonus'], quote=True)}'>
+        <svg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='2' stroke-linecap='round' stroke-linejoin='round' class='lucide lucide-gift h-5 w-5' aria-hidden='true'><rect x='3' y='8' width='18' height='4' rx='1'></rect><path d='M12 8v13'></path><path d='M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7'></path><path d='M7.5 8a2.5 2.5 0 0 1 0-5A4.8 8 0 0 1 12 8a4.8 8 0 0 1 4.5-5 2.5 2.5 0 0 1 0 5'></path></svg>
+        <span>{html.escape(text['bonus'])}</span>
+      </button>
+      <button class='secondary log-download-button' type='button' id='download-logs' data-api-key='{html.escape(key.api_key, quote=True)}' data-label='{html.escape(text['download_logs'], quote=True)}' data-loading-label='{html.escape(text['logs_downloading'], quote=True)}' data-error-label='{html.escape(text['logs_error'], quote=True)}'>{html.escape(text['download_logs'])}</button>
+    </div>
+    <section class='bonus-claim' id='bonus-claim' hidden>
+      <p>{html.escape(text['bonus_instructions'])}</p>
+      <form method='post' action='/ai/tokens/bonus'>
+        <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
+        <input type='hidden' name='lang' value='{locale}'>
+        <label for='promo-code'>{html.escape(text['promo_code'])}</label>
+        <input id='promo-code' name='promo_code' autocomplete='off' autocapitalize='characters' required>
+        <button class='bonus-button wide' type='submit'>{html.escape(text['claim_bonus'])}</button>
+      </form>
+    </section><p class='log-download-status hint' id='log-download-status' role='status' aria-live='polite'></p></section>"""
 
 
 INSTRUCTION_GROUPS = (
@@ -1389,9 +1816,15 @@ def render_tokens_admin(
     authenticated: bool,
     password_configured: bool,
     keys: list[TokenKey],
+    total_key_count: int = 0,
+    matching_key_count: int = 0,
+    page_state: TokenAdminPageState | None = None,
+    total_pages: int = 1,
+    promos: list[PromoCode] | None = None,
     error: str = "",
     notice: str = "",
     created_access_codes: list[str] | None = None,
+    created_promo_codes: list[str] | None = None,
 ) -> HTMLResponse:
     flash = ""
     if error:
@@ -1399,7 +1832,7 @@ def render_tokens_admin(
     elif notice:
         flash = f"<div class='flash success'>{html.escape(notice)}</div>"
     if not authenticated:
-        unavailable = "" if password_configured else "<p class='warning'>TOKENS_ADMIN_PASSWORDS не задан в .env. Вход отключен.</p>"
+        unavailable = "" if password_configured else "<p class='warning'>TOKENS_ADMINS не задан в .env. Вход отключен.</p>"
         content = f"""
         <main class='page narrow'><section class='card'>
           <h1>СОЗДАНИЯ КЛЮЧЕЙ</h1>
@@ -1412,24 +1845,48 @@ def render_tokens_admin(
           </form>
         </section></main>"""
         return HTMLResponse(render_layout("Админ-панель ключей", content))
-    rows = render_admin_rows(keys, csrf_token)
+    state = page_state or TokenAdminPageState()
+    rows = render_admin_rows(keys, csrf_token, state)
+    promo_rows = render_admin_promo_rows(promos or [])
     created_access_codes = created_access_codes or []
+    created_promo_codes = created_promo_codes or []
     created_codes = "\n".join(created_access_codes)
-    copy_created = ""
+    copy_created_keys = ""
     if created_access_codes:
-        copy_created = f"""
-        <div class='created-keys' data-created-keys='{html.escape(created_codes, quote=True)}'>
+        copy_created_keys = f"""
+        <div class='created-keys copy-created-codes' data-created-codes='{html.escape(created_codes, quote=True)}'>
           <strong>Созданные ключи: {len(created_access_codes)}</strong>
-          <button type='button' class='secondary' id='copy-created-keys'>Скопировать все</button>
+          <button type='button' class='secondary copy-created-codes-button'>Скопировать все</button>
+        </div>"""
+    created_promo_values = "\n".join(created_promo_codes)
+    copy_created_promos = ""
+    if created_promo_codes:
+        copy_created_promos = f"""
+        <div class='created-keys copy-created-codes' data-created-codes='{html.escape(created_promo_values, quote=True)}'>
+          <strong>Созданные промокоды: {len(created_promo_codes)}</strong>
+          <button type='button' class='secondary copy-created-codes-button'>Скопировать все</button>
         </div>"""
     service_options = "".join(f"<option value='{html.escape(service)}'>{html.escape(service)}</option>" for service in SERVICE_OPTIONS)
+    table_headers = render_token_admin_table_headers(state)
+    table_pagination = render_token_admin_pagination(
+        state=state,
+        total_pages=total_pages,
+        matching_key_count=matching_key_count,
+        total_key_count=total_key_count,
+    )
+    action_query = urlencode({
+        "page": str(state.page),
+        "sort": state.sort_key,
+        "order": state.sort_order,
+        **({"search": state.search_query} if state.search_query else {}),
+    })
     content = f"""
     <main class='page admin-page'>
       <section class='card'>
         <div class='title-row'><h1>СОЗДАНИЯ КЛЮЧЕЙ</h1>
         <form method='post' action='/ai/tokens/adm/logout'><input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><button class='secondary' type='submit'>Выйти</button></form></div>
-        {flash}{copy_created}
-        <form method='post' action='/ai/tokens/adm/create' class='create-form'>
+        {flash}{copy_created_keys}
+        <form method='post' action='/ai/tokens/adm/create?{html.escape(action_query, quote=True)}' class='create-form'>
           <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
           <label>ВЫБРАТЬ СЕРВИС:<select name='service' required>{service_options}</select></label>
           <label>ВЫБРАТЬ НАЗВАНИЕ:<input name='name' required maxlength='200' placeholder='Название'></label>
@@ -1440,17 +1897,171 @@ def render_tokens_admin(
       </section>
       <section class='card'>
         <h2>УПРАВЛЕНИЕ КЛЮЧАМИ</h2>
-        <p class='hint'>Нажмите «Управлять», чтобы изменить все данные ключа.</p>
-        <div class='table-wrap' id='keys-table-wrap'><table id='keys-table'><thead><tr><th data-sort='number'>ID</th><th data-sort='date'>Дата создания</th><th data-group-service data-sort='service'>СЕРВИС</th><th data-sort='text'>КЛЮЧ</th><th data-sort='text'>API KEY</th><th data-sort='number'>ТОКЕНОВ</th><th data-sort='number'>ИСПОЛЬЗОВАНО</th><th data-sort='text'>СТАТУС</th><th data-sort='text'>УПРАВЛЕНИЕ</th></tr></thead>
-        <tbody>{rows or "<tr><td colspan='9' class='empty'>Ключей пока нет.</td></tr>"}</tbody></table></div>
+        <p class='hint'>Нажмите «Управлять», чтобы изменить все данные ключа. Сортировка и поиск применяются ко всем ключам до разделения на страницы.</p>
+        <form method='get' action='/ai/tokens/adm' class='keys-search-form'>
+          <input type='hidden' name='sort' value='{html.escape(state.sort_key, quote=True)}'>
+          <input type='hidden' name='order' value='{html.escape(state.sort_order, quote=True)}'>
+          <label for='keys-search'>Поиск по ключу или API KEY</label>
+          <div class='keys-search-controls'>
+            <input id='keys-search' name='search' value='{html.escape(state.search_query, quote=True)}' maxlength='500' autocomplete='off' placeholder='Ключ или API KEY'>
+            <button class='secondary' type='submit'>Найти</button>
+            <a class='secondary reset-search' href='/ai/tokens/adm'>Сбросить</a>
+          </div>
+        </form>
+        <div class='table-wrap' id='keys-table-wrap'><table id='keys-table'><thead><tr>{table_headers}</tr></thead>
+        <tbody>{rows or "<tr><td colspan='9' class='empty'>По вашему запросу ключей не найдено.</td></tr>"}</tbody></table></div>
         <div id='keys-table-groups' hidden></div>
+        {table_pagination}
+      </section>
+      <section class='card'>
+        <h2>СОЗДАНИЯ ПРОМОКОДОВ</h2>
+        {copy_created_promos}
+        <form method='post' action='/ai/tokens/adm/promos/create?{html.escape(action_query, quote=True)}' class='create-form promo-create-form'>
+          <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
+          <label>КОЛИЧЕСТВО НАЧИСЛЯЕМЫХ ТОКЕНОВ:<input type='number' name='additional_tokens' min='1' step='1' required placeholder='Количество токенов'></label>
+          <label>КОЛИЧЕСТВО СОЗДАВАЕМЫХ ПРОМОКОДОВ:<input type='number' name='quantity' min='1' max='100' step='1' required value='1'></label>
+          <button class='primary wide' type='submit'>СОЗДАТЬ ПРОМОКОДЫ</button>
+        </form>
+      </section>
+      <section class='card'>
+        <h2>УПРАВЛЕНИЕ ПРОМОКОДАМИ</h2>
+        <p class='hint'>Промокод можно использовать только один раз.</p>
+        <div class='table-wrap'><table class='promos-table'><thead><tr><th>Дата создания</th><th>ПРОМОКОД</th><th>НАЧИСЛЯЕТСЯ ТОКЕНОВ</th><th>СТАТУС</th></tr></thead>
+        <tbody>{promo_rows or "<tr><td colspan='4' class='empty'>Промокодов пока нет.</td></tr>"}</tbody></table></div>
       </section>
     </main>"""
     return HTMLResponse(render_layout("Админ-панель ключей", content))
 
 
-def render_admin_rows(keys: list[TokenKey], csrf_token: str) -> str:
+def token_admin_url(
+    *,
+    page: int,
+    search_query: str,
+    sort_key: str,
+    sort_order: str,
+) -> str:
+    params = {"page": str(page), "sort": sort_key, "order": sort_order}
+    if search_query:
+        params["search"] = search_query
+    return f"/ai/tokens/adm?{urlencode(params)}"
+
+
+def render_token_admin_table_headers(state: TokenAdminPageState) -> str:
+    columns = (
+        ("id", "ID"),
+        ("created_at", "Дата создания"),
+        (None, "СЕРВИС"),
+        ("access_code", "КЛЮЧ"),
+        ("api_key", "API KEY"),
+        ("token_limit", "ТОКЕНОВ"),
+        ("used_tokens", "ИСПОЛЬЗОВАНО"),
+        ("status", "СТАТУС"),
+        ("management", "УПРАВЛЕНИЕ"),
+    )
+    headers: list[str] = []
+    for sort_key, label in columns:
+        if sort_key is None:
+            headers.append("<th data-group-service><button type='button' class='service-group-header'>СЕРВИС</button></th>")
+            continue
+        # The management cells have no sortable data, so preserve the current
+        # global order rather than pretending that their identical labels have
+        # a meaningful ordering.
+        if sort_key == "management":
+            headers.append(f"<th>{label}</th>")
+            continue
+        next_order = "asc" if state.sort_key != sort_key or state.sort_order == "desc" else "desc"
+        href = token_admin_url(
+            page=1,
+            search_query=state.search_query,
+            sort_key=sort_key,
+            sort_order=next_order,
+        )
+        headers.append(
+            f"<th><a class='sort-link' href='{html.escape(href, quote=True)}'>{label}</a></th>"
+        )
+    return "".join(headers)
+
+
+def render_token_admin_pagination(
+    *,
+    state: TokenAdminPageState,
+    total_pages: int,
+    matching_key_count: int,
+    total_key_count: int,
+) -> str:
+    if matching_key_count:
+        first = (state.page - 1) * TOKEN_ADMIN_PAGE_SIZE + 1
+        last = min(state.page * TOKEN_ADMIN_PAGE_SIZE, matching_key_count)
+        result_text = f"Показаны {first}–{last} из {matching_key_count} ключей"
+    else:
+        result_text = "Ключей по запросу не найдено"
+    if state.search_query:
+        result_text += f" (всего: {total_key_count})"
+    if total_pages <= 1:
+        return f"<p class='pagination-summary'>{html.escape(result_text)}</p>"
+
+    def link(page: int, label: str, disabled: bool = False) -> str:
+        if disabled:
+            return f"<span class='page-link disabled'>{label}</span>"
+        href = token_admin_url(
+            page=page,
+            search_query=state.search_query,
+            sort_key=state.sort_key,
+            sort_order=state.sort_order,
+        )
+        return f"<a class='page-link' href='{html.escape(href, quote=True)}'>{label}</a>"
+
+    pages: list[int | None] = []
+    for candidate in (1, state.page - 1, state.page, state.page + 1, total_pages):
+        if not 1 <= candidate <= total_pages or candidate in pages:
+            continue
+        if pages and candidate - int(pages[-1]) > 1:
+            pages.append(None)
+        pages.append(candidate)
+    page_links = "".join(
+        "<span class='page-ellipsis'>…</span>" if page is None else
+        (f"<span class='page-link current'>{page}</span>" if page == state.page else link(page, str(page)))
+        for page in pages
+    )
+    return f"""
+    <nav class='pagination' aria-label='Страницы ключей'>
+      <p class='pagination-summary'>{html.escape(result_text)}</p>
+      <div class='pagination-links'>
+        {link(state.page - 1, 'Назад', state.page <= 1)}
+        {page_links}
+        {link(state.page + 1, 'Вперёд', state.page >= total_pages)}
+      </div>
+    </nav>"""
+
+
+def render_admin_promo_rows(promos: list[PromoCode]) -> str:
+    """Render the deliberately read-only management list for promo codes."""
     rows: list[str] = []
+    for promo in promos:
+        if promo.used_at is None:
+            status = "Не использован"
+        else:
+            status = f"Использован ({format_datetime(promo.used_at)})"
+        rows.append(
+            f"<tr><td>{format_datetime(promo.created_at)}</td>"
+            f"<td><code>{html.escape(promo.code)}</code></td>"
+            f"<td>{format_tokens(promo.additional_tokens)}</td>"
+            f"<td>{html.escape(status)}</td></tr>"
+        )
+    return "".join(rows)
+
+
+def render_admin_rows(
+    keys: list[TokenKey], csrf_token: str, state: TokenAdminPageState | None = None,
+) -> str:
+    rows: list[str] = []
+    state = state or TokenAdminPageState()
+    action_query = urlencode({
+        "page": str(state.page),
+        "sort": state.sort_key,
+        "order": state.sort_order,
+        **({"search": state.search_query} if state.search_query else {}),
+    })
     for key in keys:
         status = (
             f"Истрачен ({format_datetime(key.exhausted_at or key.activated_at)})"
@@ -1462,7 +2073,7 @@ def render_admin_rows(keys: list[TokenKey], csrf_token: str) -> str:
         <td data-sort-value='{html.escape(key.api_key, quote=True)}' class='copyable-api-key' data-copy-api-key='{html.escape(key.api_key, quote=True)}' role='button' tabindex='0' title='Нажмите, чтобы скопировать API key' aria-label='Скопировать API key'><code class='api-preview'>{html.escape(key.api_key)}</code></td><td data-sort-value='{key.token_limit}'>{format_tokens(key.token_limit)}</td>
         <td data-sort-value='{key.used_tokens}'>{format_tokens(key.used_tokens)}<br><span class='hint'>ост. {format_tokens(key.remaining_tokens)}</span></td><td data-sort-value='{html.escape(status, quote=True)}'>{status}</td>
         <td data-sort-value='Управление'><div class='management-actions'><button type='button' class='secondary' data-edit='row'>Управлять</button>
-        <form method='post' action='/ai/tokens/adm/{key.id}/delete' class='inline-delete-form'>
+        <form method='post' action='/ai/tokens/adm/{key.id}/delete?{html.escape(action_query, quote=True)}' class='inline-delete-form'>
           <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
           <button class='danger' type='submit' onclick="return confirm('Удалить ключ #{key.id}?')">Удалить</button>
         </form></div></td></tr>""")
@@ -1472,7 +2083,7 @@ def render_admin_rows(keys: list[TokenKey], csrf_token: str) -> str:
         )
         rows.append(f"""
         <tr class='edit-row' hidden><td colspan='9'>
-          <form class='edit-form' method='post' action='/ai/tokens/adm/{key.id}/update'>
+          <form class='edit-form' method='post' action='/ai/tokens/adm/{key.id}/update?{html.escape(action_query, quote=True)}'>
             <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
             <h3>Управление ключом #{key.id}</h3>
             <div class='edit-grid'>
@@ -1500,7 +2111,7 @@ def render_layout(title: str, content: str, locale: str = "ru") -> str:
 <title>{html.escape(title)}</title><style>
 :root {{ color-scheme: dark; --bg:#080d16; --card:#111a2a; --line:#27364f; --text:#eaf0ff; --muted:#a9b7ce; --accent:#6d9cff; --danger:#ff7885; --success:#5fd5a0; --warn:#ffd46b; }}
 * {{ box-sizing:border-box; }} body {{ margin:0; background:radial-gradient(circle at top,#182949 0,#080d16 44rem); color:var(--text); font:16px/1.55 Arial,sans-serif; }}
-.page {{ width:min(960px,calc(100% - 32px)); margin:32px auto 64px; }} .page.narrow {{ max-width:520px; }} .admin-page {{ width:min(1320px,calc(100% - 32px)); }}
+.page {{ width:min(960px,calc(100% - 32px)); margin:32px auto 64px; }} .page.narrow {{ max-width:520px; }} .admin-page {{ width:calc(100% - 48px); max-width:1800px; }}
 .card {{ background:rgba(17,26,42,.96); border:1px solid var(--line); border-radius:16px; padding:24px; margin:18px 0; box-shadow:0 12px 36px rgba(0,0,0,.22); }}
 h1,h2,h3 {{ margin:0 0 14px; line-height:1.24; }} h1 {{ font-size:28px; }} h2 {{ font-size:20px; letter-spacing:.02em; }} p {{ margin:9px 0; }}
 label {{ display:block; font-weight:700; margin:14px 0 6px; }} input,select {{ display:block; width:100%; margin-top:6px; padding:12px 13px; border:1px solid var(--line); border-radius:9px; background:#0b1321; color:var(--text); font:inherit; }}
@@ -1508,12 +2119,13 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 .hint {{ color:var(--muted); font-size:14px; }} .warning {{ color:var(--warn); font-weight:700; }} .flash {{ border-radius:9px; padding:11px 13px; margin:12px 0; }} .error {{ color:#ffdce0; background:rgba(255,120,133,.18); border:1px solid rgba(255,120,133,.45); }} .success {{ color:#d8ffec; background:rgba(95,213,160,.15); border:1px solid rgba(95,213,160,.45); }}
 .top-links {{ display:flex; justify-content:space-between; gap:8px; margin:0 0 -4px; }} .top-links a {{ color:var(--text); font-weight:700; text-decoration:none; padding:7px 10px; border:1px solid var(--line); border-radius:7px; }} .top-links a:hover {{ border-color:var(--accent); color:var(--accent); }}
 .details {{ display:grid; grid-template-columns:minmax(210px,auto) 1fr; gap:8px 18px; margin:0; }} .details dt {{ color:var(--muted); }} .details dd {{ margin:0; min-width:0; overflow-wrap:anywhere; }} code,pre {{ font-family:Consolas,'Courier New',monospace; }} .api-key {{ color:#b9d4ff; }}
+.info-actions {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:22px; }} .info-actions button {{ display:inline-flex; justify-content:center; align-items:center; gap:9px; min-height:46px; }} .bonus-button {{ color:#281500; background:linear-gradient(135deg,#ffd46b,#f59e0b); }} .bonus-button:hover,.bonus-button:focus {{ background:linear-gradient(135deg,#ffe191,#fbbf24); }} .bonus-button svg {{ width:20px; height:20px; flex:0 0 auto; }} .bonus-claim {{ margin-top:14px; padding:16px; border:1px solid rgba(245,158,11,.45); border-radius:11px; background:rgba(245,158,11,.09); }} .bonus-claim p {{ margin:0 0 12px; color:#ffe2a2; }} .bonus-claim label {{ margin-top:0; }} .log-download-status {{ min-height:22px; margin:8px 0 0; }} .log-download-status.error {{ color:#ffdce0; }}
 .choice-row {{ display:flex; flex-wrap:wrap; gap:8px; margin:14px 0; }} .instruction-apps .choice[hidden] {{ display:none; }} .instruction-card {{ margin-top:18px; }} .choice {{ color:var(--text); background:#1b2940; border:1px solid var(--line); }} .choice.active {{ color:#08101e; background:var(--accent); border-color:var(--accent); }} .selected-line {{ padding:12px; margin:16px 0; border-left:3px solid var(--accent); background:#0b1321; }} ol {{ padding-left:24px; }} pre {{ max-width:100%; overflow:auto; padding:14px; white-space:pre-wrap; overflow-wrap:anywhere; background:#080e18; border:1px solid var(--line); border-radius:9px; color:#d9e7ff; }}
 .instruction-mode-tabs {{ display:flex; gap:6px; margin:16px 0 10px; border-bottom:1px solid var(--line); }} .instruction-mode {{ color:var(--muted); background:transparent; border-radius:8px 8px 0 0; padding:9px 12px; }} .instruction-mode.active {{ color:var(--text); background:#1b2940; box-shadow:inset 0 -2px 0 var(--accent); }} .instruction-mode-panel {{ padding:2px 0 4px; }} .manual-heading {{ color:var(--text); font-weight:700; }} .manual-downloads {{ display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 14px; }} .download-file {{ color:var(--text); background:#1b2940; border:1px solid var(--line); border-radius:8px; padding:8px 11px; font-size:14px; font-weight:700; text-decoration:none; }} .download-file:hover,.download-file:focus {{ border-color:var(--accent); color:var(--accent); }} .manual-note {{ margin:8px 0 14px; color:var(--muted); line-height:1.55; }} .remove-integration {{ margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:10px; background:#0b1321; }} .remove-integration summary,.faq-item summary {{ cursor:pointer; padding:12px 14px; font-weight:700; }} .remove-integration pre {{ margin:0 12px 12px; }} .remove-integration {{ border-color:rgba(255,120,133,.42); background:rgba(255,120,133,.07); }} .remove-integration summary {{ color:#ffdce0; }} .remove-integration .hint,.remove-integration button {{ margin-left:12px; margin-right:12px; }} .remove-integration button {{ margin-bottom:12px; }}
 .faq {{ scroll-margin-top:24px; }} .faq-items {{ border-top:1px solid var(--line); }} .faq-item {{ display:block; border-bottom:1px solid var(--line); }} .faq-item summary {{ list-style:none; padding-right:38px; position:relative; }} .faq-item summary::-webkit-details-marker {{ display:none; }} .faq-item summary::after {{ content:'+'; position:absolute; right:14px; color:var(--accent); font-size:20px; line-height:1; }} .faq-item[open] summary::after {{ content:'−'; }} .faq-item p {{ color:var(--muted); padding:0 14px 14px; margin:0; }}
 .title-row {{ display:flex; justify-content:space-between; gap:16px; align-items:start; }} .title-row form {{ margin:0; }} .create-form,.edit-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); column-gap:18px; }} .create-form .wide {{ grid-column:1 / -1; }}
-.table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} th[data-sort],th[data-group-service] {{ cursor:pointer; user-select:none; }} th[data-sort]:hover,th[data-group-service]:hover,th.grouped {{ color:var(--accent); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .service-group-toggle {{ color:var(--text); background:transparent; padding:0; font-size:16px; }} .service-group-toggle:hover,.service-group-toggle:focus {{ color:var(--accent); }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-row>td {{ padding:0 8px 14px; border-bottom:1px solid var(--line); }} .edit-form {{ margin:0; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
-@media(max-width:650px) {{ .page,.admin-page {{ width:min(100% - 20px,960px); margin-top:12px; }} .card {{ padding:18px; border-radius:12px; }} h1 {{ font-size:24px; }} .details,.create-form,.edit-grid {{ grid-template-columns:1fr; }} .title-row {{ display:block; }} .title-row form {{ margin-top:12px; }} }}
+.table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} .promos-table {{ min-width:640px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} .sort-link,.service-group-header {{ color:inherit; font:inherit; font-weight:700; text-align:left; text-decoration:none; }} .sort-link:hover,.sort-link:focus,.service-group-header:hover,.service-group-header:focus,th[data-group-service].grouped {{ color:var(--accent); }} th[data-group-service] {{ cursor:pointer; user-select:none; }} .service-group-header {{ padding:0; background:transparent; border-radius:0; }} .keys-search-form {{ margin:14px 0 18px; }} .keys-search-form label {{ margin-top:0; }} .keys-search-controls {{ display:flex; gap:9px; align-items:end; }} .keys-search-controls input {{ margin-top:0; min-width:0; flex:1 1 auto; }} .keys-search-controls .secondary,.reset-search {{ white-space:nowrap; }} .reset-search {{ display:inline-flex; align-items:center; justify-content:center; min-height:46px; text-decoration:none; }} .pagination {{ display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; margin-top:18px; }} .pagination-summary {{ margin:0; color:var(--muted); }} .pagination-links {{ display:flex; flex-wrap:wrap; gap:6px; align-items:center; }} .page-link {{ display:inline-flex; align-items:center; justify-content:center; min-width:38px; min-height:36px; padding:7px 10px; border-radius:8px; color:var(--text); background:#263652; font-weight:700; text-decoration:none; }} .page-link:hover,.page-link:focus {{ color:#08101e; background:var(--accent); }} .page-link.current {{ color:#08101e; background:var(--accent); cursor:default; }} .page-link.disabled {{ color:var(--muted); opacity:.55; cursor:not-allowed; }} .page-ellipsis {{ padding:0 3px; color:var(--muted); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .service-group-toggle {{ color:var(--text); background:transparent; padding:0; font-size:16px; }} .service-group-toggle:hover,.service-group-toggle:focus {{ color:var(--accent); }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-row>td {{ padding:0 8px 14px; border-bottom:1px solid var(--line); }} .edit-form {{ margin:0; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
+@media(max-width:650px) {{ .page,.admin-page {{ width:min(100% - 20px,960px); margin-top:12px; }} .card {{ padding:18px; border-radius:12px; }} h1 {{ font-size:24px; }} .details,.create-form,.edit-grid,.info-actions {{ grid-template-columns:1fr; }} .title-row {{ display:block; }} .title-row form {{ margin-top:12px; }} .keys-search-controls {{ flex-wrap:wrap; }} .keys-search-controls input {{ flex-basis:100%; }} .pagination {{ align-items:start; flex-direction:column; }} }}
 </style></head><body>{content}<script>
 (function() {{
   var root=document.querySelector('.instructions');
@@ -1541,40 +2153,60 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
   document.querySelectorAll('.copy-instruction').forEach(function(button) {{ button.addEventListener('click',function() {{ var target=document.getElementById(button.dataset.copyTarget); if(!target) return; navigator.clipboard.writeText(target.textContent).then(function() {{ button.textContent=button.dataset.copiedLabel; setTimeout(function() {{ button.textContent=button.dataset.copyLabel; }},1500); }}); }}); }});
   var balance=document.getElementById('token-balance');
   if(balance) fetch('/ai/tokens/balance',{{cache:'no-store'}}).then(function(response) {{ return response.ok ? response.json() : Promise.reject(); }}).then(function(data) {{ if(data.ok) balance.textContent=data.formatted+' '+(balance.dataset.separator||'/')+' '+data.token_limit_formatted; }}).catch(function() {{ /* Keep the locally saved balance visible. */ }});
+  var bonusButton=document.getElementById('get-bonus'), bonusClaim=document.getElementById('bonus-claim');
+  if(bonusButton&&bonusClaim) bonusButton.addEventListener('click',function() {{ bonusClaim.hidden=!bonusClaim.hidden; if(!bonusClaim.hidden) {{ var promoInput=document.getElementById('promo-code'); if(promoInput) promoInput.focus(); }} }});
+  var downloadLogs=document.getElementById('download-logs'), logDownloadStatus=document.getElementById('log-download-status');
+  if(downloadLogs) downloadLogs.addEventListener('click',async function() {{
+    var label=downloadLogs.dataset.label||downloadLogs.textContent, loadingLabel=downloadLogs.dataset.loadingLabel||label, errorLabel=downloadLogs.dataset.errorLabel||'Download failed.';
+    downloadLogs.disabled=true; downloadLogs.textContent=loadingLabel; if(logDownloadStatus) {{ logDownloadStatus.textContent=''; logDownloadStatus.classList.remove('error'); }}
+    try {{
+      var csrfCookie=document.cookie.split('; ').find(function(item) {{ return item.indexOf('XSRF-TOKEN=')===0 || item.indexOf('csrf_token=')===0; }}), csrfToken=csrfCookie ? decodeURIComponent(csrfCookie.slice(csrfCookie.indexOf('=')+1)) : '';
+      var headers={{'Accept':'*/*','Content-Type':'application/json'}}; if(csrfToken) headers['X-CSRF-Token']=csrfToken;
+      var response=await fetch('/ai/common/api/portal/reseller/logs/export',{{method:'POST',headers:headers,body:JSON.stringify({{api_key:downloadLogs.dataset.apiKey||''}}),credentials:'include'}});
+      if(!response.ok) throw new Error('logs export failed');
+      var blob=await response.blob(), disposition=response.headers.get('Content-Disposition')||'', match=/filename\\*?=(?:UTF-8''|"?)([^;"\\n]+)/i.exec(disposition), filename=match?decodeURIComponent(match[1]):'logs.json';
+      var objectUrl=URL.createObjectURL(blob), link=document.createElement('a'); link.href=objectUrl; link.download=filename; document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(objectUrl);
+    }} catch(error) {{ if(logDownloadStatus) {{ logDownloadStatus.textContent=errorLabel; logDownloadStatus.classList.add('error'); }} }} finally {{ downloadLogs.disabled=false; downloadLogs.textContent=label; }}
+  }});
   function copyApiKey(cell) {{ var value=cell.dataset.copyApiKey; if(!value) return; navigator.clipboard.writeText(value).then(function() {{ var old=cell.title; cell.title='API key скопирован'; setTimeout(function() {{ cell.title=old; }},1500); }}); }}
   document.querySelectorAll('.copyable-api-key').forEach(function(cell) {{ cell.addEventListener('click',function() {{ copyApiKey(cell); }}); cell.addEventListener('keydown',function(event) {{ if(event.key==='Enter'||event.key===' ') {{ event.preventDefault(); copyApiKey(cell); }} }}); }});
-  var createdKeys=document.querySelector('.created-keys'), copyCreated=document.getElementById('copy-created-keys');
-  if(createdKeys&&copyCreated) copyCreated.addEventListener('click',function() {{ navigator.clipboard.writeText(createdKeys.dataset.createdKeys||'').then(function() {{ var old=copyCreated.textContent; copyCreated.textContent='Скопировано'; setTimeout(function() {{ copyCreated.textContent=old; }},1500); }}); }});
+  document.querySelectorAll('.copy-created-codes').forEach(function(container) {{ var button=container.querySelector('.copy-created-codes-button'); if(!button) return; button.addEventListener('click',function() {{ navigator.clipboard.writeText(container.dataset.createdCodes||'').then(function() {{ var old=button.textContent; button.textContent='Скопировано'; setTimeout(function() {{ button.textContent=old; }},1500); }}); }}); }});
   var keyTable=document.getElementById('keys-table'), tableWrap=document.getElementById('keys-table-wrap'), groups=document.getElementById('keys-table-groups');
   if(keyTable&&tableWrap&&groups) {{
-    var body=keyTable.tBodies[0], originalRows=Array.prototype.slice.call(body.rows).filter(function(row) {{ return row.dataset.service; }}), editRows=new Map(), sortColumn=-1, sortAscending=true, grouped=false;
+    var body=keyTable.tBodies[0], originalRows=Array.prototype.slice.call(body.rows).filter(function(row) {{ return row.dataset.service; }}), editRows=new Map(), grouped=false;
     originalRows.forEach(function(row) {{ var edit=row.nextElementSibling; if(edit&&edit.classList.contains('edit-row')) editRows.set(row,edit); }});
-    function cellValue(row,index) {{ var cell=row.cells[index]; return cell ? (cell.dataset.sortValue||cell.textContent||'').trim() : ''; }}
     function toggleEdit(button) {{ var row=button.closest('tr'), edit=row&&row.nextElementSibling; if(edit&&edit.classList.contains('edit-row')) edit.hidden=!edit.hidden; }}
-    function sortRows(index) {{
-      if(grouped) return;
-      sortAscending=sortColumn===index ? !sortAscending : true; sortColumn=index;
-      originalRows.sort(function(left,right) {{ var a=cellValue(left,index), b=cellValue(right,index), an=Number(a), bn=Number(b); var result=(!Number.isNaN(an)&&!Number.isNaN(bn)) ? an-bn : a.localeCompare(b,undefined,{{numeric:true,sensitivity:'base'}}); return sortAscending ? result : -result; }});
-      originalRows.forEach(function(row) {{ body.appendChild(row); var edit=editRows.get(row); if(edit) body.appendChild(edit); }});
-    }}
     function toggleGroups() {{
-      grouped=!grouped; keyTable.querySelector('[data-group-service]').classList.toggle('grouped',grouped);
+      grouped=!grouped; var groupHeader=keyTable.querySelector('[data-group-service]'); if(groupHeader) groupHeader.classList.toggle('grouped',grouped);
       if(!grouped) {{ groups.hidden=true; tableWrap.hidden=false; return; }}
-      groups.innerHTML=''; var byService={{}}; originalRows.forEach(function(row) {{ var service=row.dataset.service||''; (byService[service]||(byService[service]=[])).push(row); }});
-      Object.keys(byService).sort(function(a,b) {{ return a.localeCompare(b); }}).forEach(function(service) {{ var section=document.createElement('section'), heading=document.createElement('h3'), toggle=document.createElement('button'), wrap=document.createElement('div'), table=keyTable.cloneNode(false), head=keyTable.tHead.cloneNode(true), newBody=document.createElement('tbody'); section.className='service-group'; toggle.type='button'; toggle.className='service-group-toggle'; toggle.textContent=service; toggle.setAttribute('aria-expanded','true'); toggle.addEventListener('click',function() {{ wrap.hidden=!wrap.hidden; toggle.setAttribute('aria-expanded',String(!wrap.hidden)); }}); heading.appendChild(toggle); wrap.className='table-wrap'; table.removeAttribute('id'); table.appendChild(head); byService[service].forEach(function(row) {{ newBody.appendChild(row.cloneNode(true)); var edit=editRows.get(row); if(edit) newBody.appendChild(edit.cloneNode(true)); }}); table.appendChild(newBody); wrap.appendChild(table); section.appendChild(heading); section.appendChild(wrap); groups.appendChild(section); }});
+      groups.innerHTML=''; var byService={{}};
+      originalRows.forEach(function(row) {{ var service=row.dataset.service||''; (byService[service]||(byService[service]=[])).push(row); }});
+      Object.keys(byService).sort(function(a,b) {{ return a.localeCompare(b); }}).forEach(function(service) {{
+        var section=document.createElement('section'), heading=document.createElement('h3'), toggle=document.createElement('button'), wrap=document.createElement('div'), table=keyTable.cloneNode(false), head=keyTable.tHead.cloneNode(true), newBody=document.createElement('tbody');
+        section.className='service-group'; toggle.type='button'; toggle.className='service-group-toggle'; toggle.textContent=service; toggle.setAttribute('aria-expanded','true');
+        toggle.addEventListener('click',function() {{ wrap.hidden=!wrap.hidden; toggle.setAttribute('aria-expanded',String(!wrap.hidden)); }});
+        heading.appendChild(toggle); wrap.className='table-wrap'; table.removeAttribute('id'); table.appendChild(head);
+        byService[service].forEach(function(row) {{ newBody.appendChild(row.cloneNode(true)); var edit=editRows.get(row); if(edit) newBody.appendChild(edit.cloneNode(true)); }});
+        table.appendChild(newBody); wrap.appendChild(table); section.appendChild(heading); section.appendChild(wrap); groups.appendChild(section);
+      }});
       tableWrap.hidden=true; groups.hidden=false;
     }}
-    keyTable.tHead.rows[0].querySelectorAll('th[data-sort]').forEach(function(header,index) {{ header.addEventListener('click',function() {{ if(header.hasAttribute('data-group-service')) toggleGroups(); else sortRows(index); }}); }});
-    groups.addEventListener('click',function(event) {{ var serviceHeader=event.target.closest('th[data-group-service]'); if(serviceHeader) {{ toggleGroups(); return; }} var apiCell=event.target.closest('.copyable-api-key'); if(apiCell) {{ copyApiKey(apiCell); return; }} var editButton=event.target.closest('[data-edit]'); if(editButton) toggleEdit(editButton); }});
+    function handleTableClick(event) {{
+      var serviceHeader=event.target.closest('[data-group-service]');
+      if(serviceHeader) {{ event.preventDefault(); toggleGroups(); return; }}
+      var apiCell=event.target.closest('.copyable-api-key'); if(apiCell) {{ copyApiKey(apiCell); return; }}
+      var editButton=event.target.closest('[data-edit]'); if(editButton) toggleEdit(editButton);
+    }}
+    keyTable.addEventListener('click',handleTableClick);
+    groups.addEventListener('click',handleTableClick);
   }}
-  document.querySelectorAll('[data-edit]').forEach(function(button) {{ button.addEventListener('click',function() {{ toggleEdit(button); }}); }});
   update();
 }})();
 </script></body></html>"""
 
 
 __all__ = [
-    "CheapVibeCodeClient", "SecondaryKeyClient", "SERVICE_OPTIONS", "StoredTokenKey", "TokenKey", "TokenKeyStore", "TokenKeyStores",
+    "CheapVibeCodeClient", "SecondaryKeyClient", "SERVICE_OPTIONS", "StoredTokenKey", "TokenAdmin", "TokenKey", "TokenKeyStore", "TokenKeyStores",
     "create_token_key_stores", "indexed_token_store_path",
     "create_tokens_routes", "default_instruction_choice", "generate_access_code",
     "instruction_command", "instruction_remove_command", "instruction_steps", "manual_instruction_command", "manual_instruction_note", "manual_download_buttons",

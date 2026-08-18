@@ -16,6 +16,7 @@ legacy_users.json
 user_locales.json
 token_keys.json
 token_keys_*.json
+promo_codes.json
 
 # Virtual environments
 .venv
