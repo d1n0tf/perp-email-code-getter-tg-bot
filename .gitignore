@@ -15,6 +15,7 @@ activated_keys.json
 legacy_users.json
 user_locales.json
 token_keys.json
+token_keys_*.json
 
 # Virtual environments
 .venv

@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     cvc_api_base_url: str = "https://cheapvibecode.ru"
     cvc_api_timeout_seconds: float = 30.0
     tokens_admin_password: str | None = None
+    tokens_admin_passwords: list[str] = []
 
     @field_validator("tg_admins", mode="before")
     @classmethod
@@ -74,6 +75,26 @@ class Settings(BaseSettings):
         if isinstance(value, (list, tuple, set)):
             return [str(item) for item in value]
         raise TypeError("mail_folders must be a list of strings or a comma-separated string")
+
+    @field_validator("tokens_admin_passwords", mode="before")
+    @classmethod
+    def parse_tokens_admin_passwords(cls, value: Any) -> list[str]:
+        """Accept a JSON list or a comma-separated list of admin passwords."""
+        if value in (None, "", []):
+            return []
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return []
+            if stripped.startswith("["):
+                parsed = json.loads(stripped)
+                if not isinstance(parsed, list):
+                    raise TypeError("tokens_admin_passwords must be a list")
+                return [str(item) for item in parsed if str(item)]
+            return [item.strip() for item in stripped.split(",") if item.strip()]
+        if isinstance(value, (list, tuple, set)):
+            return [str(item) for item in value if str(item)]
+        raise TypeError("tokens_admin_passwords must be a list or a comma-separated string")
 
 
 settings = Settings()  # type: ignore[call-arg]

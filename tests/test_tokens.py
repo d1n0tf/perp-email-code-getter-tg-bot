@@ -14,6 +14,8 @@ from src.tokens import (
     SERVICE_OPTIONS,
     TokenKey,
     TokenKeyStore,
+    TokenKeyStores,
+    create_token_key_stores,
     create_tokens_routes,
     default_instruction_choice,
     instruction_command,
@@ -126,6 +128,74 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status_code, 404)
         self.assertIn("\u041a\u043b\u044e\u0447 \u0434\u043e\u0441\u0442\u0443\u043f\u0430 \u043d\u0435 \u0441\u0443\u0449\u0435\u0441\u0442\u0432\u0443\u0435\u0442", response.text)
+
+    async def test_public_activation_finds_code_in_another_owner_store(self) -> None:
+        other_store = TokenKeyStore(Path(self.directory.name) / "token_keys_2.json")
+        other_code = "QRSTUVWXYZABCDEFGHIJ"
+        await other_store.add_many([
+            TokenKey(
+                id=1,
+                created_at=utc_now(),
+                access_code=other_code,
+                api_key="sk-owner-two",
+                service="Grok",
+                name="Owner two key",
+                token_limit=2_000_000,
+            )
+        ])
+        app = FastAPI()
+        create_tokens_routes(
+            app,
+            stores=TokenKeyStores([self.store, other_store]),
+            key_client=self.key_client,
+            admin_passwords=["first", "second"],
+        )
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://testserver") as client:
+            page = await client.get("/ai/tokens")
+            parser = HiddenInputParser()
+            parser.feed(page.text)
+            response = await client.post(
+                "/ai/tokens",
+                data={"csrf_token": parser.values["csrf_token"], "access_code": other_code},
+                headers={"Cookie": f"tokens_user_csrf={parser.values['csrf_token']}"},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("sk-owner-two", response.text)
+        self.assertIsNone(await self.store.get_by_code(other_code))
+        activated = await other_store.get_by_code(other_code)
+        self.assertIsNotNone(activated)
+        self.assertIsNotNone(activated.activated_at if activated else None)
+
+    async def test_admin_password_sees_only_its_own_store(self) -> None:
+        other_store = TokenKeyStore(Path(self.directory.name) / "token_keys_2.json")
+        await self.store.add_many([
+            TokenKey(1, utc_now(), "ABCDEFGHIJKLMNOPQRST", "sk-first", "Claude", "First", 100)
+        ])
+        await other_store.add_many([
+            TokenKey(1, utc_now(), "QRSTUVWXYZABCDEFGHIJ", "sk-second", "Grok", "Second", 100)
+        ])
+        app = FastAPI()
+        create_tokens_routes(
+            app,
+            stores=TokenKeyStores([self.store, other_store]),
+            key_client=self.key_client,
+            admin_passwords=["first", "second"],
+        )
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="https://testserver") as client:
+            login_page = await client.get("/ai/tokens/adm")
+            parser = HiddenInputParser()
+            parser.feed(login_page.text)
+            login = await client.post(
+                "/ai/tokens/adm/login",
+                data={"csrf_token": parser.values["csrf_token"], "password": "second"},
+                headers={"Cookie": f"tokens_admin_csrf={parser.values['csrf_token']}"},
+                follow_redirects=False,
+            )
+            page = await client.get("/ai/tokens/adm", headers={"Cookie": login.headers["set-cookie"].split(";", 1)[0]})
+
+        self.assertIn("sk-second", page.text)
+        self.assertNotIn("sk-first", page.text)
 
     async def test_public_page_supports_english_locale(self) -> None:
         response = await self.client.get("/ai/tokens?lang=en")
@@ -466,6 +536,20 @@ class TokenInstructionHelpersTestCase(unittest.TestCase):
         self.assertIsNone(trusted_secondary_remaining(500_000, 2_000_000, 500_000))
         self.assertEqual(trusted_secondary_remaining(50_000, 2_000_000, 10_000_000), 50_000)
         self.assertEqual(trusted_secondary_remaining(2_000_000, 2_000_000, 10_000_000), 2_000_000)
+
+
+class TokenStoresConfigurationTestCase(unittest.TestCase):
+    def test_owner_store_paths_are_numbered_and_legacy_store_is_migrated(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            legacy_path = Path(directory) / "token_keys.json"
+            legacy_path.write_text("[]", encoding="utf-8")
+
+            stores = create_token_key_stores(legacy_path, 2)
+
+            self.assertEqual([store.path.name for store in stores], ["token_keys_1.json", "token_keys_2.json"])
+            self.assertFalse(legacy_path.exists())
+            self.assertTrue((Path(directory) / "token_keys_1.json").exists())
+            self.assertTrue((Path(directory) / "token_keys_2.json").exists())
 
 
 if __name__ == "__main__":

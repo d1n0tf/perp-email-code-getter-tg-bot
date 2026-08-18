@@ -169,6 +169,11 @@ class TokenKeyStore:
         temporary.write_text(json.dumps([key.to_dict() for key in keys], ensure_ascii=False, indent=2), encoding="utf-8")
         temporary.replace(self.path)
 
+    def ensure_exists(self) -> None:
+        """Create an empty store without modifying an existing one."""
+        if not self.path.exists():
+            self._write([])
+
     async def list(self) -> list[TokenKey]:
         async with self._lock:
             return sorted(self._read(), key=lambda key: key.id, reverse=True)
@@ -235,6 +240,95 @@ class TokenKeyStore:
                     self._write(keys)
                 return updated
         return None
+
+
+@dataclass(frozen=True, slots=True)
+class StoredTokenKey:
+    """A key together with the private store that owns it.
+
+    Access codes are public and must be searched globally, while numeric IDs
+    are meaningful only inside one owner's separate JSON file.
+    """
+
+    owner_index: int
+    store: TokenKeyStore
+    key: TokenKey
+
+
+class TokenKeyStores:
+    """Coordinate isolated owner stores while keeping the public page global."""
+
+    def __init__(self, stores: list[TokenKeyStore] | tuple[TokenKeyStore, ...]) -> None:
+        self._stores = tuple(stores)
+
+    @property
+    def count(self) -> int:
+        return len(self._stores)
+
+    def for_owner(self, owner_index: int) -> TokenKeyStore | None:
+        if not 1 <= owner_index <= len(self._stores):
+            return None
+        return self._stores[owner_index - 1]
+
+    async def list_all(self) -> list[StoredTokenKey]:
+        groups = await asyncio.gather(*(store.list() for store in self._stores))
+        return [
+            StoredTokenKey(owner_index=index, store=self._stores[index - 1], key=key)
+            for index, keys in enumerate(groups, start=1)
+            for key in keys
+        ]
+
+    async def find_by_code(self, code: str) -> StoredTokenKey | None:
+        normalized = normalize_access_code(code)
+        if not normalized:
+            return None
+        for owner_index, store in enumerate(self._stores, start=1):
+            key = await store.get_by_code(normalized)
+            if key is not None:
+                return StoredTokenKey(owner_index=owner_index, store=store, key=key)
+        return None
+
+    async def activate(self, code: str) -> StoredTokenKey | None:
+        normalized = normalize_access_code(code)
+        if not normalized:
+            return None
+        for owner_index, store in enumerate(self._stores, start=1):
+            key = await store.activate(normalized)
+            if key is not None:
+                return StoredTokenKey(owner_index=owner_index, store=store, key=key)
+        return None
+
+
+def indexed_token_store_path(base_path: Path, owner_index: int) -> Path:
+    """Return the predictable, human-maintainable store path for an owner."""
+    if owner_index < 1:
+        raise ValueError("Owner indexes start at 1.")
+    return base_path.with_name(f"{base_path.stem}_{owner_index}{base_path.suffix}")
+
+
+def create_token_key_stores(base_path: Path, owner_count: int) -> list[TokenKeyStore]:
+    """Build one store per configured password and migrate the old lone file.
+
+    `token_keys.json` was used before per-password stores existed.  On the
+    first upgrade it is moved, not copied, to `token_keys_1.json`, so existing
+    access codes remain available and are not duplicated.  The numbered file
+    names intentionally follow password order and can be renamed manually if
+    that order is changed later.
+    """
+    if owner_count < 0:
+        raise ValueError("Owner count cannot be negative.")
+    paths = [indexed_token_store_path(base_path, index) for index in range(1, owner_count + 1)]
+    if paths and base_path.exists():
+        if paths[0].exists():
+            raise RuntimeError(
+                f"Both legacy store {base_path} and owner store {paths[0]} exist. "
+                "Move or merge the legacy file before starting the service."
+            )
+        base_path.replace(paths[0])
+    stores = [TokenKeyStore(path) for path in paths]
+    for store in stores:
+        store.ensure_exists()
+    return stores
 
 
 def used_tokens_from_remaining(token_limit: int, remaining: int) -> int:
@@ -360,14 +454,41 @@ def attach_csrf(response: HTMLResponse, token: str, cookie_name: str, path: str)
 def create_tokens_routes(
     app: FastAPI,
     *,
-    store: TokenKeyStore,
     key_client: SecondaryKeyClient,
-    admin_password: str | None,
+    stores: TokenKeyStores | list[TokenKeyStore] | tuple[TokenKeyStore, ...] | None = None,
+    admin_passwords: list[str] | tuple[str, ...] | None = None,
+    # Kept temporarily for callers that still use the single-admin API.
+    store: TokenKeyStore | None = None,
+    admin_password: str | None = None,
 ) -> None:
-    """Register the public secondary-key page and its password-protected admin page."""
-    app.state.token_key_store = store
+    """Register the public secondary-key page and its password-protected admin page.
+
+    Every configured password owns one isolated store.  The public page does
+    not disclose this split: it resolves an access code across every store.
+    """
+    if stores is None:
+        if store is None:
+            raise ValueError("At least one token key store must be configured.")
+        token_stores = TokenKeyStores([store])
+    elif isinstance(stores, TokenKeyStores):
+        token_stores = stores
+    else:
+        token_stores = TokenKeyStores(stores)
+    if token_stores.count < 1:
+        raise ValueError("At least one token key store must be configured.")
+
+    configured_passwords = tuple(password for password in (admin_passwords or ()) if password)
+    if not configured_passwords and admin_password:
+        configured_passwords = (admin_password,)
+    if len(set(configured_passwords)) != len(configured_passwords):
+        raise ValueError("Tokens admin passwords must be unique.")
+    if len(configured_passwords) > token_stores.count:
+        raise ValueError("Every configured admin password needs its own token key store.")
+
+    app.state.token_key_store = token_stores.for_owner(1)
+    app.state.token_key_stores = token_stores
     app.state.secondary_key_client = key_client
-    admin_sessions: set[str] = set()
+    admin_sessions: dict[str, int] = {}
     creation_lock = asyncio.Lock()
 
     def user_response(
@@ -391,9 +512,13 @@ def create_tokens_routes(
         response.status_code = status_code
         return attach_csrf(response, csrf_token, TOKENS_USER_CSRF_COOKIE, "/ai/tokens")
 
-    def is_admin(request: Request) -> bool:
+    def admin_owner(request: Request) -> int | None:
         session = request.cookies.get(TOKENS_ADMIN_COOKIE, "")
-        return bool(session and session in admin_sessions)
+        owner_index = admin_sessions.get(session)
+        return owner_index if owner_index is not None and token_stores.for_owner(owner_index) is not None else None
+
+    def is_admin(request: Request) -> bool:
+        return admin_owner(request) is not None
 
     async def read_primary_remaining() -> int | None:
         try:
@@ -403,6 +528,7 @@ def create_tokens_routes(
 
     async def refresh_stored_balance(
         key: TokenKey,
+        key_store: TokenKeyStore,
         primary_remaining: int | None = None,
     ) -> TokenKey:
         try:
@@ -412,15 +538,15 @@ def create_tokens_routes(
         remaining = trusted_secondary_remaining(reported, key.token_limit, primary_remaining)
         if remaining is None:
             return key
-        updated = await store.apply_remaining(key.id, remaining)
+        updated = await key_store.apply_remaining(key.id, remaining)
         return updated or key
 
-    async def refresh_stored_balances(keys: list[TokenKey]) -> list[TokenKey]:
+    async def refresh_stored_balances(keys: list[TokenKey], key_store: TokenKeyStore) -> list[TokenKey]:
         if not keys:
             return keys
         primary_remaining = await read_primary_remaining()
         refreshed = await asyncio.gather(
-            *(refresh_stored_balance(key, primary_remaining) for key in keys)
+            *(refresh_stored_balance(key, key_store, primary_remaining) for key in keys)
         )
         return sorted(refreshed, key=lambda key: key.id, reverse=True)
 
@@ -433,12 +559,14 @@ def create_tokens_routes(
         created_access_codes: list[str] | None = None,
     ) -> HTMLResponse:
         csrf_token = secrets.token_urlsafe(32)
-        authenticated = is_admin(request)
-        keys = await refresh_stored_balances(await store.list()) if authenticated else []
+        owner_index = admin_owner(request)
+        owner_store = token_stores.for_owner(owner_index) if owner_index is not None else None
+        authenticated = owner_store is not None
+        keys = await refresh_stored_balances(await owner_store.list(), owner_store) if owner_store else []
         response = render_tokens_admin(
             csrf_token=csrf_token,
             authenticated=authenticated,
-            password_configured=bool(admin_password),
+            password_configured=bool(configured_passwords),
             keys=keys,
             error=error,
             notice=notice,
@@ -450,9 +578,10 @@ def create_tokens_routes(
     async def page(request: Request) -> HTMLResponse:
         locale = token_locale(request.query_params.get("lang"))
         access_code = request.cookies.get(TOKENS_ACCESS_COOKIE, "")
-        key = await store.get_by_code(access_code) if access_code else None
-        if key is not None:
-            key = await refresh_stored_balance(key, await read_primary_remaining())
+        found = await token_stores.find_by_code(access_code) if access_code else None
+        key = found.key if found is not None else None
+        if found is not None:
+            key = await refresh_stored_balance(key, found.store, await read_primary_remaining())
         error = exhausted_message(key, locale) if key is not None and key.is_exhausted else ""
         return user_response(locale=locale, key=key, error=error)
 
@@ -464,10 +593,10 @@ def create_tokens_routes(
         access_code = normalize_access_code(form.get("access_code", ""))
         if not access_code:
             return user_response(locale=locale, error=TOKEN_TEXT[locale]["required"], status_code=400)
-        key = await store.activate(access_code)
-        if key is None:
+        found = await token_stores.activate(access_code)
+        if found is None:
             return user_response(locale=locale, error=TOKEN_TEXT[locale]["missing"], submitted_code=access_code, status_code=404)
-        key = await refresh_stored_balance(key, await read_primary_remaining())
+        key = await refresh_stored_balance(found.key, found.store, await read_primary_remaining())
         if key.is_exhausted:
             response = user_response(locale=locale, key=key, error=exhausted_message(key, locale), submitted_code=access_code)
         else:
@@ -480,9 +609,10 @@ def create_tokens_routes(
 
     async def balance(request: Request) -> JSONResponse:
         access_code = request.cookies.get(TOKENS_ACCESS_COOKIE, "")
-        key = await store.get_by_code(access_code) if access_code else None
-        if key is None:
+        found = await token_stores.find_by_code(access_code) if access_code else None
+        if found is None:
             return JSONResponse({"ok": False, "error": "access_key_missing"}, status_code=401, headers={"Cache-Control": "no-store"})
+        key = found.key
         try:
             reported = await key_client.get_token_balance(api_key=key.api_key)
         except RuntimeError:
@@ -492,7 +622,7 @@ def create_tokens_routes(
         )
         if remaining is None:
             return JSONResponse({"ok": False, "error": "balance_unavailable"}, status_code=502, headers={"Cache-Control": "no-store"})
-        updated = await store.apply_remaining(key.id, remaining)
+        updated = await found.store.apply_remaining(key.id, remaining)
         key = updated or key
         return JSONResponse(
             {
@@ -514,21 +644,29 @@ def create_tokens_routes(
         form = await read_form(request)
         if not valid_csrf(request, form, TOKENS_ADMIN_CSRF_COOKIE):
             return RedirectResponse(url="/ai/tokens/adm", status_code=303)
-        if not admin_password:
+        if not configured_passwords:
             return await admin_response(
                 request,
-                error="Админ-панель недоступна: задайте TOKENS_ADMIN_PASSWORD в .env.",
+                error="Админ-панель недоступна: задайте TOKENS_ADMIN_PASSWORDS в .env.",
                 status_code=503,
             )
         supplied = form.get("password", "")
-        if not secrets.compare_digest(supplied, admin_password):
+        owner_index = next(
+            (
+                index
+                for index, password in enumerate(configured_passwords, start=1)
+                if secrets.compare_digest(supplied, password)
+            ),
+            None,
+        )
+        if owner_index is None:
             return await admin_response(
                 request,
                 error="Неверный пароль.",
                 status_code=401,
             )
         session = secrets.token_urlsafe(32)
-        admin_sessions.add(session)
+        admin_sessions[session] = owner_index
         response = RedirectResponse(url="/ai/tokens/adm", status_code=303)
         response.headers["Cache-Control"] = "no-store"
         response.set_cookie(
@@ -547,14 +685,16 @@ def create_tokens_routes(
         if not valid_csrf(request, form, TOKENS_ADMIN_CSRF_COOKIE):
             return RedirectResponse(url="/ai/tokens/adm", status_code=303)
         session = request.cookies.get(TOKENS_ADMIN_COOKIE, "")
-        admin_sessions.discard(session)
+        admin_sessions.pop(session, None)
         response = await admin_response(request, notice="Вы вышли из админ-панели.")
         response.delete_cookie(TOKENS_ADMIN_COOKIE, path="/ai/tokens/adm")
         return response
 
     async def admin_create(request: Request) -> HTMLResponse:
         form = await read_form(request)
-        if not is_admin(request):
+        owner_index = admin_owner(request)
+        owner_store = token_stores.for_owner(owner_index) if owner_index is not None else None
+        if owner_store is None:
             return await admin_response(request, error="Сессия администратора завершена.", status_code=401)
         if not valid_csrf(request, form, TOKENS_ADMIN_CSRF_COOKIE):
             return RedirectResponse(url="/ai/tokens/adm", status_code=303)
@@ -571,8 +711,9 @@ def create_tokens_routes(
         if quantity is None or not 1 <= quantity <= 100:
             return await admin_response(request, error="Количество ключей должно быть от 1 до 100.", status_code=400)
         async with creation_lock:
-            existing = await store.list()
-            existing_codes = {key.access_code for key in existing}
+            existing = await owner_store.list()
+            all_stored_keys = await token_stores.list_all()
+            existing_codes = {stored.key.access_code for stored in all_stored_keys}
             next_id = max((key.id for key in existing), default=0) + 1
             records: list[TokenKey] = []
             try:
@@ -594,7 +735,7 @@ def create_tokens_routes(
                 # administrator. Otherwise a later failed request would leave
                 # a paid external key with no local access code to manage.
                 if records:
-                    await store.add_many(records)
+                    await owner_store.add_many(records)
                     return await admin_response(
                         request,
                         error=(
@@ -609,7 +750,7 @@ def create_tokens_routes(
                     error=f"Ключи не созданы: {str(exc)}",
                     status_code=502,
                 )
-            await store.add_many(records)
+            await owner_store.add_many(records)
         return await admin_response(
             request,
             notice=f"Создано ключей: {len(records)}.",
@@ -618,27 +759,32 @@ def create_tokens_routes(
 
     async def admin_update(request: Request, key_id: int) -> HTMLResponse:
         form = await read_form(request)
-        if not is_admin(request):
+        owner_index = admin_owner(request)
+        owner_store = token_stores.for_owner(owner_index) if owner_index is not None else None
+        if owner_store is None:
             return await admin_response(request, error="Сессия администратора завершена.", status_code=401)
         if not valid_csrf(request, form, TOKENS_ADMIN_CSRF_COOKIE):
             return RedirectResponse(url="/ai/tokens/adm", status_code=303)
-        current = await store.get(key_id)
+        current = await owner_store.get(key_id)
         if current is None:
             return await admin_response(request, error="Ключ не найден.", status_code=404)
         try:
-            updated = record_from_admin_form(form, current, await store.list())
+            all_keys = [stored.key for stored in await token_stores.list_all()]
+            updated = record_from_admin_form(form, current, all_keys)
         except ValueError as exc:
             return await admin_response(request, error=str(exc), status_code=400)
-        await store.update(key_id, updated)
+        await owner_store.update(key_id, updated)
         return await admin_response(request, notice=f"Ключ #{key_id} обновлен.")
 
     async def admin_delete(request: Request, key_id: int) -> HTMLResponse:
         form = await read_form(request)
-        if not is_admin(request):
+        owner_index = admin_owner(request)
+        owner_store = token_stores.for_owner(owner_index) if owner_index is not None else None
+        if owner_store is None:
             return await admin_response(request, error="Сессия администратора завершена.", status_code=401)
         if not valid_csrf(request, form, TOKENS_ADMIN_CSRF_COOKIE):
             return RedirectResponse(url="/ai/tokens/adm", status_code=303)
-        if not await store.delete(key_id):
+        if not await owner_store.delete(key_id):
             return await admin_response(request, error="Ключ не найден.", status_code=404)
         return await admin_response(request, notice=f"Ключ #{key_id} удален.")
 
@@ -1253,7 +1399,7 @@ def render_tokens_admin(
     elif notice:
         flash = f"<div class='flash success'>{html.escape(notice)}</div>"
     if not authenticated:
-        unavailable = "" if password_configured else "<p class='warning'>TOKENS_ADMIN_PASSWORD не задан в .env. Вход отключен.</p>"
+        unavailable = "" if password_configured else "<p class='warning'>TOKENS_ADMIN_PASSWORDS не задан в .env. Вход отключен.</p>"
         content = f"""
         <main class='page narrow'><section class='card'>
           <h1>СОЗДАНИЯ КЛЮЧЕЙ</h1>
@@ -1428,11 +1574,9 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 
 
 __all__ = [
-    "CheapVibeCodeClient", "SecondaryKeyClient", "SERVICE_OPTIONS", "TokenKey", "TokenKeyStore",
+    "CheapVibeCodeClient", "SecondaryKeyClient", "SERVICE_OPTIONS", "StoredTokenKey", "TokenKey", "TokenKeyStore", "TokenKeyStores",
+    "create_token_key_stores", "indexed_token_store_path",
     "create_tokens_routes", "default_instruction_choice", "generate_access_code",
     "instruction_command", "instruction_remove_command", "instruction_steps", "manual_instruction_command", "manual_instruction_note", "manual_download_buttons",
     "normalize_access_code", "trusted_secondary_remaining", "used_tokens_from_remaining",
 ]
-
-
-
