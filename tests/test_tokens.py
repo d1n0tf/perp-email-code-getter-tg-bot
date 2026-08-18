@@ -166,6 +166,8 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Скачать логи", response.text)
         self.assertIn("/ai/common/api/portal/reseller/logs/export", response.text)
         self.assertIn("sk-cvc-log-export", response.text)
+        self.assertIn("'Authorization':'Bearer '+apiKey", response.text)
+        self.assertIn("credentials:'same-origin'", response.text)
         self.assertNotIn("cheapvibecode.ru/api/portal/reseller/logs/export", response.text)
 
     async def test_bonus_promo_credits_owner_key_once(self) -> None:

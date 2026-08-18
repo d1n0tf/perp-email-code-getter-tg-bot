@@ -1,4 +1,4 @@
-"""Secondary API key activation and administration service."""
+﻿"""Secondary API key activation and administration service."""
 from __future__ import annotations
 
 import asyncio
@@ -681,7 +681,7 @@ class CheapVibeCodeClient:
                 async with session.post(
                     f"{self.base_url}/v1/keys/edit",
                     headers={"Authorization": f"Bearer {self.primary_key}", "Content-Type": "application/json"},
-                    json={"key": api_key, "additional_tokens": additional_tokens, "active": False},
+                    json={"key": api_key, "additional_tokens": additional_tokens, "active": True},
                 ) as response:
                     status, raw = response.status, await response.text()
         except (aiohttp.ClientError, TimeoutError) as exc:
@@ -2183,9 +2183,14 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
     var label=downloadLogs.dataset.label||downloadLogs.textContent, loadingLabel=downloadLogs.dataset.loadingLabel||label, errorLabel=downloadLogs.dataset.errorLabel||'Download failed.';
     downloadLogs.disabled=true; downloadLogs.textContent=loadingLabel; if(logDownloadStatus) {{ logDownloadStatus.textContent=''; logDownloadStatus.classList.remove('error'); }}
     try {{
-      var csrfCookie=document.cookie.split('; ').find(function(item) {{ return item.indexOf('XSRF-TOKEN=')===0 || item.indexOf('csrf_token=')===0; }}), csrfToken=csrfCookie ? decodeURIComponent(csrfCookie.slice(csrfCookie.indexOf('=')+1)) : '';
-      var headers={{'Accept':'*/*','Content-Type':'application/json'}}; if(csrfToken) headers['X-CSRF-Token']=csrfToken;
-      var response=await fetch('/ai/common/api/portal/reseller/logs/export',{{method:'POST',headers:headers,body:JSON.stringify({{api_key:downloadLogs.dataset.apiKey||''}}),credentials:'include'}});
+      var apiKey=downloadLogs.dataset.apiKey||'';
+      if(!apiKey) throw new Error('missing API key');
+      // The browser is on starimg.ru, so it cannot possess the upstream
+      // portal-session cookie from ru.cheapvibecode.ru. Authenticate the
+      // proxy request with the activated secondary key instead; nginx passes
+      // this standard header through to the upstream service.
+      var headers={{'Accept':'*/*','Content-Type':'application/json','Authorization':'Bearer '+apiKey}};
+      var response=await fetch('/ai/common/api/portal/reseller/logs/export',{{method:'POST',headers:headers,body:JSON.stringify({{api_key:apiKey}}),credentials:'same-origin'}});
       if(!response.ok) throw new Error('logs export failed');
       var blob=await response.blob(), disposition=response.headers.get('Content-Disposition')||'', match=/filename\\*?=(?:UTF-8''|"?)([^;"\\n]+)/i.exec(disposition), filename=match?decodeURIComponent(match[1]):'logs.json';
       var objectUrl=URL.createObjectURL(blob), link=document.createElement('a'); link.href=objectUrl; link.download=filename; document.body.appendChild(link); link.click(); link.remove(); URL.revokeObjectURL(objectUrl);
