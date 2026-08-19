@@ -506,6 +506,22 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/ai/tokens?lang=ru", response.text)
         self.assertIn("name='lang' value='en'", response.text)
 
+    async def test_public_page_prefills_access_key_from_link(self) -> None:
+        access_code = "abcdefghijklmnopqrst"
+
+        response = await self.client.get(f"/ai/tokens?key={access_code}")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("name='access_code' value='ABCDEFGHIJKLMNOPQRST'", response.text)
+        # The language switch must retain the ready-to-activate key too.
+        self.assertIn("/ai/tokens?lang=en&amp;key=ABCDEFGHIJKLMNOPQRST", response.text)
+
+    async def test_public_page_accepts_form_field_name_in_access_key_link(self) -> None:
+        response = await self.client.get("/ai/tokens?access_code=ABCDEFGHIJKLMNOPQRST")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("name='access_code' value='ABCDEFGHIJKLMNOPQRST'", response.text)
+
     async def test_balance_endpoint_uses_activated_key_api_key(self) -> None:
         access_code = "ABCDEFGHIJKLMNOPQRST"
         await self.store.add_many([
@@ -532,6 +548,34 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.key_client.balance_calls, ["sk-cvc-balance-test"])
         stored = await self.store.get_by_code(access_code)
         self.assertIsNotNone(stored)
+        self.assertEqual(stored.used_tokens if stored else None, 765_433)
+
+    async def test_balance_endpoint_keeps_saved_secondary_balance_when_upstream_returns_primary_total(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(
+                id=1,
+                created_at=utc_now(),
+                access_code=access_code,
+                api_key="sk-cvc-primary-total",
+                service="Claude",
+                name="Key",
+                token_limit=2_000_000,
+                used_tokens=765_433,
+            )
+        ])
+        self.key_client.balance_value = 50_000_000
+        self.key_client.primary_balance_value = 50_000_000
+
+        response = await self.client.get(
+            "/ai/tokens/balance",
+            headers={"Cookie": f"tokens_access_key={access_code}"},
+        )
+
+        stored = await self.store.get_by_code(access_code)
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["token_balance"], 1_234_567)
+        self.assertEqual(response.json()["used_tokens"], 765_433)
         self.assertEqual(stored.used_tokens if stored else None, 765_433)
 
     async def test_admin_creates_secondary_access_keys(self) -> None:
@@ -564,6 +608,15 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({key.api_key for key in keys}, {"sk-test-1", "sk-test-2"})
         self.assertTrue(all(len(key.access_code) == 20 and key.access_code.isalnum() for key in keys))
         self.assertIn("value='Grok'", response.text)
+        for key in keys:
+            self.assertIn(
+                f"https://starimg.ru/ai/tokens?key={key.access_code}",
+                response.text,
+            )
+        self.assertNotIn(
+            "data-created-codes='" + "\n".join(key.access_code for key in keys) + "'",
+            response.text,
+        )
 
     async def test_admin_freezes_and_unfreezes_key_with_its_owner_client(self) -> None:
         await self.store.add_many([

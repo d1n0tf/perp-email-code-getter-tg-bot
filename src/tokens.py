@@ -787,7 +787,13 @@ class CheapVibeCodeClient:
         except (aiohttp.ClientError, TimeoutError) as exc:
             raise RuntimeError("Could not connect to the balance service.") from exc
         if status >= 400:
-            raise RuntimeError("The balance service rejected the request.")
+            try:
+                payload = json.loads(raw)
+            except json.JSONDecodeError:
+                detail = raw
+            else:
+                detail = payload.get("detail") or payload.get("error") if isinstance(payload, dict) else raw
+            raise KeyServiceError(status, str(detail))
         try:
             payload = json.loads(raw)
             balance = payload.get("token_balance") if isinstance(payload, dict) else None
@@ -1040,13 +1046,19 @@ def create_tokens_routes(
 
     async def page(request: Request) -> HTMLResponse:
         locale = token_locale(request.query_params.get("lang"))
+        # Sellers may hand the buyer a ready-to-use activation URL, e.g.
+        # ``/ai/tokens?key=ABCDEFGHIJKLMNOPQRST``. It only pre-fills the
+        # form; activation still requires an explicit POST protected by CSRF.
+        # ``access_code`` is accepted too, matching the form field name.
+        linked_code = request.query_params.get("key") or request.query_params.get("access_code") or ""
+        submitted_code = normalize_access_code(linked_code)
         access_code = request.cookies.get(TOKENS_ACCESS_COOKIE, "")
         found = await token_stores.find_by_code(access_code) if access_code else None
         key = found.key if found is not None else None
         if found is not None:
             key = await refresh_stored_balance(key, found.store, found.owner_index, await read_primary_remaining(found.owner_index))
         error = exhausted_message(key, locale) if key is not None and key.is_exhausted else ""
-        return user_response(locale=locale, key=key, error=error)
+        return user_response(locale=locale, key=key, error=error, submitted_code=submitted_code)
 
     async def activate(request: Request) -> HTMLResponse:
         form = await read_form(request)
@@ -1078,18 +1090,37 @@ def create_tokens_routes(
         key = found.key
         client = owner_client(found.owner_index)
         if client is None:
+            logger.warning(
+                "Secondary-key balance unavailable: no client (owner=%s, key_id=%s)",
+                found.owner_index,
+                key.id,
+            )
             return JSONResponse({"ok": False, "error": "balance_unavailable"}, status_code=502, headers={"Cache-Control": "no-store"})
         try:
             reported = await client.get_token_balance(api_key=key.api_key)
-        except RuntimeError:
+        except RuntimeError as exc:
+            log_key_state_failure(owner_index=found.owner_index, key_id=key.id, error=exc)
             return JSONResponse({"ok": False, "error": "balance_unavailable"}, status_code=502, headers={"Cache-Control": "no-store"})
         remaining = trusted_secondary_remaining(
             reported, key.token_limit, await read_primary_remaining(found.owner_index)
         )
         if remaining is None:
-            return JSONResponse({"ok": False, "error": "balance_unavailable"}, status_code=502, headers={"Cache-Control": "no-store"})
-        updated = await found.store.apply_remaining(key.id, remaining)
-        key = updated or key
+            # Some upstream accounts return their *primary* balance here for
+            # a secondary key.  That number is not a per-key balance and was
+            # the reason every browser refresh became a 502.  Keep the last
+            # known per-key amount instead: the page remains usable and we
+            # never overwrite a key's usage with the owner's total balance.
+            logger.info(
+                "Ignoring aggregate balance for secondary key (owner=%s, key_id=%s, reported=%s, limit=%s)",
+                found.owner_index,
+                key.id,
+                reported,
+                key.token_limit,
+            )
+            remaining = key.remaining_tokens
+        else:
+            updated = await found.store.apply_remaining(key.id, remaining)
+            key = updated or key
         return JSONResponse(
             {
                 "ok": True,
@@ -1532,9 +1563,12 @@ def render_tokens_page(
     faq = render_faq(locale)
     opposite_locale = "ru" if locale == "en" else "en"
     faq_label = "Help / errors" if locale == "en" else "Ответы на вопросы / ошибки"
+    language_url = f"/ai/tokens?lang={opposite_locale}"
+    if submitted_code:
+        language_url += f"&key={quote(submitted_code, safe='')}"
     content = f"""
     <main class='page'>
-      <nav class='top-links' aria-label='Page links'><a href='#faq'>{html.escape(faq_label)}</a><a href='/ai/tokens?lang={opposite_locale}'>{html.escape(text['switch'])}</a></nav>
+      <nav class='top-links' aria-label='Page links'><a href='#faq'>{html.escape(faq_label)}</a><a href='{html.escape(language_url, quote=True)}'>{html.escape(text['switch'])}</a></nav>
       <section class='card'><h2>{html.escape(text['activation'])}</h2>{flash}
         <form method='post' action='/ai/tokens' class='activation-form'>
           <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><input type='hidden' name='lang' value='{locale}'>
@@ -2097,7 +2131,13 @@ def render_tokens_admin(
     promo_rows = render_admin_promo_rows(promos or [])
     created_access_codes = created_access_codes or []
     created_promo_codes = created_promo_codes or []
-    created_codes = "\n".join(created_access_codes)
+    # Copy ready-to-send activation URLs rather than bare access codes. This
+    # lets a seller paste the result directly to a buyer, while the public
+    # page still performs activation only after the buyer submits the form.
+    created_codes = "\n".join(
+        f"https://starimg.ru/ai/tokens?key={access_code}"
+        for access_code in created_access_codes
+    )
     copy_created_keys = ""
     if created_access_codes:
         copy_created_keys = f"""
