@@ -26,6 +26,10 @@ TOKEN_CODE_ALPHABET = string.ascii_uppercase + string.digits
 PROMO_CODE_ALPHABET = string.ascii_uppercase + string.digits
 logger = logging.getLogger(__name__)
 TOKEN_ADMIN_PAGE_SIZE = 100
+# The upstream allows one balance request per second for a given API key.
+# Allowing a small margin prevents an immediate page render + browser refresh
+# from repeatedly tripping that limit.
+BALANCE_RATE_LIMIT_BACKOFF_SECONDS = (1.05,)
 TOKEN_ADMIN_SORT_KEYS = frozenset({
     "id", "created_at", "access_code", "api_key", "token_limit", "used_tokens", "status",
 })
@@ -774,18 +778,38 @@ class CheapVibeCodeClient:
             raise KeyServiceError(status, str(detail))
 
     async def get_token_balance(self, *, api_key: str) -> int:
-        try:
-            async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                async with session.get(
-                    f"{self.base_url}/v1/balance",
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                ) as response:
-                    status, raw = response.status, await response.text()
-        except (aiohttp.ClientError, TimeoutError) as exc:
-            raise RuntimeError("Could not connect to the balance service.") from exc
+        status = 0
+        raw = ""
+        for attempt in range(len(BALANCE_RATE_LIMIT_BACKOFF_SECONDS) + 1):
+            try:
+                async with aiohttp.ClientSession(timeout=self.timeout) as session:
+                    async with session.get(
+                        f"{self.base_url}/v1/balance",
+                        headers={
+                            "Authorization": f"Bearer {api_key}",
+                            "Content-Type": "application/json",
+                        },
+                    ) as response:
+                        status, raw = response.status, await response.text()
+                        retry_after = response.headers.get("Retry-After", "")
+            except (aiohttp.ClientError, TimeoutError) as exc:
+                raise RuntimeError("Could not connect to the balance service.") from exc
+            if status != 429 or attempt == len(BALANCE_RATE_LIMIT_BACKOFF_SECONDS):
+                break
+            delay = BALANCE_RATE_LIMIT_BACKOFF_SECONDS[attempt]
+            try:
+                # Respect an explicit upstream cooldown, but retain a small
+                # safety margin for its documented one-request-per-second cap.
+                delay = max(delay, float(retry_after))
+            except (TypeError, ValueError):
+                pass
+            logger.info(
+                "Secondary-key balance check was rate limited; retrying in %.2fs (attempt %s/%s)",
+                delay,
+                attempt + 1,
+                len(BALANCE_RATE_LIMIT_BACKOFF_SECONDS),
+            )
+            await asyncio.sleep(delay)
         if status >= 400:
             try:
                 payload = json.loads(raw)
@@ -1055,8 +1079,10 @@ def create_tokens_routes(
         access_code = request.cookies.get(TOKENS_ACCESS_COOKIE, "")
         found = await token_stores.find_by_code(access_code) if access_code else None
         key = found.key if found is not None else None
-        if found is not None:
-            key = await refresh_stored_balance(key, found.store, found.owner_index, await read_primary_remaining(found.owner_index))
+        # The page's script fetches /balance immediately after rendering. Do
+        # not make the same upstream request here as well: the provider
+        # permits just one check per second per API key, and duplicate page
+        # render + browser requests were needlessly causing HTTP 429.
         error = exhausted_message(key, locale) if key is not None and key.is_exhausted else ""
         return user_response(locale=locale, key=key, error=error, submitted_code=submitted_code)
 
@@ -1071,7 +1097,9 @@ def create_tokens_routes(
         found = await token_stores.activate(access_code)
         if found is None:
             return user_response(locale=locale, error=TOKEN_TEXT[locale]["missing"], submitted_code=access_code, status_code=404)
-        key = await refresh_stored_balance(found.key, found.store, found.owner_index, await read_primary_remaining(found.owner_index))
+        # A new key begins with the locally stored limit. The browser's one
+        # live /balance check updates it after this response is rendered.
+        key = found.key
         if key.is_exhausted:
             response = user_response(locale=locale, key=key, error=exhausted_message(key, locale), submitted_code=access_code)
         else:
@@ -1098,6 +1126,31 @@ def create_tokens_routes(
             return JSONResponse({"ok": False, "error": "balance_unavailable"}, status_code=502, headers={"Cache-Control": "no-store"})
         try:
             reported = await client.get_token_balance(api_key=key.api_key)
+        except KeyServiceError as exc:
+            if exc.status_code != 429:
+                log_key_state_failure(owner_index=found.owner_index, key_id=key.id, error=exc)
+                return JSONResponse({"ok": False, "error": "balance_unavailable"}, status_code=502, headers={"Cache-Control": "no-store"})
+            # The retry budget was exhausted. A locally stored balance is
+            # preferable to making the user's page show a 502; the next
+            # browser refresh will try the live balance again.
+            logger.info(
+                "Using stored balance after upstream rate limit (owner=%s, key_id=%s)",
+                found.owner_index,
+                key.id,
+            )
+            remaining = key.remaining_tokens
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "token_balance": remaining,
+                    "formatted": format_tokens(remaining),
+                    "token_limit": key.token_limit,
+                    "token_limit_formatted": format_tokens(key.token_limit),
+                    "used_tokens": key.used_tokens,
+                    "stale": True,
+                },
+                headers={"Cache-Control": "no-store"},
+            )
         except RuntimeError as exc:
             log_key_state_failure(owner_index=found.owner_index, key_id=key.id, error=exc)
             return JSONResponse({"ok": False, "error": "balance_unavailable"}, status_code=502, headers={"Cache-Control": "no-store"})
@@ -2131,19 +2184,20 @@ def render_tokens_admin(
     promo_rows = render_admin_promo_rows(promos or [])
     created_access_codes = created_access_codes or []
     created_promo_codes = created_promo_codes or []
-    # Copy ready-to-send activation URLs rather than bare access codes. This
-    # lets a seller paste the result directly to a buyer, while the public
-    # page still performs activation only after the buyer submits the form.
-    created_codes = "\n".join(
+    created_codes = "\n".join(created_access_codes)
+    created_activation_links = "\n".join(
         f"https://starimg.ru/ai/tokens?key={access_code}"
         for access_code in created_access_codes
     )
     copy_created_keys = ""
     if created_access_codes:
         copy_created_keys = f"""
-        <div class='created-keys copy-created-codes' data-created-codes='{html.escape(created_codes, quote=True)}'>
+        <div class='created-keys copy-created-codes' data-created-codes='{html.escape(created_codes, quote=True)}' data-created-links='{html.escape(created_activation_links, quote=True)}'>
           <strong>Созданные ключи: {len(created_access_codes)}</strong>
-          <button type='button' class='secondary copy-created-codes-button'>Скопировать все</button>
+          <div class='created-key-actions'>
+            <button type='button' class='secondary copy-created-codes-button'>Скопировать все</button>
+            <button type='button' class='secondary copy-created-links-button'>Скопировать ссылками</button>
+          </div>
         </div>"""
     created_promo_values = "\n".join(created_promo_codes)
     copy_created_promos = ""
@@ -2420,7 +2474,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 .instruction-mode-tabs {{ display:flex; gap:6px; margin:16px 0 10px; border-bottom:1px solid var(--line); }} .instruction-mode {{ color:var(--muted); background:transparent; border-radius:8px 8px 0 0; padding:9px 12px; }} .instruction-mode.active {{ color:var(--text); background:#1b2940; box-shadow:inset 0 -2px 0 var(--accent); }} .instruction-mode-panel {{ padding:2px 0 4px; }} .manual-heading {{ color:var(--text); font-weight:700; }} .manual-downloads {{ display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 14px; }} .download-file {{ color:var(--text); background:#1b2940; border:1px solid var(--line); border-radius:8px; padding:8px 11px; font-size:14px; font-weight:700; text-decoration:none; }} .download-file:hover,.download-file:focus {{ border-color:var(--accent); color:var(--accent); }} .manual-note {{ margin:8px 0 14px; color:var(--muted); line-height:1.55; }} .remove-integration {{ margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:10px; background:#0b1321; }} .remove-integration summary,.faq-item summary {{ cursor:pointer; padding:12px 14px; font-weight:700; }} .remove-integration pre {{ margin:0 12px 12px; }} .remove-integration {{ border-color:rgba(255,120,133,.42); background:rgba(255,120,133,.07); }} .remove-integration summary {{ color:#ffdce0; }} .remove-integration .hint,.remove-integration button {{ margin-left:12px; margin-right:12px; }} .remove-integration button {{ margin-bottom:12px; }}
 .faq {{ scroll-margin-top:24px; }} .faq-items {{ border-top:1px solid var(--line); }} .faq-item {{ display:block; border-bottom:1px solid var(--line); }} .faq-item summary {{ list-style:none; padding-right:38px; position:relative; }} .faq-item summary::-webkit-details-marker {{ display:none; }} .faq-item summary::after {{ content:'+'; position:absolute; right:14px; color:var(--accent); font-size:20px; line-height:1; }} .faq-item[open] summary::after {{ content:'−'; }} .faq-item p {{ color:var(--muted); padding:0 14px 14px; margin:0; }}
 .title-row {{ display:flex; justify-content:space-between; gap:16px; align-items:start; }} .title-row form {{ margin:0; }} .create-form,.edit-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); column-gap:18px; }} .create-form .wide {{ grid-column:1 / -1; }}
-.table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form,.inline-freeze-form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .freeze-key {{ margin:0; color:#e3f3ff; background:#375d80; }} .freeze-key:hover,.freeze-key:focus {{ background:#48789f; }} .freeze-key.frozen {{ color:#05233c; background:linear-gradient(135deg,#d9f6ff,#83d5f4); box-shadow:0 0 0 1px rgba(174,235,255,.55),0 0 16px rgba(106,210,247,.35); }} .freeze-key.frozen:hover,.freeze-key.frozen:focus {{ background:linear-gradient(135deg,#e9faff,#a9e5fa); }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} .promos-table {{ min-width:640px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} .sort-link,.service-group-header {{ color:inherit; font:inherit; font-weight:700; text-align:left; text-decoration:none; }} .sort-link:hover,.sort-link:focus,.service-group-header:hover,.service-group-header:focus,th[data-group-service].grouped {{ color:var(--accent); }} th[data-group-service] {{ cursor:pointer; user-select:none; }} .service-group-header {{ padding:0; background:transparent; border-radius:0; }} .keys-search-form {{ margin:14px 0 18px; }} .keys-search-form label {{ margin-top:0; }} .keys-search-controls {{ display:flex; gap:9px; align-items:end; }} .keys-search-controls input {{ margin-top:0; min-width:0; flex:1 1 auto; }} .keys-search-controls .secondary,.reset-search {{ white-space:nowrap; }} .reset-search {{ display:inline-flex; align-items:center; justify-content:center; min-height:46px; text-decoration:none; }} .admin-page.is-updating {{ opacity:.64; pointer-events:none; transition:opacity .12s ease; }} .pagination {{ display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; margin-top:18px; }} .pagination-summary {{ margin:0; color:var(--muted); }} .pagination-links {{ display:flex; flex-wrap:wrap; gap:6px; align-items:center; }} .page-link {{ display:inline-flex; align-items:center; justify-content:center; min-width:38px; min-height:36px; padding:7px 10px; border-radius:8px; color:var(--text); background:#263652; font-weight:700; text-decoration:none; }} .page-link:hover,.page-link:focus {{ color:#08101e; background:var(--accent); }} .page-link.current {{ color:#08101e; background:var(--accent); cursor:default; }} .page-link.disabled {{ color:var(--muted); opacity:.55; cursor:not-allowed; }} .page-ellipsis {{ padding:0 3px; color:var(--muted); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .service-group-toggle {{ color:var(--text); background:transparent; padding:0; font-size:16px; }} .service-group-toggle:hover,.service-group-toggle:focus {{ color:var(--accent); }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-row>td {{ padding:0 8px 14px; border-bottom:1px solid var(--line); }} .edit-form {{ margin:0; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
+.table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form,.inline-freeze-form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .freeze-key {{ margin:0; color:#e3f3ff; background:#375d80; }} .freeze-key:hover,.freeze-key:focus {{ background:#48789f; }} .freeze-key.frozen {{ color:#05233c; background:linear-gradient(135deg,#d9f6ff,#83d5f4); box-shadow:0 0 0 1px rgba(174,235,255,.55),0 0 16px rgba(106,210,247,.35); }} .freeze-key.frozen:hover,.freeze-key.frozen:focus {{ background:linear-gradient(135deg,#e9faff,#a9e5fa); }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} .promos-table {{ min-width:640px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} .sort-link,.service-group-header {{ color:inherit; font:inherit; font-weight:700; text-align:left; text-decoration:none; }} .sort-link:hover,.sort-link:focus,.service-group-header:hover,.service-group-header:focus,th[data-group-service].grouped {{ color:var(--accent); }} th[data-group-service] {{ cursor:pointer; user-select:none; }} .service-group-header {{ padding:0; background:transparent; border-radius:0; }} .keys-search-form {{ margin:14px 0 18px; }} .keys-search-form label {{ margin-top:0; }} .keys-search-controls {{ display:flex; gap:9px; align-items:end; }} .keys-search-controls input {{ margin-top:0; min-width:0; flex:1 1 auto; }} .keys-search-controls .secondary,.reset-search {{ white-space:nowrap; }} .reset-search {{ display:inline-flex; align-items:center; justify-content:center; min-height:46px; text-decoration:none; }} .admin-page.is-updating {{ opacity:.64; pointer-events:none; transition:opacity .12s ease; }} .pagination {{ display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; margin-top:18px; }} .pagination-summary {{ margin:0; color:var(--muted); }} .pagination-links {{ display:flex; flex-wrap:wrap; gap:6px; align-items:center; }} .page-link {{ display:inline-flex; align-items:center; justify-content:center; min-width:38px; min-height:36px; padding:7px 10px; border-radius:8px; color:var(--text); background:#263652; font-weight:700; text-decoration:none; }} .page-link:hover,.page-link:focus {{ color:#08101e; background:var(--accent); }} .page-link.current {{ color:#08101e; background:var(--accent); cursor:default; }} .page-link.disabled {{ color:var(--muted); opacity:.55; cursor:not-allowed; }} .page-ellipsis {{ padding:0 3px; color:var(--muted); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .created-key-actions {{ display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .service-group-toggle {{ color:var(--text); background:transparent; padding:0; font-size:16px; }} .service-group-toggle:hover,.service-group-toggle:focus {{ color:var(--accent); }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-row>td {{ padding:0 8px 14px; border-bottom:1px solid var(--line); }} .edit-form {{ margin:0; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
 @media(max-width:650px) {{ .page,.admin-page {{ width:min(100% - 20px,960px); margin-top:12px; }} .card {{ padding:18px; border-radius:12px; }} h1 {{ font-size:24px; }} .details,.create-form,.edit-grid,.info-actions {{ grid-template-columns:1fr; }} .title-row {{ display:block; }} .title-row form {{ margin-top:12px; }} .keys-search-controls {{ flex-wrap:wrap; }} .keys-search-controls input {{ flex-basis:100%; }} .pagination {{ align-items:start; flex-direction:column; }} }}
 </style></head><body>{content}<script data-tokens-admin-refresh>
 (function() {{
@@ -2453,7 +2507,8 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
   if(bonusButton&&bonusClaim) bonusButton.addEventListener('click',function() {{ bonusClaim.hidden=!bonusClaim.hidden; if(!bonusClaim.hidden) {{ var promoInput=document.getElementById('promo-code'); if(promoInput) promoInput.focus(); }} }});
   function copyApiKey(cell) {{ var value=cell.dataset.copyApiKey; if(!value) return; navigator.clipboard.writeText(value).then(function() {{ var old=cell.title; cell.title='API key скопирован'; setTimeout(function() {{ cell.title=old; }},1500); }}); }}
   document.querySelectorAll('.copyable-api-key').forEach(function(cell) {{ cell.addEventListener('click',function() {{ copyApiKey(cell); }}); cell.addEventListener('keydown',function(event) {{ if(event.key==='Enter'||event.key===' ') {{ event.preventDefault(); copyApiKey(cell); }} }}); }});
-  document.querySelectorAll('.copy-created-codes').forEach(function(container) {{ var button=container.querySelector('.copy-created-codes-button'); if(!button) return; button.addEventListener('click',function() {{ navigator.clipboard.writeText(container.dataset.createdCodes||'').then(function() {{ var old=button.textContent; button.textContent='Скопировано'; setTimeout(function() {{ button.textContent=old; }},1500); }}); }}); }});
+  function copyCreatedValue(container, button, value) {{ if(!button) return; button.addEventListener('click',function() {{ navigator.clipboard.writeText(value||'').then(function() {{ var old=button.textContent; button.textContent='Скопировано'; setTimeout(function() {{ button.textContent=old; }},1500); }}); }}); }}
+  document.querySelectorAll('.copy-created-codes').forEach(function(container) {{ copyCreatedValue(container,container.querySelector('.copy-created-codes-button'),container.dataset.createdCodes); copyCreatedValue(container,container.querySelector('.copy-created-links-button'),container.dataset.createdLinks); }});
   // Keep the admin shell in place: forms and table navigation fetch fresh
   // markup, replace only <main>, and re-run this initializer. This preserves
   // the current document instead of doing a browser-level page reload.

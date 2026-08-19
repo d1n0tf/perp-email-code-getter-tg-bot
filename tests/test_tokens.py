@@ -2,6 +2,7 @@ import tempfile
 import unittest
 from html.parser import HTMLParser
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from fastapi import FastAPI
@@ -33,6 +34,7 @@ from src.tokens import (
     sort_token_admin_keys,
     token_admin_page_state,
     TokenAdminPageState,
+    KeyServiceError,
     trusted_secondary_remaining,
     utc_now,
 )
@@ -550,6 +552,91 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(stored)
         self.assertEqual(stored.used_tokens if stored else None, 765_433)
 
+    async def test_balance_client_retries_once_after_rate_limit(self) -> None:
+        client = CheapVibeCodeClient("primary", "https://example.test")
+        requests: list[str] = []
+
+        class Response:
+            def __init__(self, status: int, body: str) -> None:
+                self.status = status
+                self.body = body
+                self.headers: dict[str, str] = {}
+
+            async def text(self) -> str:
+                return self.body
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args) -> None:
+                return None
+
+        class Session:
+            def __init__(self) -> None:
+                self.responses = [
+                    Response(429, '{"code":"balance_rate_limit_exceeded"}'),
+                    Response(200, '{"token_balance":42}'),
+                ]
+
+            def get(self, url: str, **kwargs):
+                requests.append(url)
+                return self.responses.pop(0)
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args) -> None:
+                return None
+
+        sleep = AsyncMock()
+        with patch("src.tokens.aiohttp.ClientSession", return_value=Session()), patch(
+            "src.tokens.asyncio.sleep", sleep
+        ):
+            balance = await client.get_token_balance(api_key="sk-cvc-rate-limited")
+
+        self.assertEqual(balance, 42)
+        self.assertEqual(requests, ["https://example.test/v1/balance"] * 2)
+        sleep.assert_awaited_once_with(1.05)
+
+    async def test_balance_rate_limit_returns_stored_balance_after_retry_budget(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(
+                id=1,
+                created_at=utc_now(),
+                access_code=access_code,
+                api_key="sk-cvc-rate-limited",
+                service="Claude",
+                name="Key",
+                token_limit=2_000_000,
+                used_tokens=765_433,
+            )
+        ])
+        self.key_client.balance_error = KeyServiceError(429, "balance_rate_limit_exceeded")
+
+        response = await self.client.get(
+            "/ai/tokens/balance",
+            headers={"Cookie": f"tokens_access_key={access_code}"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.json()["stale"])
+        self.assertEqual(response.json()["token_balance"], 1_234_567)
+        self.assertEqual(response.json()["used_tokens"], 765_433)
+
+    async def test_public_page_defers_live_balance_check_to_balance_endpoint(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(1, utc_now(), access_code, "sk-cvc-one-live-check", "Claude", "Key", 100)
+        ])
+
+        page = await self.client.get("/ai/tokens", headers={"Cookie": f"tokens_access_key={access_code}"})
+        balance = await self.client.get("/ai/tokens/balance", headers={"Cookie": f"tokens_access_key={access_code}"})
+
+        self.assertEqual(page.status_code, 200)
+        self.assertEqual(balance.status_code, 200)
+        self.assertEqual(self.key_client.balance_calls, ["sk-cvc-one-live-check"])
+
     async def test_balance_endpoint_keeps_saved_secondary_balance_when_upstream_returns_primary_total(self) -> None:
         access_code = "ABCDEFGHIJKLMNOPQRST"
         await self.store.add_many([
@@ -608,15 +695,18 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual({key.api_key for key in keys}, {"sk-test-1", "sk-test-2"})
         self.assertTrue(all(len(key.access_code) == 20 and key.access_code.isalnum() for key in keys))
         self.assertIn("value='Grok'", response.text)
+        self.assertIn("Скопировать все", response.text)
+        self.assertIn("Скопировать ссылками", response.text)
+        created_codes = [key.access_code for key in sorted(keys, key=lambda key: key.id)]
+        self.assertIn(
+            "data-created-codes='" + "\n".join(created_codes) + "'",
+            response.text,
+        )
         for key in keys:
             self.assertIn(
                 f"https://starimg.ru/ai/tokens?key={key.access_code}",
                 response.text,
             )
-        self.assertNotIn(
-            "data-created-codes='" + "\n".join(key.access_code for key in keys) + "'",
-            response.text,
-        )
 
     async def test_admin_freezes_and_unfreezes_key_with_its_owner_client(self) -> None:
         await self.store.add_many([
@@ -881,7 +971,7 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("name='order' value='asc'", response.text)
         self.assertIn("/ai/tokens/adm?page=1&amp;sort=api_key&amp;order=desc&amp;search=target", response.text)
 
-    async def test_page_refreshes_remaining_tokens_from_balance_api(self) -> None:
+    async def test_balance_endpoint_refreshes_remaining_tokens_from_balance_api(self) -> None:
         access_code = "ABCDEFGHIJKLMNOPQRST"
         await self.store.add_many([
             TokenKey(
@@ -897,14 +987,20 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
             )
         ])
 
-        response = await self.client.get(
+        page = await self.client.get(
             "/ai/tokens",
             headers={"Cookie": f"tokens_access_key={access_code}"},
         )
+        response = await self.client.get(
+            "/ai/tokens/balance",
+            headers={"Cookie": f"tokens_access_key={access_code}"},
+        )
 
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("GROK", page.text)
         self.assertEqual(response.status_code, 200)
-        self.assertIn("1 234 567 из 2 000 000", response.text)
-        self.assertIn("GROK", response.text)
+        self.assertEqual(response.json()["token_balance"], 1_234_567)
+        self.assertEqual(response.json()["token_limit_formatted"], "2 000 000")
         stored = await self.store.get_by_code(access_code)
         self.assertIsNotNone(stored)
         self.assertEqual(stored.used_tokens if stored else None, 765_433)
