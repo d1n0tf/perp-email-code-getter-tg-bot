@@ -25,6 +25,7 @@ from src.time_utils import moscow_end_of_day, to_moscow
 from src.storage import (
     EmailAccount,
     JsonStorage,
+    LegacyUser,
     SubscriptionKey,
     UserKeyActivation,
     normalize_email,
@@ -92,6 +93,9 @@ class BotService:
 
     async def is_legacy_user(self, user_id: int) -> bool:
         return await self.storage.is_legacy_requester(f"tg:{user_id}")
+
+    async def get_legacy_user(self, user_id: int) -> LegacyUser | None:
+        return await self.storage.get_legacy_user(f"tg:{user_id}")
 
     async def add_account(self, raw_value: str) -> tuple[EmailAccount, bool]:
         account = EmailAccount.from_add_string(raw_value)
@@ -393,6 +397,12 @@ class BotService:
                     user_id=user_id,
                     chat_id=chat_id,
                     account=subscription.account,
+                    is_authorized=lambda: self._is_subscription_delivery_authorized(
+                        requester_id=requester_id,
+                        key_code=subscription.key.code,
+                        access_version=subscription.key.access_version,
+                        account=subscription.account,
+                    ),
                 )
             )
             self._active_subscription_code_tasks[requester_id] = task
@@ -444,6 +454,8 @@ class BotService:
                 request_id=request_id,
                 request_key=request_key,
                 account=subscription.account,
+                key_code=subscription.key.code,
+                access_version=subscription.key.access_version,
             )
         )
         self._register_web_request_task(request_id, task)
@@ -644,6 +656,54 @@ class BotService:
                 user_id=user_id,
                 chat_id=chat_id,
                 account=account,
+            )
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        return "started"
+
+    async def start_legacy_code_request(
+        self,
+        *,
+        bot: Bot,
+        user_id: int,
+        chat_id: int,
+        username: str | None,
+        full_name: str | None,
+        email_address: str,
+    ) -> str:
+        requester_id = f"tg:{user_id}"
+        legacy_user = await self.storage.get_legacy_user(requester_id)
+        normalized_email = normalize_email(email_address)
+        if (
+            legacy_user is None
+            or not legacy_user.source_email
+            or not secrets.compare_digest(normalized_email, legacy_user.source_email)
+        ):
+            return "forbidden"
+
+        status, account = await self.prepare_code_request(
+            requester_id=requester_id,
+            requester_kind="telegram",
+            user_id=user_id,
+            chat_id=chat_id,
+            username=username,
+            full_name=full_name,
+            email_address=normalized_email,
+        )
+        if account is None:
+            return status
+
+        task = asyncio.create_task(
+            self._deliver_code(
+                bot=bot,
+                user_id=user_id,
+                chat_id=chat_id,
+                account=account,
+                is_authorized=lambda: self._is_legacy_delivery_authorized(
+                    requester_id=requester_id,
+                    account=account,
+                ),
             )
         )
         self._tasks.add(task)

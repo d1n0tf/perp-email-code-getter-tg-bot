@@ -249,6 +249,9 @@ class JsonStorage:
         self.subscription_key_store_path = subscription_key_store_path
         self.activated_key_store_path = activated_key_store_path
         self.legacy_user_store_path = legacy_user_store_path
+        self.legacy_user_backup_store_path = legacy_user_store_path.with_name(
+            f"{legacy_user_store_path.stem}.backup{legacy_user_store_path.suffix}"
+        )
         self.user_locale_store_path = user_locale_store_path
         self._email_lock = asyncio.Lock()
         self._taken_lock = asyncio.Lock()
@@ -821,66 +824,96 @@ class JsonStorage:
             self._write_json(self.activated_key_store_path, data)
             return True
 
-    async def sync_legacy_users_from_taken(self) -> None:
+    async def freeze_legacy_users(self) -> None:
+        """Take a one-time backup of the legacy direct-email allow-list.
+
+        `email_taken.json` is mutable request telemetry, not an authorization
+        database.  Older versions promoted entries from it every time a user
+        interacted with the bot; a legacy user could therefore request an
+        arbitrary existing mailbox and be recorded against it.  On the first
+        run of this version we preserve the existing legacy list, supplement
+        it from historical telemetry only when necessary, and write an
+        immutable-on-normal-operation backup.  Future calls deliberately do
+        not import any new entries from request telemetry.
+        """
         async with self._taken_lock, self._legacy_lock:
-            taken_data = self._load_json(self.taken_email_store_path, default={})
+            if self.legacy_user_backup_store_path.exists():
+                return
+
             legacy_data = self._load_json(
                 self.legacy_user_store_path,
                 default={},
                 strict=True,
             )
-            updated = False
-
-            for email_address, raw_record in taken_data.items():
-                normalized_record = self._normalize_taken_record(raw_record)
-                if normalized_record is None:
-                    continue
-
-                if str(normalized_record.get("owner_kind")) != "telegram":
-                    continue
-
-                requester_id = str(normalized_record.get("owner_id") or "").strip()
-                if not requester_id:
-                    continue
-                if requester_id in legacy_data:
-                    continue
-
-                user_id = normalized_record.get("user_id")
-                if not isinstance(user_id, int) or user_id <= 0:
-                    if requester_id.startswith("tg:") and requester_id[3:].isdigit():
-                        user_id = int(requester_id[3:])
-                    else:
+            if not legacy_data:
+                taken_data = self._load_json(self.taken_email_store_path, default={})
+                candidates: dict[str, LegacyUser] = {}
+                for email_address, raw_record in taken_data.items():
+                    normalized_record = self._normalize_taken_record(raw_record)
+                    if normalized_record is None:
+                        continue
+                    if str(normalized_record.get("owner_kind")) != "telegram":
                         continue
 
-                legacy_user = LegacyUser(
-                    requester_id=requester_id,
-                    user_id=user_id,
-                    chat_id=normalized_record.get("chat_id")
-                    if isinstance(normalized_record.get("chat_id"), int)
-                    else None,
-                    username=normalized_record.get("username")
-                    if isinstance(normalized_record.get("username"), str)
-                    else None,
-                    full_name=normalized_record.get("full_name")
-                    if isinstance(normalized_record.get("full_name"), str)
-                    else None,
-                    source_email=normalize_email(str(email_address)),
-                    captured_at=_parse_datetime(
-                        normalized_record.get("created_at")
-                        or normalized_record.get("last_used_at")
-                    ),
-                )
-                legacy_data[requester_id] = legacy_user.to_dict()
-                updated = True
+                    requester_id = str(normalized_record.get("owner_id") or "").strip()
+                    if not requester_id:
+                        continue
+                    user_id = normalized_record.get("user_id")
+                    if not isinstance(user_id, int) or user_id <= 0:
+                        if requester_id.startswith("tg:") and requester_id[3:].isdigit():
+                            user_id = int(requester_id[3:])
+                        else:
+                            continue
 
-            if updated:
+                    candidate = LegacyUser(
+                        requester_id=requester_id,
+                        user_id=user_id,
+                        chat_id=normalized_record.get("chat_id")
+                        if isinstance(normalized_record.get("chat_id"), int)
+                        else None,
+                        username=normalized_record.get("username")
+                        if isinstance(normalized_record.get("username"), str)
+                        else None,
+                        full_name=normalized_record.get("full_name")
+                        if isinstance(normalized_record.get("full_name"), str)
+                        else None,
+                        source_email=normalize_email(str(email_address)),
+                        captured_at=_parse_datetime(
+                            normalized_record.get("created_at")
+                            or normalized_record.get("last_used_at")
+                        ),
+                    )
+                    existing = candidates.get(requester_id)
+                    if existing is None or candidate.captured_at < existing.captured_at:
+                        candidates[requester_id] = candidate
+
+                legacy_data = {
+                    requester_id: legacy_user.to_dict()
+                    for requester_id, legacy_user in candidates.items()
+                }
                 self._write_json(self.legacy_user_store_path, legacy_data)
 
-    async def is_legacy_requester(self, requester_id: str) -> bool:
-        await self.sync_legacy_users_from_taken()
+            self._write_json(self.legacy_user_backup_store_path, legacy_data)
+
+    async def sync_legacy_users_from_taken(self) -> None:
+        """Backward-compatible name for the now one-time legacy migration."""
+        await self.freeze_legacy_users()
+
+    async def get_legacy_user(self, requester_id: str) -> LegacyUser | None:
+        await self.freeze_legacy_users()
         async with self._legacy_lock:
-            data = self._load_json(self.legacy_user_store_path, default={})
-            return requester_id in data
+            data = self._load_json(
+                self.legacy_user_backup_store_path,
+                default={},
+                strict=True,
+            )
+            raw_user = data.get(requester_id)
+            if not isinstance(raw_user, dict):
+                return None
+            return LegacyUser.from_dict(raw_user)
+
+    async def is_legacy_requester(self, requester_id: str) -> bool:
+        return await self.get_legacy_user(requester_id) is not None
 
     async def get_locale(self, user_id: int, default_locale: str = "ru") -> str:
         async with self._locale_lock:
