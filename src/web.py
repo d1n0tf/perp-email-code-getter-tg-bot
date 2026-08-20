@@ -27,6 +27,7 @@ from src.storage import (
 WEB_USER_COOKIE_NAME = "perp_web_user_id"
 WEB_ADMIN_COOKIE_NAME = "perp_admin_session"
 WEB_LOGOUT_PATH = "/logout"
+WEB_BONUS_PATH = "/bonus"
 ADMIN_CONTROL_PATH = "/admin_control"
 ADMIN_CONTROL_LOGIN_PATH = f"{ADMIN_CONTROL_PATH}/login"
 ADMIN_CONTROL_LOGOUT_PATH = f"{ADMIN_CONTROL_PATH}/logout"
@@ -442,6 +443,95 @@ def create_web_app(service: BotService) -> FastAPI:
             subscription=subscription,
             login_codes=login_codes,
             status_message=web_text(locale, "activation_success"),
+            status_kind="success",
+        )
+
+    async def claim_bonus(request: Request) -> HTMLResponse:
+        payload = await read_form_body(request)
+        locale = resolve_locale(payload.get("lang"))
+        web_user_id = get_or_create_web_user_id(request)
+        requester_id = build_web_requester_id(web_user_id)
+        status, subscription, promo = await service.claim_perplexity_promo(
+            requester_id=requester_id,
+            promo_code=payload.get("promo_code", ""),
+        )
+        login_codes: list[LoginCodeHistoryEntry] = []
+        if subscription is not None:
+            _, _, login_codes = await service.get_web_login_code_history(
+                requester_id=requester_id,
+            )
+
+        if status == "inactive":
+            return build_page_response(
+                locale=locale,
+                web_user_id=web_user_id,
+                base_path=base_path,
+                service=service,
+                status_message=translate(locale, "subscription_inactive"),
+                status_kind="error",
+                status_code=401,
+            )
+        if status == "expired":
+            return build_page_response(
+                locale=locale,
+                web_user_id=web_user_id,
+                base_path=base_path,
+                service=service,
+                status_message=translate(locale, "subscription_inactive"),
+                status_kind="error",
+                status_code=410,
+            )
+        if status == "email_missing" and subscription is not None:
+            return build_page_response(
+                locale=locale,
+                web_user_id=web_user_id,
+                base_path=base_path,
+                service=service,
+                subscription=subscription,
+                login_codes=login_codes,
+                status_message=translate(
+                    locale,
+                    "key_email_missing",
+                    code=subscription.key.code,
+                ),
+                status_kind="error",
+                status_code=404,
+            )
+        if status == "promo_missing":
+            return build_page_response(
+                locale=locale,
+                web_user_id=web_user_id,
+                base_path=base_path,
+                service=service,
+                subscription=subscription,
+                login_codes=login_codes,
+                status_message=perplexity_text(locale)["promo_missing"],
+                status_kind="error",
+                status_code=404,
+            )
+        if status != "credited" or subscription is None or promo is None:
+            return build_page_response(
+                locale=locale,
+                web_user_id=web_user_id,
+                base_path=base_path,
+                service=service,
+                subscription=subscription,
+                login_codes=login_codes,
+                status_message=perplexity_text(locale)["promo_error"],
+                status_kind="error",
+                status_code=502,
+            )
+        return build_page_response(
+            locale=locale,
+            web_user_id=web_user_id,
+            base_path=base_path,
+            service=service,
+            subscription=subscription,
+            login_codes=login_codes,
+            status_message=perplexity_text(locale)["promo_success"].format(
+                code=promo.code,
+                days=promo.additional_days,
+            ),
             status_kind="success",
         )
 
@@ -1091,12 +1181,41 @@ def create_web_app(service: BotService) -> FastAPI:
     for route_path in route_variants("/activate-code", base_path):
         app.add_api_route(
             route_path,
+            index,
+            methods=["GET"],
+            response_class=HTMLResponse,
+            response_model=None,
+        )
+        app.add_api_route(
+            route_path,
             activate_code,
             methods=["POST"],
             response_class=HTMLResponse,
             response_model=None,
         )
+    for route_path in route_variants(WEB_BONUS_PATH, base_path):
+        app.add_api_route(
+            route_path,
+            index,
+            methods=["GET"],
+            response_class=HTMLResponse,
+            response_model=None,
+        )
+        app.add_api_route(
+            route_path,
+            claim_bonus,
+            methods=["POST"],
+            response_class=HTMLResponse,
+            response_model=None,
+        )
     for route_path in route_variants("/request-code", base_path):
+        app.add_api_route(
+            route_path,
+            index,
+            methods=["GET"],
+            response_class=HTMLResponse,
+            response_model=None,
+        )
         app.add_api_route(
             route_path,
             request_code,
@@ -1107,12 +1226,26 @@ def create_web_app(service: BotService) -> FastAPI:
     for route_path in route_variants("/change-account", base_path):
         app.add_api_route(
             route_path,
+            index,
+            methods=["GET"],
+            response_class=HTMLResponse,
+            response_model=None,
+        )
+        app.add_api_route(
+            route_path,
             change_account,
             methods=["POST"],
             response_class=HTMLResponse,
             response_model=None,
         )
     for route_path in route_variants(WEB_LOGOUT_PATH, base_path):
+        app.add_api_route(
+            route_path,
+            index,
+            methods=["GET"],
+            response_class=HTMLResponse,
+            response_model=None,
+        )
         app.add_api_route(
             route_path,
             logout,
@@ -1219,6 +1352,7 @@ def render_page(
     safe_locale = html.escape(locale, quote=True)
     home_path = build_web_path(base_path, "/")
     activate_code_path = build_web_path(base_path, "/activate-code")
+    bonus_path = build_web_path(base_path, WEB_BONUS_PATH)
     logout_path = build_web_path(base_path, WEB_LOGOUT_PATH)
     history_path = build_query_url(
         build_web_path(base_path, "/login-code-history"),
@@ -1292,7 +1426,13 @@ def render_page(
         </button>
       </div>
       <section class="bonus-claim" id="bonus-claim" hidden>
-        <p>{html.escape(text['bonus_coming_soon'])}</p>
+        <p>{html.escape(text['bonus_instructions'])}</p>
+        <form method="post" action="{html.escape(bonus_path, quote=True)}">
+          <input type="hidden" name="lang" value="{safe_locale}">
+          <label for="promo-code">{html.escape(text['promo_code'])}</label>
+          <input id="promo-code" name="promo_code" autocomplete="off" autocapitalize="characters" required>
+          <button class="bonus-button wide" type="submit">{html.escape(text['claim_bonus'])}</button>
+        </form>
       </section>
     </section>
     {subscription_block}
@@ -1301,7 +1441,7 @@ def render_page(
   <script>
     (function() {{
       var bonusButton=document.getElementById('get-bonus'), bonusClaim=document.getElementById('bonus-claim');
-      if(bonusButton&&bonusClaim) bonusButton.addEventListener('click',function(){{ bonusClaim.hidden=!bonusClaim.hidden; }});
+      if(bonusButton&&bonusClaim) bonusButton.addEventListener('click',function(){{ bonusClaim.hidden=!bonusClaim.hidden; if(!bonusClaim.hidden) {{ var promoInput=document.getElementById('promo-code'); if(promoInput) promoInput.focus(); }} }});
       document.querySelectorAll('[data-copy]').forEach(function(button) {{ button.addEventListener('click',function() {{ var value=button.dataset.copy||''; if(!value||!navigator.clipboard) return; navigator.clipboard.writeText(value).then(function() {{ var original=button.dataset.originalLabel||button.textContent; button.dataset.originalLabel=original; var label=button.querySelector('span'); if(label) label.textContent={json.dumps(text['copied'])}; else button.textContent={json.dumps(text['copied'])}; window.setTimeout(function() {{ if(label) label.textContent={json.dumps(text['copy'])}; else button.textContent=original; }},1500); }}); }});
       var historyUrl={json.dumps(history_path)}, tableBody=document.getElementById('login-code-rows'), lastMessage=document.getElementById('last-login-message'), accountStatus=document.getElementById('account-status');
       function addCell(row,text,className) {{ var cell=document.createElement('td'); cell.textContent=text; if(className) cell.className=className; row.appendChild(cell); }}
@@ -1476,7 +1616,12 @@ PERPLEXITY_TEXT = {
         "logout_success": "Вы вышли из этого браузера. Введите ключ доступа.",
         "faq_button": "Ответы на вопросы",
         "bonus_button": "Получить бонус",
-        "bonus_coming_soon": "Бонусная система готовится. Создание и применение промокодов будут добавлены отдельно.",
+        "bonus_instructions": "Чтобы получить бонусные дни, оставьте положительный отзыв на странице оплаты у продавца. После этого продавец отправит вам промокод в чат. Введите его в поле ниже и нажмите «Получить».",
+        "promo_code": "Промокод",
+        "claim_bonus": "Получить",
+        "promo_missing": "🔴 Промокод не существует или уже был использован ранее.",
+        "promo_success": "✅ Промокод #{code} был активирован и подписка продлена на {days} дн.",
+        "promo_error": "Не удалось начислить бонус. Попробуйте ещё раз.",
         "subscription_heading": "Подписка Perplexity PRO",
         "email": "1️⃣ Почта для входа",
         "duration": "2️⃣ Срок подписки",
@@ -1521,7 +1666,12 @@ PERPLEXITY_TEXT = {
         "logout_success": "You have signed out of this browser. Enter an access key.",
         "faq_button": "Help & answers",
         "bonus_button": "Get bonus",
-        "bonus_coming_soon": "The bonus system is being prepared. Promo-code creation and redemption will be added separately.",
+        "bonus_instructions": "To receive bonus days, leave a positive review on the seller's payment page. The seller will then send you a promo code in the chat. Enter it below and click “Get”.",
+        "promo_code": "Promo code",
+        "claim_bonus": "Get",
+        "promo_missing": "🔴 The promo code does not exist or has already been used.",
+        "promo_success": "✅ Promo code #{code} was activated and your subscription was extended by {days} days.",
+        "promo_error": "Could not credit the bonus. Please try again.",
         "subscription_heading": "Perplexity PRO subscription",
         "email": "1️⃣ Login email",
         "duration": "2️⃣ Subscription term",
@@ -1630,7 +1780,7 @@ def perplexity_page_styles() -> str:
     button,.action-link { border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sans-serif; cursor:pointer; text-decoration:none; } .primary { color:#071120; background:var(--accent); } .secondary { color:var(--text); background:#263652; } .wide { display:block; width:100%; margin-top:18px; } .hint { color:var(--muted); font-size:14px; }
     .top-links { display:flex; justify-content:space-between; align-items:center; gap:8px; margin:0 0 -4px; } .top-links-end { display:flex; align-items:center; gap:8px; } .top-links form { margin:0; } .top-links a, .top-links button { color:var(--text); font:700 16px/1.55 Arial,sans-serif; text-decoration:none; padding:7px 10px; border:1px solid var(--line); border-radius:7px; background:transparent; cursor:pointer; } .top-links a:hover, .top-links button:hover { border-color:var(--accent); color:var(--accent); }
     .status { border-radius:9px; padding:11px 13px; margin:12px 0; } .status.error { color:#ffdce0; background:rgba(255,120,133,.18); border:1px solid rgba(255,120,133,.45); } .status.success { color:#d8ffec; background:rgba(95,213,160,.15); border:1px solid rgba(95,213,160,.45); }
-    .info-actions { display:grid; grid-template-columns:1fr; gap:10px; margin-top:20px; } .info-actions button { width:100%; display:inline-flex; justify-content:center; align-items:center; gap:9px; min-height:46px; } .info-actions .bonus-button { font-size:16px; } .bonus-button { color:#281500; background:linear-gradient(135deg,#ffd46b,#f59e0b); } .bonus-button:hover,.bonus-button:focus { background:linear-gradient(135deg,#ffe191,#fbbf24); } .bonus-button svg { width:20px; height:20px; flex:0 0 auto; } .bonus-claim { margin-top:14px; padding:16px; border:1px solid rgba(245,158,11,.45); border-radius:11px; background:rgba(245,158,11,.09); color:#ffe2a2; } .active-key-row { display:flex; justify-content:space-between; gap:12px; padding:12px; border-radius:9px; background:#0b1321; }
+    .info-actions { display:grid; grid-template-columns:1fr; gap:10px; margin-top:20px; } .info-actions button { width:100%; display:inline-flex; justify-content:center; align-items:center; gap:9px; min-height:46px; } .info-actions .bonus-button { font-size:16px; } .bonus-button { color:#281500; background:linear-gradient(135deg,#ffd46b,#f59e0b); } .bonus-button:hover,.bonus-button:focus { background:linear-gradient(135deg,#ffe191,#fbbf24); } .bonus-button svg { width:20px; height:20px; flex:0 0 auto; } .bonus-claim { margin-top:14px; padding:16px; border:1px solid rgba(245,158,11,.45); border-radius:11px; background:rgba(245,158,11,.09); } .bonus-claim p { margin:0 0 12px; color:#ffe2a2; } .bonus-claim label { margin-top:0; } .active-key-row { display:flex; justify-content:space-between; gap:12px; padding:12px; border-radius:9px; background:#0b1321; }
     .details { display:grid; grid-template-columns:minmax(220px,auto) 1fr; gap:10px 18px; margin:0; } .details dt { color:var(--muted); } .details dd { margin:0; min-width:0; overflow-wrap:anywhere; } code { color:#b9d4ff; font-family:Consolas,'Courier New',monospace; } .copy-value,.inline-copy { padding:0; border:0; color:#b9d4ff; background:transparent; font:inherit; font-weight:700; text-align:left; } .copy-value span { margin-left:8px; font-size:12px; color:var(--accent); } .instructions { margin-top:24px; padding-top:20px; border-top:1px solid var(--line); } .instructions ol { margin:0; padding-left:24px; } .history-summary { display:flex; justify-content:space-between; flex-wrap:wrap; gap:10px 18px; padding:12px; border-radius:9px; background:#0b1321; } .account-active { color:var(--success); } .account-inactive { color:var(--danger); }
     .table-wrap { overflow-x:auto; } table { width:100%; min-width:660px; border-collapse:collapse; } th,td { padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; } th { color:var(--muted); font-size:13px; } .login-code { color:#d8ffec; font-weight:700; } .empty { text-align:center; color:var(--muted); } .retention { margin:16px 0 0; color:var(--warn); font-size:13px; }
     .faq { scroll-margin-top:24px; } .faq-items { border-top:1px solid var(--line); } .faq-item { display:block; border-bottom:1px solid var(--line); } .faq-item summary { cursor:pointer; padding:12px 38px 12px 14px; font-weight:700; position:relative; list-style:none; } .faq-item summary::-webkit-details-marker { display:none; } .faq-item summary::after { content:'+'; position:absolute; right:14px; color:var(--accent); font-size:20px; } .faq-item[open] summary::after { content:'−'; } .faq-item p { padding:0 14px 14px; margin:0; color:var(--muted); }
@@ -2669,7 +2819,7 @@ def render_live_navigation_script() -> str:
         }
 
         const html = await response.text();
-        const finalUrl = response.url || String(url);
+        const finalUrl = options.historyUrl || response.url || String(url);
         if (options.replaceHistory) {
           window.history.replaceState({}, "", finalUrl);
         } else {
@@ -2770,6 +2920,8 @@ def render_live_navigation_script() -> str:
           headers: {
             "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
           },
+          historyUrl: window.location.href,
+          replaceHistory: true,
         }).catch(() => {
           form.submit();
         });

@@ -18,6 +18,7 @@ async def _main() -> None:
         subscription_key_store_path=settings.subscription_key_store_path,
         activated_key_store_path=settings.activated_key_store_path,
         login_code_history_store_path=settings.login_code_history_store_path,
+        perplexity_promo_code_store_path=settings.perplexity_promo_code_store_path,
         legacy_user_store_path=settings.legacy_user_store_path,
         user_locale_store_path=settings.user_locale_store_path,
     )

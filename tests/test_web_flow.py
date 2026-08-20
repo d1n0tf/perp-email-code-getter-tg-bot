@@ -11,7 +11,8 @@ import httpx
 from src.config import Settings, settings
 from src.email_manager import RecentCodeRecord
 from src.service import BotService
-from src.storage import EmailAccount, JsonStorage, LoginCodeHistoryEntry, SubscriptionKey
+from src.storage import EmailAccount, JsonStorage, LoginCodeHistoryEntry, PerplexityPromoCode, SubscriptionKey
+from src.time_utils import moscow_end_of_day, to_moscow
 from src.web import WEB_USER_COOKIE_NAME, build_web_path, create_web_app, render_wait_page
 
 
@@ -128,6 +129,12 @@ class WebFlowTests(BaseWebFlowTestCase):
         self.assertIn("Get bonus", response.text)
         self.assertIn("Help &amp; answers", response.text)
         self.assertIn('class="lucide lucide-gift', response.text)
+        self.assertIn('id="get-bonus"', response.text)
+        self.assertIn('id="bonus-claim" hidden', response.text)
+        self.assertIn("/perp-code-getter/bonus", response.text)
+        self.assertIn("To receive bonus days", response.text)
+        self.assertIn("Promo code", response.text)
+        self.assertNotIn("coming soon", response.text.lower())
         self.assertNotIn('class="secondary action-link"', response.text)
         self.assertEqual(response.text.count('href="#faq"'), 1)
         self.assertIn('id="faq"', response.text)
@@ -142,6 +149,19 @@ class WebFlowTests(BaseWebFlowTestCase):
         self.assertNotIn("Request code", response.text)
         self.assertNotIn("Change account", response.text)
         self.assertIn("__perpLiveNavEnabled", response.text)
+        self.assertIn("historyUrl: window.location.href", response.text)
+
+    async def test_get_activate_code_shows_panel_instead_of_method_not_allowed(self) -> None:
+        missing_key_page = await self.client.get(self.route("/activate-code"), params={"lang": "en"})
+        self.assertEqual(missing_key_page.status_code, 200)
+        self.assertIn("Activate key", missing_key_page.text)
+        self.assertIn("Access key", missing_key_page.text)
+
+        await self.activate_key(locale="en")
+        active_page = await self.client.get(self.route("/activate-code"), params={"lang": "en"})
+        self.assertEqual(active_page.status_code, 200)
+        self.assertIn("shared@example.com", active_page.text)
+        self.assertIn("Log out", active_page.text)
 
     async def test_activate_code_and_request_login_code_successfully(self) -> None:
         activate_response = await self.activate_key(locale="en")
@@ -397,6 +417,63 @@ class WebFlowTests(BaseWebFlowTestCase):
         self.assertEqual(russian_logout.status_code, 200)
         self.assertIn("Вы вышли из этого браузера. Введите ключ доступа.", russian_logout.text)
         self.assertIn("Ключ доступа", russian_logout.text)
+
+    async def test_bonus_panel_is_hidden_until_requested(self) -> None:
+        page = (await self.client.get(self.route("/"), params={"lang": "ru"})).text
+        self.assertIn('id="get-bonus"', page)
+        self.assertIn('id="bonus-claim" hidden', page)
+        self.assertIn("/perp-code-getter/bonus", page)
+        self.assertIn("Чтобы получить бонусные дни", page)
+        self.assertIn('if(!bonusClaim.hidden)', page)
+        self.assertIn("promo-code", page)
+
+    async def test_bonus_promo_extends_active_key_once(self) -> None:
+        await self.activate_key(locale="en")
+        original = await self.storage.get_subscription_key(self.key.code)
+        assert original is not None
+        await self.storage.add_perplexity_promo_codes(
+            [PerplexityPromoCode(code="BONUS2026", additional_days=7)]
+        )
+
+        claimed = await self.client.post(
+            self.route("/bonus"),
+            data={"lang": "en", "promo_code": "bonus2026"},
+        )
+        repeated = await self.client.post(
+            self.route("/bonus"),
+            data={"lang": "en", "promo_code": "BONUS2026"},
+        )
+
+        self.assertEqual(claimed.status_code, 200)
+        self.assertIn(
+            "Promo code #BONUS2026 was activated and your subscription was extended by 7 days.",
+            claimed.text,
+        )
+        updated = await self.storage.get_subscription_key(self.key.code)
+        assert updated is not None
+        self.assertEqual(updated.duration_days, original.duration_days + 7)
+        self.assertEqual(
+            updated.expires_at,
+            moscow_end_of_day(to_moscow(original.expires_at).date() + timedelta(days=7)),
+        )
+        self.assertEqual(repeated.status_code, 404)
+        self.assertIn("The promo code does not exist or has already been used.", repeated.text)
+
+    async def test_bonus_promo_requires_an_activated_key(self) -> None:
+        await self.storage.add_perplexity_promo_codes(
+            [PerplexityPromoCode(code="NEEDSACTIVE", additional_days=5)]
+        )
+        response = await self.client.post(
+            self.route("/bonus"),
+            data={"lang": "en", "promo_code": "NEEDSACTIVE"},
+        )
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("Activate key", response.text)
+        still_available = await self.storage.claim_perplexity_promo_code(
+            "NEEDSACTIVE",
+            self.key.code,
+        )
+        self.assertIsNotNone(still_available)
 
     async def test_account_update_hides_already_completed_web_request(self) -> None:
         await self.activate_key(locale="en")

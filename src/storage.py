@@ -4,7 +4,7 @@ import os
 import secrets
 import string
 import tempfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -26,6 +26,10 @@ def normalize_email(value: str) -> str:
 
 def normalize_key_code(value: str) -> str:
     return value.strip().upper()
+
+
+def normalize_promo_code(value: str) -> str:
+    return "".join(value.strip().upper().split())
 
 
 def _generate_subscription_code(used_codes: set[str]) -> str:
@@ -263,6 +267,43 @@ class LoginCodeHistoryEntry:
         }
 
 
+@dataclass(slots=True, frozen=True)
+class PerplexityPromoCode:
+    """A one-time promo that extends a Perplexity subscription."""
+
+    code: str
+    additional_days: int
+    used_at: datetime | None = None
+    used_key_code: str | None = None
+    created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PerplexityPromoCode":
+        used_at = data.get("used_at")
+        created_at = data.get("created_at")
+        used_key_code = data.get("used_key_code")
+        return cls(
+            code=normalize_promo_code(str(data["code"])),
+            additional_days=max(0, int(data["additional_days"])),
+            created_at=_parse_datetime(created_at) if created_at else (
+                _parse_datetime(used_at) if used_at else datetime.now(timezone.utc)
+            ),
+            used_at=_parse_datetime(used_at) if used_at else None,
+            used_key_code=(
+                normalize_key_code(str(used_key_code)) if used_key_code else None
+            ),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "code": self.code,
+            "additional_days": self.additional_days,
+            "created_at": self.created_at.astimezone(timezone.utc).isoformat(),
+            "used_at": self.used_at.astimezone(timezone.utc).isoformat() if self.used_at else None,
+            "used_key_code": self.used_key_code,
+        }
+
+
 class JsonStorage:
     def __init__(
         self,
@@ -272,6 +313,7 @@ class JsonStorage:
         subscription_key_store_path: Path,
         activated_key_store_path: Path,
         login_code_history_store_path: Path | None = None,
+        perplexity_promo_code_store_path: Path | None = None,
         legacy_user_store_path: Path,
         user_locale_store_path: Path,
     ) -> None:
@@ -284,6 +326,11 @@ class JsonStorage:
             if login_code_history_store_path is not None
             else activated_key_store_path.with_name("perplexity_login_codes.json")
         )
+        self.perplexity_promo_code_store_path = (
+            perplexity_promo_code_store_path
+            if perplexity_promo_code_store_path is not None
+            else activated_key_store_path.with_name("perplexity_promo_codes.json")
+        )
         self.legacy_user_store_path = legacy_user_store_path
         self.legacy_user_backup_store_path = legacy_user_store_path.with_name(
             f"{legacy_user_store_path.stem}.backup{legacy_user_store_path.suffix}"
@@ -294,6 +341,7 @@ class JsonStorage:
         self._key_lock = asyncio.Lock()
         self._activation_lock = asyncio.Lock()
         self._login_code_history_lock = asyncio.Lock()
+        self._promo_lock = asyncio.Lock()
         self._legacy_lock = asyncio.Lock()
         self._locale_lock = asyncio.Lock()
 
@@ -931,6 +979,143 @@ class JsonStorage:
             if changed:
                 self._write_json(self.login_code_history_store_path, data)
             return sorted(added, key=lambda entry: (entry.received_at, entry.id), reverse=True)
+
+    async def add_perplexity_promo_codes(self, created: list[PerplexityPromoCode]) -> None:
+        """Atomically append unused promo codes after checking uniqueness."""
+        if not created:
+            return
+        async with self._promo_lock:
+            data = self._load_json(
+                self.perplexity_promo_code_store_path,
+                default=[],
+                strict=True,
+            )
+            if not isinstance(data, list):
+                raise JsonStorageCorruptionError(
+                    self.perplexity_promo_code_store_path,
+                    "root is not a list",
+                )
+            existing = {
+                promo.code
+                for raw in data
+                if isinstance(raw, dict)
+                for promo in [self._promo_from_dict(raw)]
+                if promo is not None
+            }
+            new_codes = [promo.code for promo in created]
+            if len(set(new_codes)) != len(new_codes) or any(code in existing for code in new_codes):
+                raise ValueError("Promo code already exists.")
+            data.extend(promo.to_dict() for promo in created)
+            self._write_json(self.perplexity_promo_code_store_path, data)
+
+    async def claim_perplexity_promo_code(
+        self,
+        code: str,
+        key_code: str,
+    ) -> PerplexityPromoCode | None:
+        normalized_code = normalize_promo_code(code)
+        normalized_key_code = normalize_key_code(key_code)
+        if not normalized_code or not normalized_key_code:
+            return None
+        async with self._promo_lock:
+            data = self._load_json(
+                self.perplexity_promo_code_store_path,
+                default=[],
+                strict=True,
+            )
+            if not isinstance(data, list):
+                raise JsonStorageCorruptionError(
+                    self.perplexity_promo_code_store_path,
+                    "root is not a list",
+                )
+            for index, raw in enumerate(data):
+                if not isinstance(raw, dict):
+                    continue
+                promo = self._promo_from_dict(raw)
+                if promo is None or promo.code != normalized_code or promo.used_at is not None:
+                    continue
+                claimed = replace(
+                    promo,
+                    used_at=datetime.now(timezone.utc),
+                    used_key_code=normalized_key_code,
+                )
+                data[index] = claimed.to_dict()
+                self._write_json(self.perplexity_promo_code_store_path, data)
+                return claimed
+        return None
+
+    async def restore_unclaimed_perplexity_promo_code(
+        self,
+        code: str,
+        key_code: str,
+    ) -> bool:
+        """Undo a provisional claim when the subscription credit was rejected."""
+        normalized_code = normalize_promo_code(code)
+        normalized_key_code = normalize_key_code(key_code)
+        async with self._promo_lock:
+            data = self._load_json(
+                self.perplexity_promo_code_store_path,
+                default=[],
+                strict=True,
+            )
+            if not isinstance(data, list):
+                raise JsonStorageCorruptionError(
+                    self.perplexity_promo_code_store_path,
+                    "root is not a list",
+                )
+            for index, raw in enumerate(data):
+                if not isinstance(raw, dict):
+                    continue
+                promo = self._promo_from_dict(raw)
+                if (
+                    promo is None
+                    or promo.code != normalized_code
+                    or promo.used_key_code != normalized_key_code
+                ):
+                    continue
+                data[index] = replace(promo, used_at=None, used_key_code=None).to_dict()
+                self._write_json(self.perplexity_promo_code_store_path, data)
+                return True
+        return False
+
+    async def extend_subscription_key(
+        self,
+        code: str,
+        additional_days: int,
+    ) -> SubscriptionKey | None:
+        if additional_days < 1:
+            return None
+        normalized_code = normalize_key_code(code)
+        async with self._key_lock:
+            data = self._load_json(
+                self.subscription_key_store_path,
+                default={},
+                strict=True,
+            )
+            raw_key = data.get(normalized_code)
+            if not isinstance(raw_key, dict):
+                return None
+            key = SubscriptionKey.from_dict(raw_key)
+            now = datetime.now(timezone.utc)
+            base_date = to_moscow(key.expires_at if key.expires_at > now else now).date()
+            updated = SubscriptionKey(
+                code=key.code,
+                email_address=key.email_address,
+                duration_days=key.duration_days + additional_days,
+                created_at=key.created_at,
+                expires_at=moscow_end_of_day(base_date + timedelta(days=additional_days)),
+                access_version=key.access_version,
+            )
+            data[normalized_code] = updated.to_dict()
+            self._write_json(self.subscription_key_store_path, data)
+            return updated
+
+    @staticmethod
+    def _promo_from_dict(raw: dict[str, Any]) -> PerplexityPromoCode | None:
+        try:
+            return PerplexityPromoCode.from_dict(raw)
+        except (KeyError, TypeError, ValueError):
+            return None
 
     async def freeze_legacy_users(self) -> None:
         """Take a one-time backup of the legacy direct-email allow-list.

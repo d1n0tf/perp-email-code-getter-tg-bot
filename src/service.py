@@ -28,6 +28,7 @@ from src.storage import (
     JsonStorage,
     LegacyUser,
     LoginCodeHistoryEntry,
+    PerplexityPromoCode,
     SubscriptionKey,
     UserKeyActivation,
     normalize_email,
@@ -498,6 +499,56 @@ class BotService:
             subscription.key.email_address
         )
         return "active", subscription, entries
+
+    async def claim_perplexity_promo(
+        self,
+        *,
+        requester_id: str,
+        promo_code: str,
+    ) -> tuple[str, ActivatedSubscription | None, PerplexityPromoCode | None]:
+        """Apply a one-time promo to the current browser's activated key."""
+        subscription = await self.get_requester_activated_subscription(requester_id)
+        if subscription is None:
+            return "inactive", None, None
+        if subscription.key.is_expired():
+            await self.clear_requester_subscription_activation(requester_id)
+            return "expired", None, None
+        if subscription.account is None:
+            return "email_missing", subscription, None
+
+        promo = await self.storage.claim_perplexity_promo_code(
+            promo_code,
+            subscription.key.code,
+        )
+        if promo is None:
+            return "promo_missing", subscription, None
+        if promo.additional_days < 1:
+            await self.storage.restore_unclaimed_perplexity_promo_code(
+                promo.code,
+                subscription.key.code,
+            )
+            return "promo_error", subscription, None
+
+        updated_key = await self.storage.extend_subscription_key(
+            subscription.key.code,
+            promo.additional_days,
+        )
+        if updated_key is None:
+            await self.storage.restore_unclaimed_perplexity_promo_code(
+                promo.code,
+                subscription.key.code,
+            )
+            return "promo_error", subscription, None
+
+        return (
+            "credited",
+            ActivatedSubscription(
+                activation=subscription.activation,
+                key=updated_key,
+                account=subscription.account,
+            ),
+            promo,
+        )
 
     async def _scan_login_code_history(self, account: EmailAccount) -> None:
         email_address = account.login_email
