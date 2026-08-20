@@ -603,6 +603,22 @@ def create_web_app(service: BotService) -> FastAPI:
                 "code_timeout",
                 email=request_state.email_address,
             )
+        elif request_state.status == "missing":
+            response = JSONResponse(
+                {
+                    "status": "missing",
+                    "message": web_text(locale, "request_missing"),
+                },
+                status_code=404,
+            )
+            response.set_cookie(
+                key=WEB_USER_COOKIE_NAME,
+                value=web_user_id,
+                httponly=True,
+                samesite="lax",
+                max_age=60 * 60 * 24 * 365,
+            )
+            return response
         else:
             message = translate(
                 locale,

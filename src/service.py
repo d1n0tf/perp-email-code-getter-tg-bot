@@ -4,6 +4,7 @@ import json
 import secrets
 import string
 import traceback
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
@@ -40,6 +41,8 @@ class WebCodeRequest:
     email_address: str
     status: str
     code: str | None = None
+    key_code: str | None = None
+    access_version: int | None = None
 
 
 @dataclass(slots=True)
@@ -446,6 +449,8 @@ class BotService:
                 requester_id=requester_id,
                 email_address=subscription.key.email_address,
                 status="pending",
+                key_code=subscription.key.code,
+                access_version=subscription.key.access_version,
             )
             self._active_web_requests[request_key] = request_id
 
@@ -618,13 +623,41 @@ class BotService:
             request = self._web_requests.get(request_id)
             if request is None or request.requester_id != requester_id:
                 return None
-            return WebCodeRequest(
+            request_state = WebCodeRequest(
                 request_id=request.request_id,
                 requester_id=request.requester_id,
                 email_address=request.email_address,
                 status=request.status,
                 code=request.code,
+                key_code=request.key_code,
+                access_version=request.access_version,
             )
+
+        # A completed result remains in memory until process restart.  It must
+        # not become readable through a stale browser cookie after the key or
+        # account was changed and the corresponding activation was revoked.
+        if (
+            request_state.key_code is not None
+            and request_state.access_version is not None
+        ):
+            subscription = await self.get_requester_activated_subscription(requester_id)
+            if (
+                subscription is None
+                or subscription.account is None
+                or subscription.key.is_expired()
+                or not secrets.compare_digest(
+                    normalize_key_code(subscription.key.code),
+                    normalize_key_code(request_state.key_code),
+                )
+                or subscription.key.access_version != request_state.access_version
+                or not secrets.compare_digest(
+                    subscription.key.email_address,
+                    request_state.email_address,
+                )
+            ):
+                return None
+
+        return request_state
 
     async def start_code_request(
         self,
@@ -791,9 +824,14 @@ class BotService:
         user_id: int,
         chat_id: int,
         account: EmailAccount,
+        is_authorized: Callable[[], Awaitable[bool]] | None = None,
     ) -> None:
         try:
+            if is_authorized is not None and not await is_authorized():
+                return
             result = await self.fetch_code(account)
+            if is_authorized is not None and not await is_authorized():
+                return
             locale = await self.get_locale(user_id)
             await bot.send_message(
                 chat_id,
@@ -805,6 +843,8 @@ class BotService:
                 ),
             )
         except CodeWaitTimeout:
+            if is_authorized is not None and not await is_authorized():
+                return
             locale = await self.get_locale(user_id)
             await bot.send_message(
                 chat_id,
@@ -817,6 +857,8 @@ class BotService:
         except asyncio.CancelledError:
             raise
         except Exception:
+            if is_authorized is not None and not await is_authorized():
+                return
             locale = await self.get_locale(user_id)
             with contextlib.suppress(Exception):
                 await bot.send_message(
@@ -1034,10 +1076,36 @@ class BotService:
         request_id: str,
         request_key: tuple[str, str],
         account: EmailAccount,
+        key_code: str | None = None,
+        access_version: int | None = None,
     ) -> None:
+        async def is_authorized() -> bool:
+            if key_code is None or access_version is None:
+                return True
+            return await self._is_subscription_delivery_authorized(
+                requester_id=request_key[0],
+                key_code=key_code,
+                access_version=access_version,
+                account=account,
+            )
+
         try:
+            if not await is_authorized():
+                await self._set_web_request_result(
+                    request_id=request_id,
+                    request_key=request_key,
+                    status="missing",
+                )
+                return
             result = await self.fetch_code(account)
         except CodeWaitTimeout:
+            if not await is_authorized():
+                await self._set_web_request_result(
+                    request_id=request_id,
+                    request_key=request_key,
+                    status="missing",
+                )
+                return
             await self._set_web_request_result(
                 request_id=request_id,
                 request_key=request_key,
@@ -1046,18 +1114,66 @@ class BotService:
         except asyncio.CancelledError:
             raise
         except Exception:
+            if not await is_authorized():
+                await self._set_web_request_result(
+                    request_id=request_id,
+                    request_key=request_key,
+                    status="missing",
+                )
+                return
             await self._set_web_request_result(
                 request_id=request_id,
                 request_key=request_key,
                 status="failed",
             )
         else:
+            if not await is_authorized():
+                await self._set_web_request_result(
+                    request_id=request_id,
+                    request_key=request_key,
+                    status="missing",
+                )
+                return
             await self._set_web_request_result(
                 request_id=request_id,
                 request_key=request_key,
                 status="success",
                 code=result.code,
             )
+
+    async def _is_subscription_delivery_authorized(
+        self,
+        *,
+        requester_id: str,
+        key_code: str,
+        access_version: int,
+        account: EmailAccount,
+    ) -> bool:
+        subscription = await self.get_requester_activated_subscription(requester_id)
+        if subscription is None or subscription.account is None:
+            return False
+        return (
+            not subscription.key.is_expired()
+            and secrets.compare_digest(
+                normalize_key_code(subscription.key.code),
+                normalize_key_code(key_code),
+            )
+            and subscription.key.access_version == access_version
+            and subscription.account == account
+        )
+
+    async def _is_legacy_delivery_authorized(
+        self,
+        *,
+        requester_id: str,
+        account: EmailAccount,
+    ) -> bool:
+        legacy_user = await self.storage.get_legacy_user(requester_id)
+        if legacy_user is None:
+            return False
+        if not secrets.compare_digest(legacy_user.source_email, account.login_email):
+            return False
+        return await self.storage.get_account(account.login_email) == account
 
     async def _set_web_request_result(
         self,

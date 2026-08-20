@@ -171,6 +171,45 @@ class WebFlowTests(BaseWebFlowTestCase):
         self.assertIn("Activate code", response.text)
         self.assertNotIn("shared@example.com", response.text)
 
+    async def test_account_update_hides_already_completed_web_request(self) -> None:
+        await self.activate_key(locale="en")
+
+        request_response = await self.client.post(
+            self.route("/request-code"),
+            data={"lang": "en"},
+            follow_redirects=False,
+        )
+        self.assertEqual(request_response.status_code, 303)
+        wait_url = request_response.headers["location"]
+        request_id = parse_qs(urlparse(wait_url).query)["request_id"][0]
+
+        successful_response = await self.wait_for_request_status(request_id, locale="en")
+        self.assertEqual(successful_response.json()["code"], "654321")
+
+        await self.storage.upsert_account(
+            EmailAccount(
+                login_email="shared@example.com",
+                login_password="new-pass",
+                recovery_email="recovery@example.com",
+                recovery_password="recovery-pass",
+                refresh_token="refresh-token",
+                client_id="client-id",
+                raw="shared@example.com:new-pass:recovery@example.com:recovery-pass:refresh-token:client-id",
+            )
+        )
+
+        revoked_response = await self.client.get(
+            self.route("/request-status"),
+            params={"request_id": request_id, "lang": "en"},
+        )
+        self.assertEqual(revoked_response.status_code, 404)
+        self.assertEqual(revoked_response.json()["status"], "missing")
+        self.assertNotIn("email", revoked_response.json())
+        self.assertNotIn("code", revoked_response.json())
+
+        wait_page = await self.client.get(wait_url)
+        self.assertEqual(wait_page.status_code, 404)
+
 
 class WebFlowCancellationTests(BaseWebFlowTestCase):
     service_class = None  # type: ignore[assignment]
@@ -210,6 +249,46 @@ class WebFlowCancellationTests(BaseWebFlowTestCase):
 
         payload = status_response.json()
         self.assertEqual(payload["status"], "missing")
+
+    async def test_account_update_revokes_pending_web_request_after_fetch(self) -> None:
+        await self.activate_key(locale="en")
+
+        request_response = await self.client.post(
+            self.route("/request-code"),
+            data={"lang": "en"},
+            follow_redirects=False,
+        )
+        self.assertEqual(request_response.status_code, 303)
+        request_id = parse_qs(urlparse(request_response.headers["location"]).query)[
+            "request_id"
+        ][0]
+
+        await asyncio.wait_for(self.service.fetch_started.wait(), timeout=1)
+
+        # This path updates persisted credentials and invalidates activations,
+        # but does not explicitly cancel a task that is already waiting for a
+        # code.  The post-fetch authorization check must still suppress it.
+        await self.storage.upsert_account(
+            EmailAccount(
+                login_email="shared@example.com",
+                login_password="new-pass",
+                recovery_email="recovery@example.com",
+                recovery_password="recovery-pass",
+                refresh_token="refresh-token",
+                client_id="client-id",
+                raw="shared@example.com:new-pass:recovery@example.com:recovery-pass:refresh-token:client-id",
+            )
+        )
+
+        self.service.fetch_release.set()
+        status_response = await self.wait_for_request_status(
+            request_id,
+            locale="en",
+            expected_status="missing",
+            expected_http_status=404,
+        )
+
+        self.assertEqual(status_response.json()["status"], "missing")
 
     async def test_wait_page_stops_polling_when_request_is_missing(self) -> None:
         page = render_wait_page(

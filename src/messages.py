@@ -124,6 +124,10 @@ MESSAGES = {
         "legacy_unknown_text": (
             "Я жду email в формате `example@outlook.com` или команду `/start`."
         ),
+        "legacy_email_forbidden": (
+            "Для этого аккаунта можно запрашивать код только для исторически "
+            "привязанной почты `{email}`."
+        ),
     },
     "en": {
         "choose_language": "Choose your language / Выбери язык",
@@ -243,6 +247,9 @@ MESSAGES = {
         "code_failed": "I could not fetch a code for `{email}`.",
         "legacy_unknown_text": (
             "Send an email in the `example@outlook.com` format or use `/start`."
+        ),
+        "legacy_email_forbidden": (
+            "This account may request codes only for its historical email `{email}`."
         ),
     },
 }

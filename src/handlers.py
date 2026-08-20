@@ -501,10 +501,8 @@ def build_router(service: BotService) -> Router:
                 await message.answer(translate(locale, "legacy_unknown_text"))
                 return
 
-            status = await service.start_code_request(
+            status = await service.start_legacy_code_request(
                 bot=message.bot,
-                requester_id=f"tg:{message.from_user.id}",
-                requester_kind="telegram",
                 user_id=message.from_user.id,
                 chat_id=message.chat.id,
                 username=message.from_user.username,
@@ -512,6 +510,16 @@ def build_router(service: BotService) -> Router:
                 email_address=candidate,
             )
 
+            if status == "forbidden":
+                legacy_user = await service.get_legacy_user(message.from_user.id)
+                await message.answer(
+                    translate(
+                        locale,
+                        "legacy_email_forbidden",
+                        email="" if legacy_user is None else legacy_user.source_email,
+                    )
+                )
+                return
             if status == "missing":
                 await message.answer(translate(locale, "email_missing"))
                 return

@@ -477,6 +477,126 @@ class EmptyPlaceholderStoreTests(unittest.IsolatedAsyncioTestCase):
             )
 
 
+class LegacyUserFreezeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_legacy_backup_is_not_extended_by_later_usage(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base_path = Path(td)
+            storage = JsonStorage(
+                email_store_path=base_path / "email.json",
+                taken_email_store_path=base_path / "email_taken.json",
+                subscription_key_store_path=base_path / "keys.json",
+                activated_key_store_path=base_path / "activated_keys.json",
+                legacy_user_store_path=base_path / "legacy_users.json",
+                user_locale_store_path=base_path / "user_locales.json",
+            )
+            (base_path / "email_taken.json").write_text(
+                json.dumps(
+                    {
+                        "historical@example.com": {
+                            "owner_id": "tg:101",
+                            "owner_kind": "telegram",
+                            "user_id": 101,
+                            "chat_id": 1001,
+                            "username": "legacy",
+                            "full_name": "Legacy User",
+                            "created_at": "2026-01-01T00:00:00+00:00",
+                            "last_used_at": "2026-01-01T00:00:00+00:00",
+                            "request_count": 1,
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            legacy_user = await storage.get_legacy_user("tg:101")
+            self.assertIsNotNone(legacy_user)
+            assert legacy_user is not None
+            self.assertEqual(legacy_user.source_email, "historical@example.com")
+            self.assertTrue((base_path / "legacy_users.backup.json").exists())
+
+            await storage.reserve_email(
+                "later@example.com",
+                owner_id="tg:202",
+                owner_kind="telegram",
+                user_id=202,
+                chat_id=2002,
+                username="later",
+                full_name="Later User",
+            )
+
+            self.assertIsNone(await storage.get_legacy_user("tg:202"))
+            backup = json.loads(
+                (base_path / "legacy_users.backup.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(set(backup), {"tg:101"})
+
+    async def test_legacy_request_cannot_access_another_email(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            base_path = Path(td)
+            storage = JsonStorage(
+                email_store_path=base_path / "email.json",
+                taken_email_store_path=base_path / "email_taken.json",
+                subscription_key_store_path=base_path / "keys.json",
+                activated_key_store_path=base_path / "activated_keys.json",
+                legacy_user_store_path=base_path / "legacy_users.json",
+                user_locale_store_path=base_path / "user_locales.json",
+            )
+            service = BotService(
+                settings=Settings(
+                    email_store_path=base_path / "email.json",
+                    taken_email_store_path=base_path / "email_taken.json",
+                    subscription_key_store_path=base_path / "keys.json",
+                    activated_key_store_path=base_path / "activated_keys.json",
+                    legacy_user_store_path=base_path / "legacy_users.json",
+                    user_locale_store_path=base_path / "user_locales.json",
+                    concurrent_mail_workers=1,
+                ),
+                storage=storage,
+            )
+            try:
+                await storage.upsert_account(
+                    EmailAccount(
+                        login_email="other@example.com",
+                        login_password="pass",
+                        recovery_email="recovery@example.com",
+                        recovery_password="recovery-pass",
+                        refresh_token="refresh-token",
+                        client_id="client-id",
+                        raw="other@example.com:pass:recovery@example.com:recovery-pass:refresh-token:client-id",
+                    )
+                )
+                (base_path / "legacy_users.json").write_text(
+                    json.dumps(
+                        {
+                            "tg:101": {
+                                "requester_id": "tg:101",
+                                "user_id": 101,
+                                "chat_id": 1001,
+                                "username": "legacy",
+                                "full_name": "Legacy User",
+                                "source_email": "historical@example.com",
+                                "captured_at": "2026-01-01T00:00:00+00:00",
+                            }
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+                status = await service.start_legacy_code_request(
+                    bot=object(),  # type: ignore[arg-type]
+                    user_id=101,
+                    chat_id=1001,
+                    username="legacy",
+                    full_name="Legacy User",
+                    email_address="other@example.com",
+                )
+
+                self.assertEqual(status, "forbidden")
+                self.assertFalse((base_path / "email_taken.json").exists())
+            finally:
+                await service.shutdown()
+
+
 class SubscriptionRequestCancellationTests(unittest.IsolatedAsyncioTestCase):
     async def test_switch_account_cancels_active_subscription_code_delivery(self) -> None:
         with tempfile.TemporaryDirectory() as td:
