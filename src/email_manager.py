@@ -2,6 +2,7 @@ import email
 import hashlib
 import imaplib
 import json
+import logging
 import random
 import re
 import threading
@@ -21,6 +22,21 @@ from src.storage import EmailAccount
 CODE_REGEX = re.compile(r"\b\d{6}\b")
 HTML_TAG_REGEX = re.compile(r"<[^>]+>")
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+LOGGER = logging.getLogger(__name__)
+IMAP_MONTH_NAMES = (
+    "Jan",
+    "Feb",
+    "Mar",
+    "Apr",
+    "May",
+    "Jun",
+    "Jul",
+    "Aug",
+    "Sep",
+    "Oct",
+    "Nov",
+    "Dec",
+)
 
 
 class CodeWaitTimeout(RuntimeError):
@@ -246,7 +262,13 @@ class EmailCodeFetcher:
                     )
                     # A missing or inaccessible junk folder must not prevent an
                     # otherwise usable inbox from supplying its codes.
-                except Exception:
+                except Exception as exc:
+                    LOGGER.warning(
+                        "Recent login-code scan failed for mailbox folder %s (%s): %s",
+                        folder,
+                        account.login_email,
+                        exc,
+                    )
                     continue
 
                 for record in records_in_folder:
@@ -254,10 +276,15 @@ class EmailCodeFetcher:
                         continue
                     identities.add(record.message_identity)
                     records.append(record)
-        except Exception:
+        except Exception as exc:
             # The caller is polling a display-only history.  A transient
             # token/IMAP failure must leave its already persisted history
             # usable and be retried on the next scheduled scan.
+            LOGGER.warning(
+                "Recent login-code scan failed for mailbox %s: %s",
+                account.login_email,
+                exc,
+            )
             return []
         finally:
             self._safe_logout(imap)
@@ -282,46 +309,73 @@ class EmailCodeFetcher:
         # IMAP SINCE works at day precision, so the precise UTC cutoff below
         # remains necessary.  Search all matching UIDs instead of only the
         # most recent UID: several login attempts may arrive between scans.
-        search_day = cutoff.strftime("%d-%b-%Y")
-        status, data = self._imap_uid(
-            imap,
-            "search",
-            f'(FROM "{self.search_from}" SINCE {search_day})',
+        # IMAP requires English month names regardless of the host locale.
+        search_day = (
+            f"{cutoff.day:02d}-{IMAP_MONTH_NAMES[cutoff.month - 1]}-{cutoff.year:04d}"
         )
-        if status != "OK":
-            return []
+        search_criteria = f'FROM "{self.search_from}" SINCE {search_day}'
+        status, data = self._imap_uid(imap, "search", search_criteria)
+        uids = self._extract_uids(data) if status == "OK" else []
+
+        # Keep the pre-history scanner's proven query as a fallback.  Some
+        # Outlook tenants reject or mis-index a compound FROM+SINCE search,
+        # even though a plain FROM search works correctly.
+        if not uids:
+            fallback_status, fallback_data = self._imap_uid(
+                imap,
+                "search",
+                f'FROM "{self.search_from}"',
+            )
+            if fallback_status == "OK":
+                uids.extend(self._extract_uids(fallback_data))
+
+        # Some tenants index the displayed sender differently from the RFC822
+        # From header.  A final time-only search lets local sender validation
+        # accept provider aliases without making the normal path expensive.
+        if not uids:
+            fallback_status, fallback_data = self._imap_uid(
+                imap,
+                "search",
+                f"SINCE {search_day}",
+            )
+            if fallback_status == "OK":
+                uids.extend(self._extract_uids(fallback_data))
+        uids = list(dict.fromkeys(uids))
 
         records: list[RecentCodeRecord] = []
-        for uid in reversed(self._extract_uids(data)):
-            raw_message = self._fetch_raw_message_from_selected_folder(imap, uid)
-            if raw_message is None:
-                continue
+        for uid in reversed(uids):
+            try:
+                raw_message = self._fetch_raw_message_from_selected_folder(imap, uid)
+                if raw_message is None:
+                    continue
 
-            message = email.message_from_bytes(raw_message)
-            timestamp = self._get_message_datetime(message)
-            if (
-                timestamp is None
-                or timestamp < cutoff
-                or not self._is_expected_sender(message)
-            ):
-                continue
+                message = email.message_from_bytes(raw_message)
+                timestamp = self._get_message_datetime(message)
+                if (
+                    timestamp is None
+                    or timestamp < cutoff
+                    or not self._is_expected_sender(message)
+                ):
+                    continue
 
-            # The history import accepts a code from any textual mail part or
-            # from the subject.  Keep ``_extract_code`` untouched because the
-            # existing wait path deliberately retains its established parsing
-            # behaviour.
-            code = self._extract_recent_code(message)
-            if not code:
-                continue
+                # The history import accepts a code from any textual mail
+                # part or from the subject.  Keep ``_extract_code`` untouched
+                # because the existing wait path retains its parsing.
+                code = self._extract_recent_code(message)
+                if not code:
+                    continue
 
-            records.append(
-                RecentCodeRecord(
-                    code=code,
-                    timestamp=timestamp,
-                    folder=folder,
-                    message_identity=self._message_identity(message, raw_message),
+                records.append(
+                    RecentCodeRecord(
+                        code=code,
+                        timestamp=timestamp,
+                        folder=folder,
+                        message_identity=self._message_identity(message, raw_message),
+                    )
                 )
-            )
+            except Exception:
+                # One malformed message must not hide all other login mails.
+                continue
         return records
 
     @staticmethod
@@ -356,7 +410,26 @@ class EmailCodeFetcher:
     def _is_expected_sender(self, message: Message) -> bool:
         """Defence in depth for IMAP servers with loose FROM search rules."""
         _, sender = parseaddr(str(message.get("From") or ""))
-        return sender.casefold() == self.search_from.strip().casefold()
+        normalized_sender = sender.strip().casefold()
+        normalized_expected = self.search_from.strip().casefold()
+        if not normalized_sender or not normalized_expected:
+            return False
+        if normalized_sender == normalized_expected:
+            return True
+
+        # Perplexity has used more than one sender mailbox over time.  Only
+        # apply the relaxed rule for the provider's own domain; custom
+        # deployments keep exact matching semantics.
+        expected_domain = normalized_expected.rsplit("@", 1)[-1]
+        sender_domain = normalized_sender.rsplit("@", 1)[-1]
+        if not (
+            expected_domain == "perplexity.ai"
+            or expected_domain.endswith(".perplexity.ai")
+        ):
+            return False
+        return sender_domain == "perplexity.ai" or sender_domain.endswith(
+            ".perplexity.ai"
+        )
 
     def _extract_recent_code(self, message: Message) -> str | None:
         text_parts: list[str] = [str(message.get("Subject") or "")]
@@ -369,11 +442,13 @@ class EmailCodeFetcher:
                     continue
                 content = self._decode_part(part)
                 if part.get_content_type() == "text/html":
+                    text_parts.append(HTML_TAG_REGEX.sub("", content))
                     content = HTML_TAG_REGEX.sub(" ", content)
                 text_parts.append(content)
         else:
             content = self._decode_part(message)
             if message.get_content_type() == "text/html":
+                text_parts.append(HTML_TAG_REGEX.sub("", content))
                 content = HTML_TAG_REGEX.sub(" ", content)
             text_parts.append(content)
 
@@ -493,13 +568,18 @@ class EmailCodeFetcher:
         uid: str,
     ) -> bytes | None:
         status, data = self._imap_uid(imap, "fetch", uid, "(RFC822)")
-        if status != "OK" or not data or not data[0]:
+        if status != "OK" or not data:
             return None
 
-        raw_message = data[0][1]
-        if not isinstance(raw_message, bytes):
-            return None
-        return raw_message
+        # RFC822 FETCH responses commonly contain a metadata tuple followed
+        # by a trailing bytes marker.  Do not assume the tuple is item zero.
+        for item in data:
+            if not isinstance(item, tuple) or len(item) < 2:
+                continue
+            raw_message = item[1]
+            if isinstance(raw_message, bytes):
+                return raw_message
+        return None
 
     def _extract_code(self, message: Message) -> str | None:
         body_parts: list[str] = []
@@ -540,7 +620,10 @@ class EmailCodeFetcher:
             return payload_text if isinstance(payload_text, str) else ""
 
         charset = part.get_content_charset() or "utf-8"
-        return payload.decode(charset, errors="ignore")  # type: ignore
+        try:
+            return payload.decode(charset, errors="ignore")  # type: ignore
+        except LookupError:
+            return payload.decode("utf-8", errors="ignore")
 
     def _get_message_datetime(self, message: Message) -> datetime | None:
         raw_date = message.get("Date")

@@ -434,6 +434,7 @@ def create_web_app(service: BotService) -> FastAPI:
         if subscription is not None:
             _, _, login_codes = await service.get_web_login_code_history(
                 requester_id=requester_id,
+                scan=False,
             )
         return build_page_response(
             locale=locale,
@@ -459,6 +460,7 @@ def create_web_app(service: BotService) -> FastAPI:
         if subscription is not None:
             _, _, login_codes = await service.get_web_login_code_history(
                 requester_id=requester_id,
+                scan=False,
             )
 
         if status == "inactive":
@@ -1363,12 +1365,29 @@ def render_page(
     text = perplexity_text(locale)
     flash = render_status_block(status_message, status_kind)
     logout_control = ""
+    bonus_block = ""
     if subscription is not None:
         logout_control = f"""
         <form action="{html.escape(logout_path, quote=True)}" method="post">
           <input type="hidden" name="lang" value="{safe_locale}">
           <button type="submit">{html.escape(text['logout_button'])}</button>
         </form>"""
+        bonus_block = f"""
+      <div class="info-actions">
+        <button class="bonus-button" id="get-bonus" type="button" aria-label="{html.escape(text['bonus_button'], quote=True)}">
+          <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-gift h-5 w-5" aria-hidden="true"><rect x="3" y="8" width="18" height="4" rx="1"></rect><path d="M12 8v13"></path><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"></path><path d="M7.5 8a2.5 2.5 0 0 1 0-5A4.8 8 0 0 1 12 8a4.8 8 0 0 1 4.5-5 2.5 2.5 0 0 1 0 5"></path></svg>
+          <span>{html.escape(text['bonus_button'])}</span>
+        </button>
+      </div>
+      <section class="bonus-claim" id="bonus-claim" hidden>
+        <p>{html.escape(text['bonus_instructions'])}</p>
+        <form method="post" action="{html.escape(bonus_path, quote=True)}">
+          <input type="hidden" name="lang" value="{safe_locale}">
+          <label for="promo-code">{html.escape(text['promo_code'])}</label>
+          <input id="promo-code" name="promo_code" autocomplete="off" autocapitalize="characters" required>
+          <button class="bonus-button wide" type="submit">{html.escape(text['claim_bonus'])}</button>
+        </form>
+      </section>"""
 
     if subscription is None:
         activation_content = f"""
@@ -1419,21 +1438,7 @@ def render_page(
       <p class="hint">{html.escape(text['questions_hint'])}</p>
       {flash}
       {activation_content}
-      <div class="info-actions">
-        <button class="bonus-button" id="get-bonus" type="button" aria-label="{html.escape(text['bonus_button'], quote=True)}">
-          <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-gift h-5 w-5" aria-hidden="true"><rect x="3" y="8" width="18" height="4" rx="1"></rect><path d="M12 8v13"></path><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"></path><path d="M7.5 8a2.5 2.5 0 0 1 0-5A4.8 8 0 0 1 12 8a4.8 8 0 0 1 4.5-5 2.5 2.5 0 0 1 0 5"></path></svg>
-          <span>{html.escape(text['bonus_button'])}</span>
-        </button>
-      </div>
-      <section class="bonus-claim" id="bonus-claim" hidden>
-        <p>{html.escape(text['bonus_instructions'])}</p>
-        <form method="post" action="{html.escape(bonus_path, quote=True)}">
-          <input type="hidden" name="lang" value="{safe_locale}">
-          <label for="promo-code">{html.escape(text['promo_code'])}</label>
-          <input id="promo-code" name="promo_code" autocomplete="off" autocapitalize="characters" required>
-          <button class="bonus-button wide" type="submit">{html.escape(text['claim_bonus'])}</button>
-        </form>
-      </section>
+      {bonus_block}
     </section>
     {subscription_block}
     {render_perplexity_faq(locale)}
@@ -1442,7 +1447,45 @@ def render_page(
     (function() {{
       var bonusButton=document.getElementById('get-bonus'), bonusClaim=document.getElementById('bonus-claim');
       if(bonusButton&&bonusClaim) bonusButton.addEventListener('click',function(){{ bonusClaim.hidden=!bonusClaim.hidden; if(!bonusClaim.hidden) {{ var promoInput=document.getElementById('promo-code'); if(promoInput) promoInput.focus(); }} }});
-      document.querySelectorAll('[data-copy]').forEach(function(button) {{ button.addEventListener('click',function() {{ var value=button.dataset.copy||''; if(!value||!navigator.clipboard) return; navigator.clipboard.writeText(value).then(function() {{ var original=button.dataset.originalLabel||button.textContent; button.dataset.originalLabel=original; var label=button.querySelector('span'); if(label) label.textContent={json.dumps(text['copied'])}; else button.textContent={json.dumps(text['copied'])}; window.setTimeout(function() {{ if(label) label.textContent={json.dumps(text['copy'])}; else button.textContent=original; }},1500); }}); }});
+      function copyFallback(value) {{
+        return new Promise(function(resolve, reject) {{
+          var area=document.createElement('textarea');
+          area.value=value;
+          area.setAttribute('readonly','');
+          area.style.position='fixed';
+          area.style.top='0';
+          area.style.left='-9999px';
+          document.body.appendChild(area);
+          area.focus();
+          area.select();
+          area.setSelectionRange(0, value.length);
+          try {{ if (document.execCommand('copy')) resolve(); else reject(new Error('copy failed')); }}
+          catch (error) {{ reject(error); }}
+          finally {{ document.body.removeChild(area); }}
+        }});
+      }}
+      function copyValue(value) {{
+        if (navigator.clipboard && navigator.clipboard.writeText) {{
+          return navigator.clipboard.writeText(value).catch(function() {{ return copyFallback(value); }});
+        }}
+        return copyFallback(value);
+      }}
+      function markCopied(button) {{
+        var label=button.querySelector('span');
+        var original=button.dataset.originalLabel || (label ? label.textContent : button.textContent);
+        button.dataset.originalLabel=original;
+        if (label) label.textContent={json.dumps(text['copied'])}; else button.textContent={json.dumps(text['copied'])};
+        window.setTimeout(function() {{ if (label) label.textContent={json.dumps(text['copy'])}; else button.textContent=original; }}, 1500);
+      }}
+      document.querySelectorAll('[data-copy]').forEach(function(button) {{
+        button.addEventListener('click', function(event) {{
+          event.preventDefault();
+          event.stopPropagation();
+          var value=button.getAttribute('data-copy') || '';
+          if (!value) return;
+          copyValue(value).then(function() {{ markCopied(button); }});
+        }});
+      }});
       var historyUrl={json.dumps(history_path)}, tableBody=document.getElementById('login-code-rows'), lastMessage=document.getElementById('last-login-message'), accountStatus=document.getElementById('account-status');
       function addCell(row,text,className) {{ var cell=document.createElement('td'); cell.textContent=text; if(className) cell.className=className; row.appendChild(cell); }}
       function renderHistory(entries) {{

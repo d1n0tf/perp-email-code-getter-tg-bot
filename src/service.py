@@ -475,12 +475,13 @@ class BotService:
         self,
         *,
         requester_id: str,
+        scan: bool = True,
     ) -> tuple[str, ActivatedSubscription | SubscriptionKey | None, list[LoginCodeHistoryEntry]]:
         """Return the shared login-code history only for a valid key holder.
 
-        A page refresh asks the mailbox scanner for fresh messages at most once
-        per mailbox every 10 seconds. Every browser holding the same active key
-        then reads the same persisted history.
+        HTML pages read the already persisted snapshot so activation does not
+        wait on IMAP. The polling endpoint still asks the mailbox scanner for
+        fresh messages at most once per mailbox every 10 seconds.
         """
         subscription = await self.get_requester_activated_subscription(requester_id)
         if subscription is None:
@@ -493,8 +494,9 @@ class BotService:
 
         # Mailbox failures are temporary and must not hide codes already
         # imported into the local history from an authorized key holder.
-        with contextlib.suppress(Exception):
-            await self._scan_login_code_history(subscription.account)
+        if scan:
+            with contextlib.suppress(Exception):
+                await self._scan_login_code_history(subscription.account)
         entries = await self.storage.list_login_code_history(
             subscription.key.email_address
         )

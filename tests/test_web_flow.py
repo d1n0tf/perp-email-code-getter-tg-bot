@@ -126,15 +126,13 @@ class WebFlowTests(BaseWebFlowTestCase):
         self.assertIn("PERPLEXITY PANEL", response.text)
         self.assertIn("Activate key", response.text)
         self.assertIn("Access key", response.text)
-        self.assertIn("Get bonus", response.text)
         self.assertIn("Help &amp; answers", response.text)
-        self.assertIn('class="lucide lucide-gift', response.text)
-        self.assertIn('id="get-bonus"', response.text)
-        self.assertIn('id="bonus-claim" hidden', response.text)
-        self.assertIn("/perp-code-getter/bonus", response.text)
-        self.assertIn("To receive bonus days", response.text)
-        self.assertIn("Promo code", response.text)
-        self.assertNotIn("coming soon", response.text.lower())
+        self.assertNotIn("Get bonus", response.text)
+        self.assertNotIn('id="get-bonus"', response.text)
+        self.assertNotIn('id="bonus-claim"', response.text)
+        self.assertNotIn("/perp-code-getter/bonus", response.text)
+        self.assertNotIn("To receive bonus days", response.text)
+        self.assertNotIn('class="lucide lucide-gift', response.text)
         self.assertNotIn('class="secondary action-link"', response.text)
         self.assertEqual(response.text.count('href="#faq"'), 1)
         self.assertIn('id="faq"', response.text)
@@ -168,10 +166,19 @@ class WebFlowTests(BaseWebFlowTestCase):
 
         self.assertEqual(activate_response.status_code, 200)
         self.assertIn("shared@example.com", activate_response.text)
+        self.assertIn('data-copy="shared@example.com"', activate_response.text)
+        self.assertIn("document.execCommand('copy')", activate_response.text)
+        self.assertEqual(activate_response.text.count('data-copy="shared@example.com"'), 2)
         self.assertIn("Perplexity PRO subscription", activate_response.text)
         self.assertIn("LOGIN CODES", activate_response.text)
         self.assertIn("login-code-history", activate_response.text)
         self.assertIn("Log out", activate_response.text)
+        self.assertIn("Get bonus", activate_response.text)
+        self.assertIn('id="get-bonus"', activate_response.text)
+        self.assertIn('id="bonus-claim" hidden', activate_response.text)
+        self.assertIn("/perp-code-getter/bonus", activate_response.text)
+        self.assertIn("To receive bonus days", activate_response.text)
+        self.assertIn('class="lucide lucide-gift', activate_response.text)
         self.assertNotIn("Request code", activate_response.text)
         self.assertNotIn("Change account", activate_response.text)
         self.assertNotIn("/request-code", activate_response.text)
@@ -199,6 +206,21 @@ class WebFlowTests(BaseWebFlowTestCase):
         self.assertEqual(payload["status"], "success")
         self.assertEqual(payload["email"], "shared@example.com")
         self.assertEqual(payload["code"], "654321")
+
+    async def test_activate_code_does_not_wait_for_mailbox_scan(self) -> None:
+        scanned = {"called": False}
+
+        def slow_scan(*args, **kwargs):
+            scanned["called"] = True
+            raise AssertionError("activation must not wait for IMAP")
+
+        self.service.fetcher.scan_recent_codes = slow_scan  # type: ignore[method-assign]
+        response = await self.activate_key(locale="en")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(scanned["called"])
+        self.assertIn("shared@example.com", response.text)
+        self.assertIn("LOGIN CODES", response.text)
 
     async def test_login_code_history_is_shared_by_active_key_holders(self) -> None:
         await self.activate_key(locale="en")
@@ -419,7 +441,12 @@ class WebFlowTests(BaseWebFlowTestCase):
         self.assertIn("Ключ доступа", russian_logout.text)
 
     async def test_bonus_panel_is_hidden_until_requested(self) -> None:
-        page = (await self.client.get(self.route("/"), params={"lang": "ru"})).text
+        inactive_page = (await self.client.get(self.route("/"), params={"lang": "ru"})).text
+        self.assertNotIn('id="get-bonus"', inactive_page)
+        self.assertNotIn("Получить бонус", inactive_page)
+        self.assertNotIn("/perp-code-getter/bonus", inactive_page)
+
+        page = (await self.activate_key(locale="ru")).text
         self.assertIn('id="get-bonus"', page)
         self.assertIn('id="bonus-claim" hidden', page)
         self.assertIn("/perp-code-getter/bonus", page)
