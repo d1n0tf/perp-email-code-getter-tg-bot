@@ -1286,8 +1286,10 @@ def render_page(
       {flash}
       {activation_content}
       <div class="info-actions">
-        <a class="secondary action-link" href="#faq">{html.escape(text['faq_button'])}</a>
-        <button class="bonus-button" id="get-bonus" type="button">{html.escape(text['bonus_button'])}</button>
+        <button class="bonus-button" id="get-bonus" type="button" aria-label="{html.escape(text['bonus_button'], quote=True)}">
+          <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="lucide lucide-gift h-5 w-5" aria-hidden="true"><rect x="3" y="8" width="18" height="4" rx="1"></rect><path d="M12 8v13"></path><path d="M19 12v7a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2v-7"></path><path d="M7.5 8a2.5 2.5 0 0 1 0-5A4.8 8 0 0 1 12 8a4.8 8 0 0 1 4.5-5 2.5 2.5 0 0 1 0 5"></path></svg>
+          <span>{html.escape(text['bonus_button'])}</span>
+        </button>
       </div>
       <section class="bonus-claim" id="bonus-claim" hidden>
         <p>{html.escape(text['bonus_coming_soon'])}</p>
@@ -1504,12 +1506,6 @@ PERPLEXITY_TEXT = {
         "no_codes": "Пока нет новых кодов. Отправьте вход в Perplexity и подождите до 10 секунд.",
         "retention": "⚠️ Полученные коды хранятся до 100 штук, затем удаляются самые старые коды.",
         "faq_heading": "ОТВЕТЫ НА ВОПРОСЫ",
-        "faq_1_q": "Где взять код для входа?",
-        "faq_1_a": "Введите почту из подписки на сайте или в приложении Perplexity. Новый код появится в таблице автоматически.",
-        "faq_2_q": "Почему код ещё не появился?",
-        "faq_2_a": "Проверьте почту и подождите до 10 секунд. Сканируются папки «Входящие» и «Спам»; убедитесь, что отправитель Perplexity не заблокирован.",
-        "faq_3_q": "Можно ли открыть подписку в другом браузере?",
-        "faq_3_a": "Да. Активируйте тот же действующий ключ. История кодов доступна всем владельцам этого ключа.",
     },
     "en": {
         "title": "Perplexity Panel",
@@ -1555,12 +1551,6 @@ PERPLEXITY_TEXT = {
         "no_codes": "No new codes yet. Start a Perplexity sign-in and wait up to 10 seconds.",
         "retention": "⚠️ Up to 100 received codes are retained; older codes are then deleted.",
         "faq_heading": "HELP & ANSWERS",
-        "faq_1_q": "Where can I get a login code?",
-        "faq_1_a": "Enter the subscription email on the Perplexity site or app. The new code appears in the table automatically.",
-        "faq_2_q": "Why is the code not here yet?",
-        "faq_2_a": "Check your inbox and wait up to 10 seconds. Inbox and spam folders are scanned; make sure Perplexity is not blocked.",
-        "faq_3_q": "Can I open the subscription in another browser?",
-        "faq_3_a": "Yes. Activate the same valid key. Code history is available to every holder of that key.",
     },
 }
 
@@ -1627,11 +1617,7 @@ def render_login_code_rows(entries: list[LoginCodeHistoryEntry], locale: str) ->
 
 def render_perplexity_faq(locale: str) -> str:
     text = perplexity_text(locale)
-    rows = "".join(
-        f"<details class=\"faq-item\"><summary>{html.escape(text[f'faq_{index}_q'])}</summary><p>{html.escape(text[f'faq_{index}_a'])}</p></details>"
-        for index in range(1, 4)
-    )
-    return f'<section id="faq" class="card faq"><h2>{html.escape(text["faq_heading"])}</h2><div class="faq-items">{rows}</div></section>'
+    return f'<section id="faq" class="card faq"><h2>{html.escape(text["faq_heading"])}</h2><div class="faq-items"></div></section>'
 
 
 def perplexity_page_styles() -> str:
@@ -1644,11 +1630,11 @@ def perplexity_page_styles() -> str:
     button,.action-link { border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sans-serif; cursor:pointer; text-decoration:none; } .primary { color:#071120; background:var(--accent); } .secondary { color:var(--text); background:#263652; } .wide { display:block; width:100%; margin-top:18px; } .hint { color:var(--muted); font-size:14px; }
     .top-links { display:flex; justify-content:space-between; align-items:center; gap:8px; margin:0 0 -4px; } .top-links-end { display:flex; align-items:center; gap:8px; } .top-links form { margin:0; } .top-links a, .top-links button { color:var(--text); font:700 16px/1.55 Arial,sans-serif; text-decoration:none; padding:7px 10px; border:1px solid var(--line); border-radius:7px; background:transparent; cursor:pointer; } .top-links a:hover, .top-links button:hover { border-color:var(--accent); color:var(--accent); }
     .status { border-radius:9px; padding:11px 13px; margin:12px 0; } .status.error { color:#ffdce0; background:rgba(255,120,133,.18); border:1px solid rgba(255,120,133,.45); } .status.success { color:#d8ffec; background:rgba(95,213,160,.15); border:1px solid rgba(95,213,160,.45); }
-    .info-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:20px; } .info-actions>* { display:inline-flex; align-items:center; justify-content:center; } .bonus-button { color:#281500; background:linear-gradient(135deg,#ffd46b,#f59e0b); } .bonus-claim { margin-top:14px; padding:16px; border:1px solid rgba(245,158,11,.45); border-radius:11px; background:rgba(245,158,11,.09); color:#ffe2a2; } .active-key-row { display:flex; justify-content:space-between; gap:12px; padding:12px; border-radius:9px; background:#0b1321; }
+    .info-actions { display:grid; grid-template-columns:1fr; gap:10px; margin-top:20px; } .info-actions button { width:100%; display:inline-flex; justify-content:center; align-items:center; gap:9px; min-height:46px; } .info-actions .bonus-button { font-size:16px; } .bonus-button { color:#281500; background:linear-gradient(135deg,#ffd46b,#f59e0b); } .bonus-button:hover,.bonus-button:focus { background:linear-gradient(135deg,#ffe191,#fbbf24); } .bonus-button svg { width:20px; height:20px; flex:0 0 auto; } .bonus-claim { margin-top:14px; padding:16px; border:1px solid rgba(245,158,11,.45); border-radius:11px; background:rgba(245,158,11,.09); color:#ffe2a2; } .active-key-row { display:flex; justify-content:space-between; gap:12px; padding:12px; border-radius:9px; background:#0b1321; }
     .details { display:grid; grid-template-columns:minmax(220px,auto) 1fr; gap:10px 18px; margin:0; } .details dt { color:var(--muted); } .details dd { margin:0; min-width:0; overflow-wrap:anywhere; } code { color:#b9d4ff; font-family:Consolas,'Courier New',monospace; } .copy-value,.inline-copy { padding:0; border:0; color:#b9d4ff; background:transparent; font:inherit; font-weight:700; text-align:left; } .copy-value span { margin-left:8px; font-size:12px; color:var(--accent); } .instructions { margin-top:24px; padding-top:20px; border-top:1px solid var(--line); } .instructions ol { margin:0; padding-left:24px; } .history-summary { display:flex; justify-content:space-between; flex-wrap:wrap; gap:10px 18px; padding:12px; border-radius:9px; background:#0b1321; } .account-active { color:var(--success); } .account-inactive { color:var(--danger); }
     .table-wrap { overflow-x:auto; } table { width:100%; min-width:660px; border-collapse:collapse; } th,td { padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; } th { color:var(--muted); font-size:13px; } .login-code { color:#d8ffec; font-weight:700; } .empty { text-align:center; color:var(--muted); } .retention { margin:16px 0 0; color:var(--warn); font-size:13px; }
     .faq { scroll-margin-top:24px; } .faq-items { border-top:1px solid var(--line); } .faq-item { display:block; border-bottom:1px solid var(--line); } .faq-item summary { cursor:pointer; padding:12px 38px 12px 14px; font-weight:700; position:relative; list-style:none; } .faq-item summary::-webkit-details-marker { display:none; } .faq-item summary::after { content:'+'; position:absolute; right:14px; color:var(--accent); font-size:20px; } .faq-item[open] summary::after { content:'−'; } .faq-item p { padding:0 14px 14px; margin:0; color:var(--muted); }
-    @media(max-width:650px) { .page { width:min(100% - 20px,960px); margin-top:12px; } .card { padding:18px; border-radius:12px; } h1 { font-size:24px; } .details,.info-actions { grid-template-columns:1fr; } .history-summary { display:block; } .history-summary span { display:block; margin:5px 0; } }
+    @media(max-width:650px) { .page { width:min(100% - 20px,960px); margin-top:12px; } .card { padding:18px; border-radius:12px; } h1 { font-size:24px; } .details { grid-template-columns:1fr; } .history-summary { display:block; } .history-summary span { display:block; margin:5px 0; } }
     """
 
 
