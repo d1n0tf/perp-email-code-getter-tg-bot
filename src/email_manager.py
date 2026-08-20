@@ -262,6 +262,18 @@ class EmailCodeFetcher:
                     )
                     # A missing or inaccessible junk folder must not prevent an
                     # otherwise usable inbox from supplying its codes.
+                except imaplib.IMAP4.error as exc:
+                    # Outlook commonly returns BAD/NO for a configured folder
+                    # that is absent or named differently in this mailbox.
+                    # That is a normal partial-scan condition, not a failed
+                    # history import when another folder remains available.
+                    LOGGER.info(
+                        "Skipping unavailable mailbox folder %s (%s): %s",
+                        folder,
+                        account.login_email,
+                        exc,
+                    )
+                    continue
                 except Exception as exc:
                     LOGGER.warning(
                         "Recent login-code scan failed for mailbox folder %s (%s): %s",

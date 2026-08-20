@@ -498,9 +498,20 @@ class BotService:
             with contextlib.suppress(Exception):
                 await self._scan_login_code_history(subscription.account)
         entries = await self.storage.list_login_code_history(
-            subscription.key.email_address
+            self._login_code_history_key(subscription.key)
         )
         return "active", subscription, entries
+
+    @staticmethod
+    def _login_code_history_key(key: SubscriptionKey) -> str:
+        """Return the stable history bucket for one subscription version.
+
+        The access version changes when an account or key is replaced, while
+        ordinary duration extensions keep it unchanged.  This gives a
+        replacement key a clean history without breaking sharing between
+        browsers that activated the same key.
+        """
+        return f"{normalize_key_code(key.code)}:{key.access_version}"
 
     async def claim_perplexity_promo(
         self,
@@ -575,19 +586,31 @@ class BotService:
                 raise
             else:
                 self._login_code_last_scan_at[email_address] = monotonic()
-            await self.storage.add_login_code_history_entries(
-                [
-                    LoginCodeHistoryEntry(
-                        id=uuid4().hex,
-                        email_address=email_address,
-                        code=found_code.code,
-                        received_at=found_code.timestamp,
-                        message_key=found_code.message_identity,
-                    )
-                    for found_code in found_codes
-                ],
-                limit_per_email=100,
-            )
+            history_entries = [
+                LoginCodeHistoryEntry(
+                    id=uuid4().hex,
+                    email_address=email_address,
+                    code=found_code.code,
+                    received_at=found_code.timestamp,
+                    message_key=found_code.message_identity,
+                )
+                for found_code in found_codes
+            ]
+            if not history_entries:
+                return
+
+            # Scan the mailbox once per email, then persist the same snapshot
+            # in every current key bucket for that mailbox.  Holders of the
+            # same key share one bucket; a replacement key starts empty.
+            keys = await self.storage.list_subscription_keys()
+            for key in keys:
+                if key.email_address != email_address:
+                    continue
+                await self.storage.add_login_code_history_entries(
+                    self._login_code_history_key(key),
+                    history_entries,
+                    limit_per_key=100,
+                )
 
     async def begin_refresh_prompt(self, user_id: int) -> None:
         async with self._refresh_lock:

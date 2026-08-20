@@ -224,7 +224,9 @@ class WebFlowTests(BaseWebFlowTestCase):
 
     async def test_login_code_history_is_shared_by_active_key_holders(self) -> None:
         await self.activate_key(locale="en")
+        history_key = self.service._login_code_history_key(self.key)
         await self.storage.add_login_code_history_entries(
+            history_key,
             [
                 LoginCodeHistoryEntry(
                     id="new",
@@ -276,6 +278,51 @@ class WebFlowTests(BaseWebFlowTestCase):
         self.assertEqual(second.status_code, 200)
         self.assertEqual([entry["code"] for entry in second.json()["entries"]], ["654321"])
 
+    async def test_replacing_key_starts_a_fresh_history_bucket(self) -> None:
+        await self.activate_key(locale="en")
+        old_history_key = self.service._login_code_history_key(self.key)
+        await self.storage.add_login_code_history_entries(
+            old_history_key,
+            [
+                LoginCodeHistoryEntry(
+                    id="old-key-entry",
+                    email_address="shared@example.com",
+                    code="654321",
+                    received_at=datetime.now(timezone.utc),
+                    message_key="message-id:old-key-entry",
+                )
+            ],
+        )
+
+        account = await self.storage.get_account("shared@example.com")
+        assert account is not None
+        new_code = "NEW-KEY-2026"
+        status = await self.storage.replace_subscription_bundle(
+            original_email="shared@example.com",
+            original_code=self.key.code,
+            account=account,
+            key_code=new_code,
+            duration_days=self.key.duration_days,
+            activated_at=self.key.created_at,
+        )
+
+        self.assertEqual(status, "updated")
+        new_key = await self.storage.get_subscription_key(new_code)
+        assert new_key is not None
+        self.assertEqual(
+            await self.storage.list_login_code_history(
+                self.service._login_code_history_key(new_key)
+            ),
+            [],
+        )
+        self.assertEqual(
+            [
+                entry.code
+                for entry in await self.storage.list_login_code_history(old_history_key)
+            ],
+            ["654321"],
+        )
+
     async def test_login_code_history_is_not_available_after_activation_is_cleared(self) -> None:
         await self.activate_key(locale="en")
         await self.service.clear_requester_subscription_activation(
@@ -294,7 +341,9 @@ class WebFlowTests(BaseWebFlowTestCase):
 
     async def test_login_code_history_reports_expiration_without_disclosing_codes(self) -> None:
         await self.activate_key(locale="en")
+        history_key = self.service._login_code_history_key(self.key)
         await self.storage.add_login_code_history_entries(
+            history_key,
             [
                 LoginCodeHistoryEntry(
                     id="old-code",
@@ -339,10 +388,11 @@ class WebFlowTests(BaseWebFlowTestCase):
             )
             for index in range(101)
         ]
-        await self.storage.add_login_code_history_entries(entries)
-        await self.storage.add_login_code_history_entries([entries[-1]])
+        history_key = self.service._login_code_history_key(self.key)
+        await self.storage.add_login_code_history_entries(history_key, entries)
+        await self.storage.add_login_code_history_entries(history_key, [entries[-1]])
 
-        saved = await self.storage.list_login_code_history("shared@example.com")
+        saved = await self.storage.list_login_code_history(history_key)
         self.assertEqual(len(saved), 100)
         self.assertEqual({entry.message_key for entry in saved}, {f"message-id:{index}" for index in range(1, 101)})
 
@@ -386,7 +436,9 @@ class WebFlowTests(BaseWebFlowTestCase):
                 data={"lang": "en", "code": self.key.code},
             )
             self.assertEqual(other_activation.status_code, 200)
+            history_key = self.service._login_code_history_key(self.key)
             await self.storage.add_login_code_history_entries(
+                history_key,
                 [
                     LoginCodeHistoryEntry(
                         id="kept-code",
@@ -422,7 +474,7 @@ class WebFlowTests(BaseWebFlowTestCase):
             self.assertIsNotNone(await self.storage.get_user_activation(f"web:{other_cookie}"))
             self.assertIsNotNone(await self.storage.get_subscription_key(self.key.code))
             self.assertIsNotNone(await self.storage.get_account("shared@example.com"))
-            history = await self.storage.list_login_code_history("shared@example.com")
+            history = await self.storage.list_login_code_history(history_key)
             self.assertEqual([entry.code for entry in history], ["654321"])
 
             other_page = await other_client.get(self.route("/"), params={"lang": "en"})

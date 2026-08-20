@@ -911,14 +911,21 @@ class JsonStorage:
 
     async def list_login_code_history(
         self,
-        email_address: str,
+        history_key: str,
     ) -> list[LoginCodeHistoryEntry]:
-        normalized_email = normalize_email(email_address)
+        """Read one subscription-version history bucket.
+
+        Older email-keyed buckets are intentionally not used: they could
+        expose codes from a previous subscription key.
+        """
+        normalized_history_key = str(history_key).strip()
+        if not normalized_history_key:
+            return []
         async with self._login_code_history_lock:
             data = self._load_json(self.login_code_history_store_path, default={})
 
         entries: list[LoginCodeHistoryEntry] = []
-        for raw_entry in data.get(normalized_email, []):
+        for raw_entry in data.get(normalized_history_key, []):
             if not isinstance(raw_entry, dict):
                 continue
             try:
@@ -929,18 +936,17 @@ class JsonStorage:
 
     async def add_login_code_history_entries(
         self,
+        history_key: str,
         entries: list[LoginCodeHistoryEntry],
         *,
-        limit_per_email: int = 100,
+        limit_per_key: int = 100,
     ) -> list[LoginCodeHistoryEntry]:
-        """Persist unseen codes, deduplicated by the immutable mailbox message key."""
-        if limit_per_email < 1:
-            raise ValueError("limit_per_email must be positive")
+        """Persist unseen codes in one subscription-version bucket."""
+        if limit_per_key < 1:
+            raise ValueError("limit_per_key must be positive")
 
-        grouped: dict[str, list[LoginCodeHistoryEntry]] = {}
-        for entry in entries:
-            grouped.setdefault(normalize_email(entry.email_address), []).append(entry)
-        if not grouped:
+        normalized_history_key = str(history_key).strip()
+        if not normalized_history_key or not entries:
             return []
 
         async with self._login_code_history_lock:
@@ -950,31 +956,27 @@ class JsonStorage:
                 strict=True,
             )
             added: list[LoginCodeHistoryEntry] = []
-            changed = False
-            for email_address, new_entries in grouped.items():
-                existing: list[LoginCodeHistoryEntry] = []
-                for raw_entry in data.get(email_address, []):
-                    if not isinstance(raw_entry, dict):
-                        continue
-                    try:
-                        existing.append(LoginCodeHistoryEntry.from_dict(raw_entry))
-                    except (KeyError, TypeError, ValueError):
-                        continue
+            existing: list[LoginCodeHistoryEntry] = []
+            for raw_entry in data.get(normalized_history_key, []):
+                if not isinstance(raw_entry, dict):
+                    continue
+                try:
+                    existing.append(LoginCodeHistoryEntry.from_dict(raw_entry))
+                except (KeyError, TypeError, ValueError):
+                    continue
 
-                known_keys = {entry.message_key for entry in existing}
-                for entry in new_entries:
-                    if entry.message_key in known_keys:
-                        continue
-                    known_keys.add(entry.message_key)
-                    existing.append(entry)
-                    added.append(entry)
-                    changed = True
+            known_keys = {entry.message_key for entry in existing}
+            for entry in entries:
+                if entry.message_key in known_keys:
+                    continue
+                known_keys.add(entry.message_key)
+                existing.append(entry)
+                added.append(entry)
 
-                existing.sort(key=lambda entry: (entry.received_at, entry.id), reverse=True)
-                trimmed = existing[:limit_per_email]
-                if len(trimmed) != len(existing):
-                    changed = True
-                data[email_address] = [entry.to_dict() for entry in trimmed]
+            existing.sort(key=lambda entry: (entry.received_at, entry.id), reverse=True)
+            trimmed = existing[:limit_per_key]
+            changed = bool(added) or len(trimmed) != len(existing)
+            data[normalized_history_key] = [entry.to_dict() for entry in trimmed]
 
             if changed:
                 self._write_json(self.login_code_history_store_path, data)
