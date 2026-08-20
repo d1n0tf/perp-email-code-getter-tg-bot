@@ -27,6 +27,7 @@ from src.storage import (
     EmailAccount,
     JsonStorage,
     LegacyUser,
+    LoginCodeHistoryEntry,
     SubscriptionKey,
     UserKeyActivation,
     normalize_email,
@@ -79,6 +80,9 @@ class BotService:
         self._refresh_prompt_timeout_seconds = 15 * 60
         self._subscription_code_lock = asyncio.Lock()
         self._active_subscription_code_tasks: dict[str, asyncio.Task[None]] = {}
+        self._login_code_scan_locks: dict[str, asyncio.Lock] = {}
+        self._login_code_last_scan_at: dict[str, float] = {}
+        self._login_code_scan_interval_seconds = 10.0
 
     def is_admin(self, user_id: int) -> bool:
         if not self.settings.tg_admins:
@@ -465,6 +469,72 @@ class BotService:
         )
         self._register_web_request_task(request_id, task)
         return "started", request_id
+
+    async def get_web_login_code_history(
+        self,
+        *,
+        requester_id: str,
+    ) -> tuple[str, ActivatedSubscription | SubscriptionKey | None, list[LoginCodeHistoryEntry]]:
+        """Return the shared login-code history only for a valid key holder.
+
+        A page refresh asks the mailbox scanner for fresh messages at most once
+        per mailbox every 10 seconds. Every browser holding the same active key
+        then reads the same persisted history.
+        """
+        subscription = await self.get_requester_activated_subscription(requester_id)
+        if subscription is None:
+            return "inactive", None, []
+        if subscription.key.is_expired():
+            await self.clear_requester_subscription_activation(requester_id)
+            return "expired", subscription.key, []
+        if subscription.account is None:
+            return "email_missing", subscription.key, []
+
+        # Mailbox failures are temporary and must not hide codes already
+        # imported into the local history from an authorized key holder.
+        with contextlib.suppress(Exception):
+            await self._scan_login_code_history(subscription.account)
+        entries = await self.storage.list_login_code_history(
+            subscription.key.email_address
+        )
+        return "active", subscription, entries
+
+    async def _scan_login_code_history(self, account: EmailAccount) -> None:
+        email_address = account.login_email
+        scan_lock = self._login_code_scan_locks.setdefault(email_address, asyncio.Lock())
+        async with scan_lock:
+            last_scan_at = self._login_code_last_scan_at.get(email_address)
+            if (
+                last_scan_at is not None
+                and monotonic() - last_scan_at < self._login_code_scan_interval_seconds
+            ):
+                return
+
+            loop = asyncio.get_running_loop()
+            try:
+                found_codes = await loop.run_in_executor(
+                    self.executor,
+                    lambda: self.fetcher.scan_recent_codes(account, limit=20),
+                )
+            except Exception:
+                # Do not turn a transient mailbox issue into a permanent
+                # ten-second stale state; the next browser poll may recover.
+                raise
+            else:
+                self._login_code_last_scan_at[email_address] = monotonic()
+            await self.storage.add_login_code_history_entries(
+                [
+                    LoginCodeHistoryEntry(
+                        id=uuid4().hex,
+                        email_address=email_address,
+                        code=found_code.code,
+                        received_at=found_code.timestamp,
+                        message_key=found_code.message_identity,
+                    )
+                    for found_code in found_codes
+                ],
+                limit_per_email=100,
+            )
 
     async def begin_refresh_prompt(self, user_id: int) -> None:
         async with self._refresh_lock:

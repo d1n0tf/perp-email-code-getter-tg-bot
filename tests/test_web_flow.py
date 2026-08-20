@@ -1,7 +1,7 @@
 import asyncio
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from urllib.parse import parse_qs, urlparse
@@ -9,8 +9,9 @@ from urllib.parse import parse_qs, urlparse
 import httpx
 
 from src.config import Settings, settings
+from src.email_manager import RecentCodeRecord
 from src.service import BotService
-from src.storage import EmailAccount, JsonStorage
+from src.storage import EmailAccount, JsonStorage, LoginCodeHistoryEntry, SubscriptionKey
 from src.web import WEB_USER_COOKIE_NAME, build_web_path, create_web_app, render_wait_page
 
 
@@ -121,10 +122,16 @@ class WebFlowTests(BaseWebFlowTestCase):
         response = await self.client.get(f"{self.route('/')}?lang=en")
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Activate code", response.text)
-        self.assertIn("Seller code", response.text)
+        self.assertIn("PERPLEXITY PANEL", response.text)
+        self.assertIn("Activate key", response.text)
+        self.assertIn("Access key", response.text)
+        self.assertIn("Get bonus", response.text)
+        self.assertIn("Help &amp; answers", response.text)
         self.assertNotIn("example@outlook.com", response.text)
         self.assertNotIn('type="email"', response.text)
+        self.assertNotIn("Log out", response.text)
+        self.assertNotIn("Request code", response.text)
+        self.assertNotIn("Change account", response.text)
         self.assertIn("__perpLiveNavEnabled", response.text)
 
     async def test_activate_code_and_request_login_code_successfully(self) -> None:
@@ -132,8 +139,14 @@ class WebFlowTests(BaseWebFlowTestCase):
 
         self.assertEqual(activate_response.status_code, 200)
         self.assertIn("shared@example.com", activate_response.text)
-        self.assertIn("Request code", activate_response.text)
-        self.assertIn("Change account", activate_response.text)
+        self.assertIn("Perplexity PRO subscription", activate_response.text)
+        self.assertIn("LOGIN CODES", activate_response.text)
+        self.assertIn("login-code-history", activate_response.text)
+        self.assertIn("Log out", activate_response.text)
+        self.assertNotIn("Request code", activate_response.text)
+        self.assertNotIn("Change account", activate_response.text)
+        self.assertNotIn("/request-code", activate_response.text)
+        self.assertNotIn("/change-account", activate_response.text)
         self.assertIn(WEB_USER_COOKIE_NAME, self.client.cookies)
 
         request_response = await self.client.post(
@@ -158,6 +171,130 @@ class WebFlowTests(BaseWebFlowTestCase):
         self.assertEqual(payload["email"], "shared@example.com")
         self.assertEqual(payload["code"], "654321")
 
+    async def test_login_code_history_is_shared_by_active_key_holders(self) -> None:
+        await self.activate_key(locale="en")
+        await self.storage.add_login_code_history_entries(
+            [
+                LoginCodeHistoryEntry(
+                    id="new",
+                    email_address="shared@example.com",
+                    code="654321",
+                    received_at=datetime(2026, 8, 20, 13, 0, 13, tzinfo=timezone.utc),
+                    message_key="message-id:new",
+                ),
+                LoginCodeHistoryEntry(
+                    id="old",
+                    email_address="shared@example.com",
+                    code="123456",
+                    received_at=datetime(2026, 8, 20, 12, 0, 13, tzinfo=timezone.utc),
+                    message_key="message-id:old",
+                ),
+            ]
+        )
+
+        response = await self.client.get(
+            self.route("/login-code-history"),
+            params={"lang": "en"},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["status"], "active")
+        self.assertEqual([entry["code"] for entry in payload["entries"]], ["654321", "123456"])
+        self.assertEqual(payload["entries"][0]["received_at"], "20.08.2026 \\ 16:00:13")
+
+    async def test_history_endpoint_imports_scanned_codes_without_duplicates(self) -> None:
+        await self.activate_key(locale="en")
+        timestamp = datetime(2026, 8, 20, 13, 0, 13, tzinfo=timezone.utc)
+        self.service.fetcher.scan_recent_codes = lambda *args, **kwargs: [  # type: ignore[method-assign]
+            RecentCodeRecord(
+                code="654321",
+                timestamp=timestamp,
+                folder="INBOX",
+                message_identity="message-id:perplexity-login",
+            )
+        ]
+        self.service._login_code_last_scan_at.clear()
+
+        first = await self.client.get(self.route("/login-code-history"), params={"lang": "en"})
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual([entry["code"] for entry in first.json()["entries"]], ["654321"])
+
+        self.service._login_code_last_scan_at.clear()
+        second = await self.client.get(self.route("/login-code-history"), params={"lang": "en"})
+        self.assertEqual(second.status_code, 200)
+        self.assertEqual([entry["code"] for entry in second.json()["entries"]], ["654321"])
+
+    async def test_login_code_history_is_not_available_after_activation_is_cleared(self) -> None:
+        await self.activate_key(locale="en")
+        await self.service.clear_requester_subscription_activation(
+            f"web:{self.client.cookies[WEB_USER_COOKIE_NAME]}"
+        )
+
+        response = await self.client.get(
+            self.route("/login-code-history"),
+            params={"lang": "en"},
+        )
+
+        self.assertEqual(response.status_code, 404)
+        self.assertEqual(response.json()["status"], "missing")
+        self.assertEqual(response.json()["account_status"], "inactive")
+        self.assertEqual(response.json()["entries"], [])
+
+    async def test_login_code_history_reports_expiration_without_disclosing_codes(self) -> None:
+        await self.activate_key(locale="en")
+        await self.storage.add_login_code_history_entries(
+            [
+                LoginCodeHistoryEntry(
+                    id="old-code",
+                    email_address="shared@example.com",
+                    code="654321",
+                    received_at=datetime.now(timezone.utc),
+                    message_key="message-id:old-code",
+                )
+            ]
+        )
+        await self.storage.add_subscription_keys(
+            [
+                SubscriptionKey(
+                    code=self.key.code,
+                    email_address=self.key.email_address,
+                    duration_days=self.key.duration_days,
+                    created_at=self.key.created_at,
+                    expires_at=datetime.now(timezone.utc) - timedelta(seconds=1),
+                    access_version=self.key.access_version,
+                )
+            ]
+        )
+
+        response = await self.client.get(
+            self.route("/login-code-history"),
+            params={"lang": "en"},
+        )
+
+        self.assertEqual(response.status_code, 410)
+        self.assertEqual(response.json()["status"], "expired")
+        self.assertEqual(response.json()["account_status"], "expired")
+        self.assertEqual(response.json()["entries"], [])
+
+    async def test_history_store_deduplicates_and_keeps_latest_hundred_codes(self) -> None:
+        entries = [
+            LoginCodeHistoryEntry(
+                id=str(index),
+                email_address="shared@example.com",
+                code=f"{index:06d}",
+                received_at=datetime(2026, 8, 20, tzinfo=timezone.utc),
+                message_key=f"message-id:{index}",
+            )
+            for index in range(101)
+        ]
+        await self.storage.add_login_code_history_entries(entries)
+        await self.storage.add_login_code_history_entries([entries[-1]])
+
+        saved = await self.storage.list_login_code_history("shared@example.com")
+        self.assertEqual(len(saved), 100)
+        self.assertEqual({entry.message_key for entry in saved}, {f"message-id:{index}" for index in range(1, 101)})
+
     async def test_change_account_returns_activation_form_again(self) -> None:
         await self.activate_key(locale="en")
 
@@ -167,9 +304,90 @@ class WebFlowTests(BaseWebFlowTestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.assertIn("Enter a new seller code", response.text)
-        self.assertIn("Activate code", response.text)
+        self.assertIn("Access key", response.text)
+        self.assertIn("Activate key", response.text)
         self.assertNotIn("shared@example.com", response.text)
+
+    async def test_active_page_hides_legacy_actions_and_shows_logout(self) -> None:
+        english_page = await self.activate_key(locale="en")
+        self.assertEqual(english_page.status_code, 200)
+        self.assertIn(">Log out</button>", english_page.text)
+        self.assertIn('action="/perp-code-getter/logout"', english_page.text)
+        self.assertNotIn("Request code", english_page.text)
+        self.assertNotIn("Change account", english_page.text)
+        self.assertNotIn('action="/perp-code-getter/request-code"', english_page.text)
+        self.assertNotIn('action="/perp-code-getter/change-account"', english_page.text)
+
+        russian_page = (await self.client.get(self.route("/"), params={"lang": "ru"})).text
+        self.assertIn(">Выйти</button>", russian_page)
+        self.assertNotIn("Запросить код", russian_page)
+        self.assertNotIn("Сменить аккаунт", russian_page)
+
+    async def test_logout_clears_current_browser_activation_and_keeps_shared_data(self) -> None:
+        other_client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.app),
+            base_url="http://testserver",
+        )
+        try:
+            await self.activate_key(locale="en")
+            other_activation = await other_client.post(
+                self.route("/activate-code"),
+                data={"lang": "en", "code": self.key.code},
+            )
+            self.assertEqual(other_activation.status_code, 200)
+            await self.storage.add_login_code_history_entries(
+                [
+                    LoginCodeHistoryEntry(
+                        id="kept-code",
+                        email_address="shared@example.com",
+                        code="654321",
+                        received_at=datetime(2026, 8, 20, 13, 0, 13, tzinfo=timezone.utc),
+                        message_key="message-id:kept-code",
+                    )
+                ]
+            )
+            old_cookie = self.client.cookies[WEB_USER_COOKIE_NAME]
+            other_cookie = other_client.cookies[WEB_USER_COOKIE_NAME]
+            self.assertNotEqual(old_cookie, other_cookie)
+
+            response = await self.client.post(
+                self.route("/logout"),
+                data={"lang": "en"},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertIn(
+                "You have signed out of this browser. Enter an access key.",
+                response.text,
+            )
+            self.assertIn("Access key", response.text)
+            self.assertIn("Activate key", response.text)
+            self.assertNotIn("shared@example.com", response.text)
+            self.assertNotIn("Log out", response.text)
+            new_cookie = self.client.cookies[WEB_USER_COOKIE_NAME]
+            self.assertNotEqual(new_cookie, old_cookie)
+            self.assertIsNone(await self.storage.get_user_activation(f"web:{old_cookie}"))
+            self.assertIsNone(await self.storage.get_user_activation(f"web:{new_cookie}"))
+            self.assertIsNotNone(await self.storage.get_user_activation(f"web:{other_cookie}"))
+            self.assertIsNotNone(await self.storage.get_subscription_key(self.key.code))
+            self.assertIsNotNone(await self.storage.get_account("shared@example.com"))
+            history = await self.storage.list_login_code_history("shared@example.com")
+            self.assertEqual([entry.code for entry in history], ["654321"])
+
+            other_page = await other_client.get(self.route("/"), params={"lang": "en"})
+            self.assertIn("shared@example.com", other_page.text)
+            self.assertIn("Log out", other_page.text)
+        finally:
+            await other_client.aclose()
+
+        await self.activate_key(locale="ru")
+        russian_logout = await self.client.post(
+            self.route("/logout"),
+            data={"lang": "ru"},
+        )
+        self.assertEqual(russian_logout.status_code, 200)
+        self.assertIn("Вы вышли из этого браузера. Введите ключ доступа.", russian_logout.text)
+        self.assertIn("Ключ доступа", russian_logout.text)
 
     async def test_account_update_hides_already_completed_web_request(self) -> None:
         await self.activate_key(locale="en")
@@ -250,6 +468,55 @@ class WebFlowCancellationTests(BaseWebFlowTestCase):
         payload = status_response.json()
         self.assertEqual(payload["status"], "missing")
 
+    async def test_logout_cancels_pending_web_request(self) -> None:
+        await self.activate_key(locale="en")
+        old_cookie = self.client.cookies[WEB_USER_COOKIE_NAME]
+
+        request_response = await self.client.post(
+            self.route("/request-code"),
+            data={"lang": "en"},
+            follow_redirects=False,
+        )
+        self.assertEqual(request_response.status_code, 303)
+        request_id = parse_qs(urlparse(request_response.headers["location"]).query)[
+            "request_id"
+        ][0]
+
+        await asyncio.wait_for(self.service.fetch_started.wait(), timeout=1)
+
+        logout_response = await self.client.post(
+            self.route("/logout"),
+            data={"lang": "en"},
+        )
+        self.assertEqual(logout_response.status_code, 200)
+        self.assertIn("You have signed out of this browser. Enter an access key.", logout_response.text)
+        self.assertIn("Activate key", logout_response.text)
+        self.assertNotEqual(self.client.cookies[WEB_USER_COOKIE_NAME], old_cookie)
+
+        stale_client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=self.app),
+            base_url="http://testserver",
+            cookies={WEB_USER_COOKIE_NAME: old_cookie},
+        )
+        try:
+            self.service.fetch_release.set()
+            last_response: httpx.Response | None = None
+            for _ in range(40):
+                last_response = await stale_client.get(
+                    self.route("/request-status"),
+                    params={"request_id": request_id, "lang": "en"},
+                )
+                if last_response.status_code == 404 and last_response.json().get("status") == "missing":
+                    break
+                await asyncio.sleep(0.01)
+            else:
+                self.fail(
+                    "Timed out waiting for the previous browser cookie to lose the pending request. "
+                    f"Last response: {None if last_response is None else last_response.text}"
+                )
+        finally:
+            await stale_client.aclose()
+
     async def test_account_update_revokes_pending_web_request_after_fetch(self) -> None:
         await self.activate_key(locale="en")
 
@@ -305,6 +572,15 @@ class WebFlowCancellationTests(BaseWebFlowTestCase):
             page.index("if (!response.ok)"),
         )
         self.assertIn("if (response.status < 500)", page)
+
+    async def test_login_history_script_clears_stale_codes_when_access_is_revoked(self) -> None:
+        await self.activate_key(locale="en")
+
+        page = (await self.client.get(self.route("/"), params={"lang": "en"})).text
+
+        self.assertIn("data.status==='missing'||data.status==='expired'", page)
+        self.assertIn("renderHistory([]);", page)
+        self.assertIn("account-inactive", page)
 
 
 class AdminControlTests(BaseWebFlowTestCase):
@@ -439,7 +715,7 @@ class AdminControlTests(BaseWebFlowTestCase):
 
         old_cookie_page = await self.client.get(f"{self.route('/')}?lang=en")
         self.assertEqual(old_cookie_page.status_code, 200)
-        self.assertIn("Activate code", old_cookie_page.text)
+        self.assertIn("Activate key", old_cookie_page.text)
         self.assertNotIn("shared-updated@example.com", old_cookie_page.text)
 
     async def test_admin_add_replacing_account_invalidates_old_cookie_activation(self) -> None:
@@ -464,7 +740,7 @@ class AdminControlTests(BaseWebFlowTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(await self.storage.get_user_activation(f"web:{old_cookie}"))
         old_cookie_page = await self.client.get(f"{self.route('/')}?lang=en")
-        self.assertIn("Activate code", old_cookie_page.text)
+        self.assertIn("Activate key", old_cookie_page.text)
         self.assertNotIn("new-refresh-token", old_cookie_page.text)
 
     async def test_admin_control_add_form_generates_key_when_it_is_not_provided(self) -> None:

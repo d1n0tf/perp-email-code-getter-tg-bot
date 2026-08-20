@@ -233,6 +233,36 @@ class LegacyUser:
         }
 
 
+@dataclass(slots=True, frozen=True)
+class LoginCodeHistoryEntry:
+    """A deduplicated Perplexity login code received by a mailbox."""
+
+    id: str
+    email_address: str
+    code: str
+    received_at: datetime
+    message_key: str
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "LoginCodeHistoryEntry":
+        return cls(
+            id=str(data["id"]),
+            email_address=normalize_email(str(data["email_address"])),
+            code=str(data["code"]),
+            received_at=_parse_datetime(data["received_at"]),
+            message_key=str(data["message_key"]),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": self.id,
+            "email_address": self.email_address,
+            "code": self.code,
+            "received_at": self.received_at.astimezone(timezone.utc).isoformat(),
+            "message_key": self.message_key,
+        }
+
+
 class JsonStorage:
     def __init__(
         self,
@@ -241,6 +271,7 @@ class JsonStorage:
         taken_email_store_path: Path,
         subscription_key_store_path: Path,
         activated_key_store_path: Path,
+        login_code_history_store_path: Path | None = None,
         legacy_user_store_path: Path,
         user_locale_store_path: Path,
     ) -> None:
@@ -248,6 +279,11 @@ class JsonStorage:
         self.taken_email_store_path = taken_email_store_path
         self.subscription_key_store_path = subscription_key_store_path
         self.activated_key_store_path = activated_key_store_path
+        self.login_code_history_store_path = (
+            login_code_history_store_path
+            if login_code_history_store_path is not None
+            else activated_key_store_path.with_name("perplexity_login_codes.json")
+        )
         self.legacy_user_store_path = legacy_user_store_path
         self.legacy_user_backup_store_path = legacy_user_store_path.with_name(
             f"{legacy_user_store_path.stem}.backup{legacy_user_store_path.suffix}"
@@ -257,6 +293,7 @@ class JsonStorage:
         self._taken_lock = asyncio.Lock()
         self._key_lock = asyncio.Lock()
         self._activation_lock = asyncio.Lock()
+        self._login_code_history_lock = asyncio.Lock()
         self._legacy_lock = asyncio.Lock()
         self._locale_lock = asyncio.Lock()
 
@@ -823,6 +860,77 @@ class JsonStorage:
                 return False
             self._write_json(self.activated_key_store_path, data)
             return True
+
+    async def list_login_code_history(
+        self,
+        email_address: str,
+    ) -> list[LoginCodeHistoryEntry]:
+        normalized_email = normalize_email(email_address)
+        async with self._login_code_history_lock:
+            data = self._load_json(self.login_code_history_store_path, default={})
+
+        entries: list[LoginCodeHistoryEntry] = []
+        for raw_entry in data.get(normalized_email, []):
+            if not isinstance(raw_entry, dict):
+                continue
+            try:
+                entries.append(LoginCodeHistoryEntry.from_dict(raw_entry))
+            except (KeyError, TypeError, ValueError):
+                continue
+        return sorted(entries, key=lambda entry: (entry.received_at, entry.id), reverse=True)
+
+    async def add_login_code_history_entries(
+        self,
+        entries: list[LoginCodeHistoryEntry],
+        *,
+        limit_per_email: int = 100,
+    ) -> list[LoginCodeHistoryEntry]:
+        """Persist unseen codes, deduplicated by the immutable mailbox message key."""
+        if limit_per_email < 1:
+            raise ValueError("limit_per_email must be positive")
+
+        grouped: dict[str, list[LoginCodeHistoryEntry]] = {}
+        for entry in entries:
+            grouped.setdefault(normalize_email(entry.email_address), []).append(entry)
+        if not grouped:
+            return []
+
+        async with self._login_code_history_lock:
+            data = self._load_json(
+                self.login_code_history_store_path,
+                default={},
+                strict=True,
+            )
+            added: list[LoginCodeHistoryEntry] = []
+            changed = False
+            for email_address, new_entries in grouped.items():
+                existing: list[LoginCodeHistoryEntry] = []
+                for raw_entry in data.get(email_address, []):
+                    if not isinstance(raw_entry, dict):
+                        continue
+                    try:
+                        existing.append(LoginCodeHistoryEntry.from_dict(raw_entry))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+
+                known_keys = {entry.message_key for entry in existing}
+                for entry in new_entries:
+                    if entry.message_key in known_keys:
+                        continue
+                    known_keys.add(entry.message_key)
+                    existing.append(entry)
+                    added.append(entry)
+                    changed = True
+
+                existing.sort(key=lambda entry: (entry.received_at, entry.id), reverse=True)
+                trimmed = existing[:limit_per_email]
+                if len(trimmed) != len(existing):
+                    changed = True
+                data[email_address] = [entry.to_dict() for entry in trimmed]
+
+            if changed:
+                self._write_json(self.login_code_history_store_path, data)
+            return sorted(added, key=lambda entry: (entry.received_at, entry.id), reverse=True)
 
     async def freeze_legacy_users(self) -> None:
         """Take a one-time backup of the legacy direct-email allow-list.

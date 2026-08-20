@@ -1,4 +1,5 @@
 import html
+import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import parse_qs, urlencode
@@ -15,6 +16,7 @@ from src.service import ActivatedSubscription, BotService
 from src.time_utils import MOSCOW_TZ, to_moscow, to_utc
 from src.storage import (
     EmailAccount,
+    LoginCodeHistoryEntry,
     SubscriptionKey,
     UserKeyActivation,
     normalize_email,
@@ -24,6 +26,7 @@ from src.storage import (
 
 WEB_USER_COOKIE_NAME = "perp_web_user_id"
 WEB_ADMIN_COOKIE_NAME = "perp_admin_session"
+WEB_LOGOUT_PATH = "/logout"
 ADMIN_CONTROL_PATH = "/admin_control"
 ADMIN_CONTROL_LOGIN_PATH = f"{ADMIN_CONTROL_PATH}/login"
 ADMIN_CONTROL_LOGOUT_PATH = f"{ADMIN_CONTROL_PATH}/logout"
@@ -426,15 +429,80 @@ def create_web_app(service: BotService) -> FastAPI:
             )
 
         subscription = result if isinstance(result, ActivatedSubscription) else None
+        login_codes: list[LoginCodeHistoryEntry] = []
+        if subscription is not None:
+            _, _, login_codes = await service.get_web_login_code_history(
+                requester_id=requester_id,
+            )
         return build_page_response(
             locale=locale,
             web_user_id=web_user_id,
             base_path=base_path,
             service=service,
             subscription=subscription,
+            login_codes=login_codes,
             status_message=web_text(locale, "activation_success"),
             status_kind="success",
         )
+
+    async def login_code_history(request: Request) -> JSONResponse:
+        locale = resolve_locale(request.query_params.get("lang"))
+        web_user_id = get_or_create_web_user_id(request)
+        requester_id = build_web_requester_id(web_user_id)
+        status, result, entries = await service.get_web_login_code_history(
+            requester_id=requester_id,
+        )
+        if status == "expired" and isinstance(result, SubscriptionKey):
+            response = JSONResponse(
+                {
+                    "status": "expired",
+                    "account_status": "expired",
+                    "account_status_label": perplexity_text(locale)["status_expired"],
+                    "entries": [],
+                    "message": translate(
+                        locale,
+                        "key_expired",
+                        code=result.code,
+                        end_date=service.format_date(result.expires_at),
+                    ),
+                },
+                status_code=410,
+            )
+        elif status != "active" or not isinstance(result, ActivatedSubscription):
+            response = JSONResponse(
+                {
+                    "status": "missing",
+                    "account_status": "inactive",
+                    "account_status_label": perplexity_text(locale)["status_inactive"],
+                    "entries": [],
+                    "message": web_text(locale, "request_missing"),
+                },
+                status_code=404,
+            )
+        else:
+            response = JSONResponse(
+                {
+                    "status": "active",
+                    "account_status": "active",
+                    "account_status_label": perplexity_text(locale)["status_active"],
+                    "entries": [
+                        {
+                            "id": entry.id,
+                            "code": entry.code,
+                            "received_at": format_login_code_datetime(entry.received_at),
+                        }
+                        for entry in entries
+                    ],
+                }
+            )
+        response.set_cookie(
+            key=WEB_USER_COOKIE_NAME,
+            value=web_user_id,
+            httponly=True,
+            samesite="lax",
+            max_age=60 * 60 * 24 * 365,
+        )
+        return response
 
     async def request_code(request: Request):
         payload = await read_form_body(request)
@@ -527,6 +595,22 @@ def create_web_app(service: BotService) -> FastAPI:
             base_path=base_path,
             service=service,
             status_message=web_text(locale, "change_success"),
+            status_kind="success",
+        )
+
+    async def logout(request: Request) -> HTMLResponse:
+        payload = await read_form_body(request)
+        locale = resolve_locale(payload.get("lang"))
+        web_user_id = get_or_create_web_user_id(request)
+        requester_id = build_web_requester_id(web_user_id)
+        await service.clear_requester_subscription_activation(requester_id)
+
+        return build_page_response(
+            locale=locale,
+            web_user_id=uuid4().hex,
+            base_path=base_path,
+            service=service,
+            status_message=perplexity_text(locale)["logout_success"],
             status_kind="success",
         )
 
@@ -1028,6 +1112,14 @@ def create_web_app(service: BotService) -> FastAPI:
             response_class=HTMLResponse,
             response_model=None,
         )
+    for route_path in route_variants(WEB_LOGOUT_PATH, base_path):
+        app.add_api_route(
+            route_path,
+            logout,
+            methods=["POST"],
+            response_class=HTMLResponse,
+            response_model=None,
+        )
     for route_path in route_variants("/wait", base_path):
         app.add_api_route(
             route_path,
@@ -1040,6 +1132,14 @@ def create_web_app(service: BotService) -> FastAPI:
         app.add_api_route(
             route_path,
             request_status,
+            methods=["GET"],
+            response_class=JSONResponse,
+            response_model=None,
+        )
+    for route_path in route_variants("/login-code-history", base_path):
+        app.add_api_route(
+            route_path,
+            login_code_history,
             methods=["GET"],
             response_class=JSONResponse,
             response_model=None,
@@ -1110,6 +1210,7 @@ def render_page(
     status_message: str = "",
     status_kind: str = "info",
     subscription: ActivatedSubscription | None = None,
+    login_codes: list[LoginCodeHistoryEntry] | None = None,
     service: BotService,
 ) -> str:
     locale = resolve_locale(locale)
@@ -1118,132 +1219,119 @@ def render_page(
     safe_locale = html.escape(locale, quote=True)
     home_path = build_web_path(base_path, "/")
     activate_code_path = build_web_path(base_path, "/activate-code")
-    request_code_path = build_web_path(base_path, "/request-code")
-    change_account_path = build_web_path(base_path, "/change-account")
+    logout_path = build_web_path(base_path, WEB_LOGOUT_PATH)
+    history_path = build_query_url(
+        build_web_path(base_path, "/login-code-history"),
+        {"lang": locale},
+    )
     lang_ru_path = f"{home_path}?lang=ru"
     lang_en_path = f"{home_path}?lang=en"
+    text = perplexity_text(locale)
+    flash = render_status_block(status_message, status_kind)
+    logout_control = ""
+    if subscription is not None:
+        logout_control = f"""
+        <form action="{html.escape(logout_path, quote=True)}" method="post">
+          <input type="hidden" name="lang" value="{safe_locale}">
+          <button type="submit">{html.escape(text['logout_button'])}</button>
+        </form>"""
 
     if subscription is None:
-        content_block = f"""
-    <section class="card">
-      <h2>{html.escape(web_text(locale, "activation_heading"))}</h2>
-      <form action="{html.escape(activate_code_path, quote=True)}" method="post">
-        <input type="hidden" name="lang" value="{safe_locale}">
-        <label for="code">{html.escape(web_text(locale, "activation_label"))}</label>
-        <input
-          id="code"
-          class="code-input"
-          name="code"
-          type="text"
-          value="{safe_code_value}"
-          placeholder="{html.escape(web_text(locale, "activation_placeholder"), quote=True)}"
-          autocomplete="off"
-          autocapitalize="characters"
-          spellcheck="false"
-        >
-        <button type="submit">{html.escape(web_text(locale, "activation_button"))}</button>
-      </form>
-    </section>"""
+        activation_content = f"""
+        <form action="{html.escape(activate_code_path, quote=True)}" method="post" class="activation-form">
+          <input type="hidden" name="lang" value="{safe_locale}">
+          <label for="code">{html.escape(text['activation_label'])}</label>
+          <input id="code" class="code-input" name="code" type="text" value="{safe_code_value}"
+            placeholder="{html.escape(text['activation_placeholder'], quote=True)}" maxlength="64"
+            autocomplete="off" autocapitalize="characters" spellcheck="false" required>
+          <p class="hint">{html.escape(text['activation_hint'])}</p>
+          <button class="primary wide" type="submit">{html.escape(text['activation_button'])}</button>
+        </form>"""
+        subscription_block = ""
     else:
-        content_block = f"""
-    <section class="card">
-      <h2>{html.escape(web_text(locale, "subscription_heading"))}</h2>
-      <div class="details">{render_subscription_details_html(locale, subscription, service)}</div>
-      <p class="hint">{html.escape(web_text(locale, "subscription_hint"))}</p>
-      <div class="actions">
-        <form action="{html.escape(request_code_path, quote=True)}" method="post">
-          <input type="hidden" name="lang" value="{safe_locale}">
-          <button type="submit">{html.escape(translate(locale, "subscription_request_button"))}</button>
-        </form>
-        <form action="{html.escape(change_account_path, quote=True)}" method="post">
-          <input type="hidden" name="lang" value="{safe_locale}">
-          <button type="submit" class="secondary">{html.escape(translate(locale, "subscription_change_button"))}</button>
-        </form>
-      </div>
-    </section>"""
+        activation_content = f"""
+        <div class="active-key-row"><span>{html.escape(text['active_key'])}</span>
+          <code>{html.escape(subscription.key.code)}</code></div>"""
+        subscription_block = render_perplexity_subscription_block(
+            locale=locale,
+            subscription=subscription,
+            service=service,
+            entries=login_codes or [],
+            history_path=history_path,
+        )
 
     return f"""<!DOCTYPE html>
 <html lang="{safe_locale}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{html.escape(web_text(locale, "title"))}</title>
+  <title>{html.escape(text['title'])}</title>
   <style>
-    {common_base_styles()}
-    main {{
-      max-width: 760px;
-      margin: 32px auto;
-      padding: 0 16px 32px;
-    }}
-    .lang-switch {{
-      display: flex;
-      gap: 10px;
-      margin-bottom: 16px;
-    }}
-    .lang-switch a {{
-      color: #0f766e;
-      text-decoration: none;
-      font-weight: 700;
-    }}
-    label {{
-      display: block;
-      margin-bottom: 8px;
-      font-weight: 700;
-    }}
-    input {{
-      width: 100%;
-      padding: 12px;
-      border: 1px solid #bfc7d4;
-      border-radius: 8px;
-      margin-bottom: 12px;
-    }}
-    .code-input {{
-      text-transform: uppercase;
-    }}
-    button {{
-      padding: 12px 16px;
-      border: 0;
-      border-radius: 8px;
-      background: #0f766e;
-      color: #ffffff;
-      cursor: pointer;
-      font-weight: 700;
-    }}
-    button.secondary {{
-      background: #1f2937;
-    }}
-    .actions {{
-      display: flex;
-      gap: 12px;
-      flex-wrap: wrap;
-    }}
-    .actions form {{
-      margin: 0;
-    }}
-    .details {{
-      white-space: pre-wrap;
-      line-height: 1.6;
-      margin-bottom: 12px;
-    }}
-    .hint {{
-      margin: 0 0 16px;
-      color: #334155;
-    }}
+    {perplexity_page_styles()}
   </style>
 </head>
 <body>
-  <main>
-    <div class="lang-switch">
-      <a href="{html.escape(lang_ru_path, quote=True)}">{html.escape(web_text(locale, "lang_ru"))}</a>
-      <a href="{html.escape(lang_en_path, quote=True)}">{html.escape(web_text(locale, "lang_en"))}</a>
-    </div>
-    <section class="card">
-      <h1>{html.escape(web_text(locale, "title"))}</h1>
-      <p>{html.escape(web_text(locale, "subtitle"))}</p>
+  <main class="page">
+    <nav class="top-links" aria-label="Page links">
+      <a href="#faq">{html.escape(text['faq_button'])}</a>
+      <div class="top-links-end">
+        <a href="{html.escape(lang_en_path if locale == 'ru' else lang_ru_path, quote=True)}">{html.escape(text['switch'])}</a>
+        {logout_control}
+      </div>
+    </nav>
+    <section class="card activation-card">
+      <h1>PERPLEXITY PANEL</h1>
+      <p>{html.escape(text['intro'])}</p>
+      <p class="hint">{html.escape(text['questions_hint'])}</p>
+      {flash}
+      {activation_content}
+      <div class="info-actions">
+        <a class="secondary action-link" href="#faq">{html.escape(text['faq_button'])}</a>
+        <button class="bonus-button" id="get-bonus" type="button">{html.escape(text['bonus_button'])}</button>
+      </div>
+      <section class="bonus-claim" id="bonus-claim" hidden>
+        <p>{html.escape(text['bonus_coming_soon'])}</p>
+      </section>
     </section>
-    {render_status_block(status_message, status_kind)}
-    {content_block}
+    {subscription_block}
+    {render_perplexity_faq(locale)}
   </main>
+  <script>
+    (function() {{
+      var bonusButton=document.getElementById('get-bonus'), bonusClaim=document.getElementById('bonus-claim');
+      if(bonusButton&&bonusClaim) bonusButton.addEventListener('click',function(){{ bonusClaim.hidden=!bonusClaim.hidden; }});
+      document.querySelectorAll('[data-copy]').forEach(function(button) {{ button.addEventListener('click',function() {{ var value=button.dataset.copy||''; if(!value||!navigator.clipboard) return; navigator.clipboard.writeText(value).then(function() {{ var original=button.dataset.originalLabel||button.textContent; button.dataset.originalLabel=original; var label=button.querySelector('span'); if(label) label.textContent={json.dumps(text['copied'])}; else button.textContent={json.dumps(text['copied'])}; window.setTimeout(function() {{ if(label) label.textContent={json.dumps(text['copy'])}; else button.textContent=original; }},1500); }}); }});
+      var historyUrl={json.dumps(history_path)}, tableBody=document.getElementById('login-code-rows'), lastMessage=document.getElementById('last-login-message'), accountStatus=document.getElementById('account-status');
+      function addCell(row,text,className) {{ var cell=document.createElement('td'); cell.textContent=text; if(className) cell.className=className; row.appendChild(cell); }}
+      function renderHistory(entries) {{
+        if(!tableBody) return;
+        tableBody.replaceChildren();
+        if(!entries.length) {{ var row=document.createElement('tr'), cell=document.createElement('td'); cell.colSpan=4; cell.className='empty'; cell.textContent={json.dumps(text['no_codes'])}; row.appendChild(cell); tableBody.appendChild(row); lastMessage.textContent={json.dumps(text['last_message_empty'])}; return; }}
+        entries.forEach(function(entry,index) {{ var row=document.createElement('tr'); addCell(row,String(index+1)); addCell(row,'PERPLEXITY PRO'); addCell(row,{json.dumps(text['code_prefix'])}+' '+entry.code,'login-code'); addCell(row,entry.received_at); tableBody.appendChild(row); }});
+        lastMessage.textContent=entries[0].received_at;
+      }}
+      async function refreshHistory() {{
+        if(!historyUrl||!tableBody) return;
+        try {{
+          var response=await fetch(historyUrl,{{cache:'no-store',credentials:'same-origin'}}), data=null;
+          try {{ data=await response.json(); }} catch(_) {{ /* A proxy may return a non-JSON response. */ }}
+          if(data&&data.status==='active') {{
+            renderHistory(data.entries||[]);
+            if(accountStatus) {{ accountStatus.textContent=data.account_status_label||{json.dumps(text['status_active'])}; accountStatus.className='account-active'; }}
+            return;
+          }}
+          // The server never returns entries after an activation is revoked.
+          // Remove the previously rendered snapshot as soon as this client
+          // learns about it too, rather than leaving old login codes on screen.
+          if(data&&(data.status==='missing'||data.status==='expired')) {{
+            renderHistory([]);
+            if(accountStatus) {{ accountStatus.textContent=data.account_status_label||{json.dumps(text['status_inactive'])}; accountStatus.className='account-inactive'; }}
+          }}
+        }} catch(_) {{ /* Keep the last safely rendered state on a transient network failure. */ }}
+      }}
+      if(tableBody) {{ refreshHistory(); window.setInterval(refreshHistory,10000); }}
+    }})();
+  </script>
   {render_live_navigation_script()}
 </body>
 </html>"""
@@ -1260,6 +1348,7 @@ def build_page_response(
     status_kind: str = "info",
     status_code: int = 200,
     subscription: ActivatedSubscription | None = None,
+    login_codes: list[LoginCodeHistoryEntry] | None = None,
 ) -> HTMLResponse:
     response = HTMLResponse(
         render_page(
@@ -1269,6 +1358,7 @@ def build_page_response(
             status_message=status_message,
             status_kind=status_kind,
             subscription=subscription,
+            login_codes=login_codes,
             service=service,
         ),
         status_code=status_code,
@@ -1369,20 +1459,197 @@ def web_text(locale: str, key: str, **kwargs: str) -> str:
     return template.format(**kwargs)
 
 
-def render_subscription_details_html(
+PERPLEXITY_TEXT = {
+    "ru": {
+        "title": "Perplexity Panel",
+        "switch": "English",
+        "intro": "Получите доступ к Perplexity PRO, для этого укажите ключ, который был выдан при покупке у продавца.",
+        "questions_hint": "Если у вас есть вопросы и ошибки, нажмите «Ответы на вопросы».",
+        "activation_label": "Ключ доступа",
+        "activation_placeholder": "XXXXXXXXXXXXXXXX",
+        "activation_hint": "Ключ выглядит в формате: XXXXXXXXXXXXXXXX",
+        "activation_button": "Активировать ключ",
+        "active_key": "Активный ключ",
+        "logout_button": "Выйти",
+        "logout_success": "Вы вышли из этого браузера. Введите ключ доступа.",
+        "faq_button": "Ответы на вопросы",
+        "bonus_button": "Получить бонус",
+        "bonus_coming_soon": "Бонусная система готовится. Создание и применение промокодов будут добавлены отдельно.",
+        "subscription_heading": "Подписка Perplexity PRO",
+        "email": "1️⃣ Почта для входа",
+        "duration": "2️⃣ Срок подписки",
+        "days_left": "3️⃣ Осталось дней",
+        "ends": "4️⃣ Конец подписки",
+        "key": "5️⃣ Ключ доступа",
+        "days": "дней",
+        "copy": "Скопировать",
+        "copied": "Скопировано",
+        "instructions": "➡️ ИНСТРУКЦИЯ ПО ВХОДУ",
+        "instruction_1": "Копируем почту",
+        "instruction_2": "Открываем perplexity.ai либо приложение Perplexity (Comet)",
+        "instruction_3": "Вводим почту и ожидаем ниже получения кода",
+        "codes_heading": "ПОЛУЧЕНИЕ КОДОВ ВХОДА",
+        "last_message": "Последнее сообщение",
+        "last_message_empty": "Ожидание первого кода",
+        "account_status": "Статус аккаунта",
+        "status_active": "Активен",
+        "status_expired": "Просрочен",
+        "status_inactive": "Недоступен — активируйте ключ заново",
+        "scan_hint": "Пока вы на сайте, новые коды сканируются каждые 10 секунд. В таблицу попадают только уникальные письма.",
+        "id": "ID",
+        "service": "PERPLEXITY",
+        "login_code": "Код для входа",
+        "date": "ДАТА + ВРЕМЯ",
+        "code_prefix": "Код для входа:",
+        "no_codes": "Пока нет новых кодов. Отправьте вход в Perplexity и подождите до 10 секунд.",
+        "retention": "⚠️ Полученные коды хранятся до 100 штук, затем удаляются самые старые коды.",
+        "faq_heading": "ОТВЕТЫ НА ВОПРОСЫ",
+        "faq_1_q": "Где взять код для входа?",
+        "faq_1_a": "Введите почту из подписки на сайте или в приложении Perplexity. Новый код появится в таблице автоматически.",
+        "faq_2_q": "Почему код ещё не появился?",
+        "faq_2_a": "Проверьте почту и подождите до 10 секунд. Сканируются папки «Входящие» и «Спам»; убедитесь, что отправитель Perplexity не заблокирован.",
+        "faq_3_q": "Можно ли открыть подписку в другом браузере?",
+        "faq_3_a": "Да. Активируйте тот же действующий ключ. История кодов доступна всем владельцам этого ключа.",
+    },
+    "en": {
+        "title": "Perplexity Panel",
+        "switch": "Русский",
+        "intro": "Get Perplexity PRO access by entering the key issued by your seller.",
+        "questions_hint": "For questions or errors, open “Help & answers”.",
+        "activation_label": "Access key",
+        "activation_placeholder": "XXXXXXXXXXXXXXXX",
+        "activation_hint": "The key format is: XXXXXXXXXXXXXXXX",
+        "activation_button": "Activate key",
+        "active_key": "Active key",
+        "logout_button": "Log out",
+        "logout_success": "You have signed out of this browser. Enter an access key.",
+        "faq_button": "Help & answers",
+        "bonus_button": "Get bonus",
+        "bonus_coming_soon": "The bonus system is being prepared. Promo-code creation and redemption will be added separately.",
+        "subscription_heading": "Perplexity PRO subscription",
+        "email": "1️⃣ Login email",
+        "duration": "2️⃣ Subscription term",
+        "days_left": "3️⃣ Days remaining",
+        "ends": "4️⃣ Subscription ends",
+        "key": "5️⃣ Access key",
+        "days": "days",
+        "copy": "Copy",
+        "copied": "Copied",
+        "instructions": "➡️ LOGIN INSTRUCTIONS",
+        "instruction_1": "Copy the email",
+        "instruction_2": "Open perplexity.ai or the Perplexity (Comet) app",
+        "instruction_3": "Enter the email and wait below for a code",
+        "codes_heading": "LOGIN CODES",
+        "last_message": "Last message",
+        "last_message_empty": "Waiting for the first code",
+        "account_status": "Account status",
+        "status_active": "Active",
+        "status_expired": "Expired",
+        "status_inactive": "Unavailable — activate the key again",
+        "scan_hint": "While this page is open, new codes are scanned every 10 seconds. Only unique messages enter the table.",
+        "id": "ID",
+        "service": "PERPLEXITY",
+        "login_code": "Login code",
+        "date": "DATE + TIME",
+        "code_prefix": "Login code:",
+        "no_codes": "No new codes yet. Start a Perplexity sign-in and wait up to 10 seconds.",
+        "retention": "⚠️ Up to 100 received codes are retained; older codes are then deleted.",
+        "faq_heading": "HELP & ANSWERS",
+        "faq_1_q": "Where can I get a login code?",
+        "faq_1_a": "Enter the subscription email on the Perplexity site or app. The new code appears in the table automatically.",
+        "faq_2_q": "Why is the code not here yet?",
+        "faq_2_a": "Check your inbox and wait up to 10 seconds. Inbox and spam folders are scanned; make sure Perplexity is not blocked.",
+        "faq_3_q": "Can I open the subscription in another browser?",
+        "faq_3_a": "Yes. Activate the same valid key. Code history is available to every holder of that key.",
+    },
+}
+
+
+def perplexity_text(locale: str) -> dict[str, str]:
+    return PERPLEXITY_TEXT[resolve_locale(locale)]
+
+
+def subscription_days_left(subscription: ActivatedSubscription) -> int:
+    expires_on = to_moscow(subscription.key.expires_at).date()
+    return max(0, (expires_on - datetime.now(MOSCOW_TZ).date()).days)
+
+
+def format_login_code_datetime(value: datetime) -> str:
+    return to_moscow(value).strftime("%d.%m.%Y \\ %H:%M:%S")
+
+
+def render_perplexity_subscription_block(
+    *,
     locale: str,
     subscription: ActivatedSubscription,
     service: BotService,
+    entries: list[LoginCodeHistoryEntry],
+    history_path: str,
 ) -> str:
-    details = web_text(
-        locale,
-        "subscription_details_web",
-        email=subscription.key.email_address,
-        duration_days=str(subscription.key.duration_days),
-        end_date=service.format_date(subscription.key.expires_at),
-        code=subscription.key.code,
+    text = perplexity_text(locale)
+    email_address = subscription.key.email_address
+    login_rows = render_login_code_rows(entries, locale)
+    return f"""
+    <section class="card info-card">
+      <h2>{html.escape(text['subscription_heading'])}</h2>
+      <dl class="details">
+        <dt>{html.escape(text['email'])}</dt><dd><button class="copy-value" type="button" data-copy="{html.escape(email_address, quote=True)}">{html.escape(email_address)} <span>{html.escape(text['copy'])}</span></button></dd>
+        <dt>{html.escape(text['duration'])}</dt><dd>{subscription.key.duration_days} {html.escape(text['days'])}</dd>
+        <dt>{html.escape(text['days_left'])}</dt><dd>{subscription_days_left(subscription)} {html.escape(text['days'])}</dd>
+        <dt>{html.escape(text['ends'])}</dt><dd>{html.escape(service.format_date(subscription.key.expires_at))}</dd>
+        <dt>{html.escape(text['key'])}</dt><dd><code>{html.escape(subscription.key.code)}</code></dd>
+      </dl>
+      <div class="instructions"><h3>{html.escape(text['instructions'])}</h3>
+        <ol><li>{html.escape(text['instruction_1'])}: <button class="inline-copy" type="button" data-copy="{html.escape(email_address, quote=True)}">{html.escape(email_address)}</button></li>
+        <li>{html.escape(text['instruction_2'])}</li><li>{html.escape(text['instruction_3'])}</li></ol>
+      </div>
+    </section>
+    <section class="card codes-card" data-history-url="{html.escape(history_path, quote=True)}">
+      <h2>{html.escape(text['codes_heading'])}</h2>
+      <p class="history-summary"><span>{html.escape(text['last_message'])}: <strong id="last-login-message">{html.escape(entries[0] and format_login_code_datetime(entries[0].received_at) if entries else text['last_message_empty'])}</strong></span>
+      <span>{html.escape(text['account_status'])}: <strong class="account-active" id="account-status">{html.escape(text['status_active'])}</strong></span></p>
+      <p class="hint">{html.escape(text['scan_hint'])}</p>
+      <div class="table-wrap"><table><thead><tr><th>{html.escape(text['id'])}</th><th>{html.escape(text['service'])}</th><th>{html.escape(text['login_code'])}</th><th>{html.escape(text['date'])}</th></tr></thead>
+      <tbody id="login-code-rows">{login_rows}</tbody></table></div>
+      <p class="retention">{html.escape(text['retention'])}</p>
+    </section>"""
+
+
+def render_login_code_rows(entries: list[LoginCodeHistoryEntry], locale: str) -> str:
+    text = perplexity_text(locale)
+    if not entries:
+        return f'<tr><td class="empty" colspan="4">{html.escape(text["no_codes"])}</td></tr>'
+    return "".join(
+        f"<tr><td>{index}</td><td>PERPLEXITY PRO</td><td class=\"login-code\">{html.escape(text['code_prefix'])} {html.escape(entry.code)}</td><td>{html.escape(format_login_code_datetime(entry.received_at))}</td></tr>"
+        for index, entry in enumerate(entries, start=1)
     )
-    return html.escape(details).replace("\n", "<br>")
+
+
+def render_perplexity_faq(locale: str) -> str:
+    text = perplexity_text(locale)
+    rows = "".join(
+        f"<details class=\"faq-item\"><summary>{html.escape(text[f'faq_{index}_q'])}</summary><p>{html.escape(text[f'faq_{index}_a'])}</p></details>"
+        for index in range(1, 4)
+    )
+    return f'<section id="faq" class="card faq"><h2>{html.escape(text["faq_heading"])}</h2><div class="faq-items">{rows}</div></section>'
+
+
+def perplexity_page_styles() -> str:
+    return """
+    :root { color-scheme: dark; --bg:#080d16; --card:#111a2a; --line:#27364f; --text:#eaf0ff; --muted:#a9b7ce; --accent:#6d9cff; --success:#5fd5a0; --warn:#ffd46b; --danger:#ff7885; }
+    * { box-sizing:border-box; } body { margin:0; background:radial-gradient(circle at top,#182949 0,#080d16 44rem); color:var(--text); font:16px/1.55 Arial,sans-serif; }
+    .page { width:min(960px,calc(100% - 32px)); margin:32px auto 64px; } .card { background:rgba(17,26,42,.96); border:1px solid var(--line); border-radius:16px; padding:24px; margin:18px 0; box-shadow:0 12px 36px rgba(0,0,0,.22); }
+    h1,h2,h3 { margin:0 0 14px; line-height:1.24; } h1 { font-size:28px; } h2 { font-size:20px; letter-spacing:.02em; } p { margin:9px 0; } label { display:block; font-weight:700; margin:14px 0 6px; }
+    input { display:block; width:100%; margin-top:6px; padding:12px 13px; border:1px solid var(--line); border-radius:9px; background:#0b1321; color:var(--text); font:inherit; } .code-input { text-transform:uppercase; letter-spacing:.08em; }
+    button,.action-link { border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sans-serif; cursor:pointer; text-decoration:none; } .primary { color:#071120; background:var(--accent); } .secondary { color:var(--text); background:#263652; } .wide { display:block; width:100%; margin-top:18px; } .hint { color:var(--muted); font-size:14px; }
+    .top-links { display:flex; justify-content:space-between; align-items:center; gap:8px; margin:0 0 -4px; } .top-links-end { display:flex; align-items:center; gap:8px; } .top-links form { margin:0; } .top-links a, .top-links button { color:var(--text); font:700 16px/1.55 Arial,sans-serif; text-decoration:none; padding:7px 10px; border:1px solid var(--line); border-radius:7px; background:transparent; cursor:pointer; } .top-links a:hover, .top-links button:hover { border-color:var(--accent); color:var(--accent); }
+    .status { border-radius:9px; padding:11px 13px; margin:12px 0; } .status.error { color:#ffdce0; background:rgba(255,120,133,.18); border:1px solid rgba(255,120,133,.45); } .status.success { color:#d8ffec; background:rgba(95,213,160,.15); border:1px solid rgba(95,213,160,.45); }
+    .info-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; margin-top:20px; } .info-actions>* { display:inline-flex; align-items:center; justify-content:center; } .bonus-button { color:#281500; background:linear-gradient(135deg,#ffd46b,#f59e0b); } .bonus-claim { margin-top:14px; padding:16px; border:1px solid rgba(245,158,11,.45); border-radius:11px; background:rgba(245,158,11,.09); color:#ffe2a2; } .active-key-row { display:flex; justify-content:space-between; gap:12px; padding:12px; border-radius:9px; background:#0b1321; }
+    .details { display:grid; grid-template-columns:minmax(220px,auto) 1fr; gap:10px 18px; margin:0; } .details dt { color:var(--muted); } .details dd { margin:0; min-width:0; overflow-wrap:anywhere; } code { color:#b9d4ff; font-family:Consolas,'Courier New',monospace; } .copy-value,.inline-copy { padding:0; border:0; color:#b9d4ff; background:transparent; font:inherit; font-weight:700; text-align:left; } .copy-value span { margin-left:8px; font-size:12px; color:var(--accent); } .instructions { margin-top:24px; padding-top:20px; border-top:1px solid var(--line); } .instructions ol { margin:0; padding-left:24px; } .history-summary { display:flex; justify-content:space-between; flex-wrap:wrap; gap:10px 18px; padding:12px; border-radius:9px; background:#0b1321; } .account-active { color:var(--success); } .account-inactive { color:var(--danger); }
+    .table-wrap { overflow-x:auto; } table { width:100%; min-width:660px; border-collapse:collapse; } th,td { padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; } th { color:var(--muted); font-size:13px; } .login-code { color:#d8ffec; font-weight:700; } .empty { text-align:center; color:var(--muted); } .retention { margin:16px 0 0; color:var(--warn); font-size:13px; }
+    .faq { scroll-margin-top:24px; } .faq-items { border-top:1px solid var(--line); } .faq-item { display:block; border-bottom:1px solid var(--line); } .faq-item summary { cursor:pointer; padding:12px 38px 12px 14px; font-weight:700; position:relative; list-style:none; } .faq-item summary::-webkit-details-marker { display:none; } .faq-item summary::after { content:'+'; position:absolute; right:14px; color:var(--accent); font-size:20px; } .faq-item[open] summary::after { content:'−'; } .faq-item p { padding:0 14px 14px; margin:0; color:var(--muted); }
+    @media(max-width:650px) { .page { width:min(100% - 20px,960px); margin-top:12px; } .card { padding:18px; border-radius:12px; } h1 { font-size:24px; } .details,.info-actions { grid-template-columns:1fr; } .history-summary { display:block; } .history-summary span { display:block; margin:5px 0; } }
+    """
 
 
 def render_wait_page(
