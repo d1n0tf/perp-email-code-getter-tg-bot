@@ -16,6 +16,8 @@ legacy_users.json
 user_locales.json
 token_keys.json
 token_keys_*.json
+reseller_keys*.json
+reseller_keys*.json.generated
 promo_codes.json
 
 # Virtual environments

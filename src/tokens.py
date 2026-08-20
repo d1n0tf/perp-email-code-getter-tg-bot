@@ -22,6 +22,8 @@ TOKENS_ACCESS_COOKIE = "tokens_access_key"
 TOKENS_ADMIN_COOKIE = "tokens_admin_session"
 TOKENS_USER_CSRF_COOKIE = "tokens_user_csrf"
 TOKENS_ADMIN_CSRF_COOKIE = "tokens_admin_csrf"
+TOKENS_RESELLER_COOKIE = "tokens_reseller_session"
+TOKENS_RESELLER_CSRF_COOKIE = "tokens_reseller_csrf"
 TOKEN_CODE_ALPHABET = string.ascii_uppercase + string.digits
 PROMO_CODE_ALPHABET = string.ascii_uppercase + string.digits
 logger = logging.getLogger(__name__)
@@ -35,8 +37,10 @@ TOKEN_ADMIN_SORT_KEYS = frozenset({
 })
 SERVICE_OPTIONS = (
     "Claude", "OpenAI", "Google", "Grok", "DeepSeek", "Alibaba Cloud",
-    "Z.AI (GLM)", "KIMI", "Xiaomi", "NVIDIA",
+    "Z.AI (GLM)", "KIMI", "Xiaomi", "NVIDIA", "Реселлинг",
 )
+RESELLING_SERVICE = "Реселлинг"
+RESELLER_SERVICE_OPTIONS = tuple(service for service in SERVICE_OPTIONS if service != RESELLING_SERVICE)
 
 TOKEN_TEXT = {
     "ru": {
@@ -237,6 +241,10 @@ class TokenKey:
     # This mirrors the upstream ``active`` flag.  Older store files did not
     # have it, so their keys remain active after migration.
     active: bool = True
+    # A child key stays in the standard owner store, but belongs to exactly
+    # one local reseller. Existing records omit this field and remain direct
+    # administrator keys.
+    reseller_id: int | None = None
 
     @property
     def remaining_tokens(self) -> int:
@@ -262,6 +270,7 @@ class TokenKey:
             activated_at=parse_datetime(activated) if activated else None,
             exhausted_at=parse_datetime(exhausted) if exhausted else None,
             active=bool(data.get("active", True)),
+            reseller_id=(int(data["reseller_id"]) if data.get("reseller_id") is not None else None),
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -271,6 +280,251 @@ class TokenKey:
         result["exhausted_at"] = self.exhausted_at.astimezone(timezone.utc).isoformat() if self.exhausted_at else None
         return result
 
+
+@dataclass(frozen=True, slots=True)
+class ResellerKey:
+    """A local master key that may allocate a fixed irreversible budget."""
+
+    id: int
+    created_at: datetime
+    access_code: str
+    name: str
+    token_limit: int
+    issued_tokens: int = 0
+    active: bool = True
+
+    @property
+    def available_tokens(self) -> int:
+        return max(0, self.token_limit - self.issued_tokens)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "ResellerKey":
+        limit = max(0, int(data["token_limit"]))
+        issued = min(limit, max(0, int(data.get("issued_tokens") or 0)))
+        return cls(
+            id=int(data["id"]),
+            created_at=parse_datetime(data["created_at"]),
+            access_code=normalize_access_code(str(data["access_code"])),
+            name=str(data.get("name") or ""),
+            token_limit=limit,
+            issued_tokens=issued,
+            active=bool(data.get("active", True)),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "created_at": self.created_at.astimezone(timezone.utc).isoformat(),
+            "access_code": self.access_code,
+            "name": self.name,
+            "token_limit": self.token_limit,
+            "issued_tokens": self.issued_tokens,
+            "active": self.active,
+        }
+
+
+class ResellerKeyStore:
+    """One atomic local reseller ledger per token-admin owner.
+
+    ``issued_tokens`` never decreases: creation and an upstream-confirmed
+    top-up consume budget permanently, including after a child is frozen or
+    later archived. The lock makes the check-and-reserve operation atomic.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = asyncio.Lock()
+
+    def _read(self) -> list[ResellerKey]:
+        if not self.path.exists():
+            return []
+        raw = self.path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return []
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, list):
+                raise ValueError("root is not a list")
+            return [ResellerKey.from_dict(item) for item in payload if isinstance(item, dict)]
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Reseller key store is unreadable: {exc}") from exc
+
+    def _write(self, keys: list[ResellerKey]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps([key.to_dict() for key in keys], ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        temporary.replace(self.path)
+
+    def ensure_exists(self) -> None:
+        if not self.path.exists():
+            self._write([])
+
+    async def list(self) -> list[ResellerKey]:
+        async with self._lock:
+            return sorted(self._read(), key=lambda key: key.id, reverse=True)
+
+    async def get(self, key_id: int) -> ResellerKey | None:
+        async with self._lock:
+            return next((key for key in self._read() if key.id == key_id), None)
+
+    async def get_by_code(self, code: str) -> ResellerKey | None:
+        normalized = normalize_access_code(code)
+        async with self._lock:
+            return next((key for key in self._read() if key.access_code == normalized), None)
+
+    async def add_many(self, records: list[ResellerKey]) -> None:
+        async with self._lock:
+            keys = self._read()
+            keys.extend(records)
+            self._write(keys)
+
+    async def update(self, key_id: int, updated: ResellerKey) -> bool:
+        async with self._lock:
+            keys = self._read()
+            for index, key in enumerate(keys):
+                if key.id == key_id:
+                    keys[index] = updated
+                    self._write(keys)
+                    return True
+        return False
+
+    async def reserve(self, key_id: int, amount: int) -> ResellerKey | None:
+        """Permanently allocate ``amount`` only when the whole budget fits."""
+        if amount < 1:
+            return None
+        async with self._lock:
+            keys = self._read()
+            for index, key in enumerate(keys):
+                if key.id != key_id or not key.active or key.available_tokens < amount:
+                    return None
+                updated = replace(key, issued_tokens=key.issued_tokens + amount)
+                keys[index] = updated
+                self._write(keys)
+                return updated
+        return None
+
+    async def release_rejected_reservation(self, key_id: int, amount: int) -> ResellerKey | None:
+        """Undo only a request that upstream explicitly rejected.
+
+        This is deliberately not used after a timeout or broken connection:
+        the provider may have accepted that request, so returning its budget
+        could allow a second allocation to overspend the primary account.
+        """
+        if amount < 1:
+            return None
+        async with self._lock:
+            keys = self._read()
+            for index, key in enumerate(keys):
+                if key.id != key_id or key.issued_tokens < amount:
+                    return None
+                updated = replace(key, issued_tokens=key.issued_tokens - amount)
+                keys[index] = updated
+                self._write(keys)
+                return updated
+        return None
+
+
+@dataclass(frozen=True, slots=True)
+class ResellerOperation:
+    """Durable audit trail for a master-budget-affecting upstream request."""
+
+    id: str
+    created_at: datetime
+    reseller_id: int
+    action: str
+    amount: int
+    state: str
+    child_key_id: int | None = None
+    detail: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "ResellerOperation":
+        return cls(
+            id=str(data["id"]),
+            created_at=parse_datetime(data["created_at"]),
+            reseller_id=int(data["reseller_id"]),
+            action=str(data["action"]),
+            amount=max(0, int(data.get("amount") or 0)),
+            state=str(data["state"]),
+            child_key_id=int(data["child_key_id"]) if data.get("child_key_id") is not None else None,
+            detail=str(data.get("detail") or "")[:500],
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "id": self.id,
+            "created_at": self.created_at.astimezone(timezone.utc).isoformat(),
+            "reseller_id": self.reseller_id,
+            "action": self.action,
+            "amount": self.amount,
+            "state": self.state,
+            "child_key_id": self.child_key_id,
+            "detail": self.detail,
+        }
+
+
+class ResellerOperationStore:
+    """Append-only-ish persistent ledger of allocation attempts.
+
+    The state transitions ``pending -> confirmed/rejected/unknown`` are
+    persisted before an HTTP response is returned. A request that ends in an
+    unknown state intentionally retains its budget reservation.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._lock = asyncio.Lock()
+
+    def _read(self) -> list[ResellerOperation]:
+        if not self.path.exists():
+            return []
+        raw = self.path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return []
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, list):
+                raise ValueError("root is not a list")
+            return [ResellerOperation.from_dict(item) for item in payload if isinstance(item, dict)]
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Reseller operation store is unreadable: {exc}") from exc
+
+    def _write(self, operations: list[ResellerOperation]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
+        temporary.write_text(
+            json.dumps([operation.to_dict() for operation in operations], ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        temporary.replace(self.path)
+
+    def ensure_exists(self) -> None:
+        if not self.path.exists():
+            self._write([])
+
+    async def add(self, operation: ResellerOperation) -> None:
+        async with self._lock:
+            operations = self._read()
+            operations.append(operation)
+            self._write(operations)
+
+    async def update(self, operation_id: str, **changes: object) -> ResellerOperation | None:
+        async with self._lock:
+            operations = self._read()
+            for index, operation in enumerate(operations):
+                if operation.id != operation_id:
+                    continue
+                updated = replace(operation, **changes)
+                operations[index] = updated
+                self._write(operations)
+                return updated
+        return None
+
+    async def list_for_reseller(self, reseller_id: int) -> list[ResellerOperation]:
+        async with self._lock:
+            return [operation for operation in self._read() if operation.reseller_id == reseller_id]
 
 class TokenKeyStore:
     def __init__(self, path: Path) -> None:
@@ -570,6 +824,47 @@ class TokenKeyStores:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredResellerKey:
+    owner_index: int
+    store: ResellerKeyStore
+    key: ResellerKey
+
+
+class ResellerKeyStores:
+    """Coordinate the local reseller stores matching the token-admin owners."""
+
+    def __init__(self, stores: list[ResellerKeyStore] | tuple[ResellerKeyStore, ...]) -> None:
+        self._stores = tuple(stores)
+
+    @property
+    def count(self) -> int:
+        return len(self._stores)
+
+    def for_owner(self, owner_index: int) -> ResellerKeyStore | None:
+        if not 1 <= owner_index <= len(self._stores):
+            return None
+        return self._stores[owner_index - 1]
+
+    async def find_by_code(self, code: str) -> StoredResellerKey | None:
+        normalized = normalize_access_code(code)
+        if not normalized:
+            return None
+        for owner_index, store in enumerate(self._stores, start=1):
+            key = await store.get_by_code(normalized)
+            if key is not None:
+                return StoredResellerKey(owner_index=owner_index, store=store, key=key)
+        return None
+
+    async def list_all(self) -> list[StoredResellerKey]:
+        groups = await asyncio.gather(*(store.list() for store in self._stores))
+        return [
+            StoredResellerKey(owner_index=index, store=self._stores[index - 1], key=key)
+            for index, keys in enumerate(groups, start=1)
+            for key in keys
+        ]
+
+
+@dataclass(frozen=True, slots=True)
 class TokenAdmin:
     """One password-protected owner area and its primary upstream key."""
 
@@ -579,6 +874,12 @@ class TokenAdmin:
 
 def indexed_token_store_path(base_path: Path, owner_index: int) -> Path:
     """Return the predictable, human-maintainable store path for an owner."""
+    if owner_index < 1:
+        raise ValueError("Owner indexes start at 1.")
+    return base_path.with_name(f"{base_path.stem}_{owner_index}{base_path.suffix}")
+
+
+def indexed_reseller_store_path(base_path: Path, owner_index: int) -> Path:
     if owner_index < 1:
         raise ValueError("Owner indexes start at 1.")
     return base_path.with_name(f"{base_path.stem}_{owner_index}{base_path.suffix}")
@@ -604,6 +905,18 @@ def create_token_key_stores(base_path: Path, owner_count: int) -> list[TokenKeyS
             )
         base_path.replace(paths[0])
     stores = [TokenKeyStore(path) for path in paths]
+    for store in stores:
+        store.ensure_exists()
+    return stores
+
+
+def create_reseller_key_stores(base_path: Path, owner_count: int) -> list[ResellerKeyStore]:
+    if owner_count < 0:
+        raise ValueError("Owner count cannot be negative.")
+    stores = [
+        ResellerKeyStore(indexed_reseller_store_path(base_path, index))
+        for index in range(1, owner_count + 1)
+    ]
     for store in stores:
         store.ensure_exists()
     return stores
@@ -714,7 +1027,7 @@ class CheapVibeCodeClient:
                 detail = raw
             else:
                 detail = payload.get("detail") if isinstance(payload, dict) else raw
-            raise RuntimeError(f"Key service rejected the request: {detail}")
+            raise KeyServiceError(status, str(detail))
         try:
             payload = json.loads(raw)
         except json.JSONDecodeError as exc:
@@ -746,7 +1059,7 @@ class CheapVibeCodeClient:
                 detail = raw
             else:
                 detail = payload.get("detail") if isinstance(payload, dict) else raw
-            raise RuntimeError(f"Key service rejected the request: {detail}")
+            raise KeyServiceError(status, str(detail))
 
     async def set_key_active(self, *, api_key: str, active: bool) -> None:
         """Freeze or unfreeze a secondary key without changing its balance.
@@ -892,6 +1205,8 @@ def create_tokens_routes(
     key_client: SecondaryKeyClient | None = None,
     owner_key_clients: list[SecondaryKeyClient] | tuple[SecondaryKeyClient, ...] | None = None,
     stores: TokenKeyStores | list[TokenKeyStore] | tuple[TokenKeyStore, ...] | None = None,
+    reseller_stores: ResellerKeyStores | list[ResellerKeyStore] | tuple[ResellerKeyStore, ...] | None = None,
+    reseller_operation_stores: list[ResellerOperationStore] | tuple[ResellerOperationStore, ...] | None = None,
     promo_store: PromoCodeStore | None = None,
     admins: list[TokenAdmin] | tuple[TokenAdmin, ...] | None = None,
     admin_passwords: list[str] | tuple[str, ...] | None = None,
@@ -914,6 +1229,36 @@ def create_tokens_routes(
         token_stores = TokenKeyStores(stores)
     if token_stores.count < 1:
         raise ValueError("At least one token key store must be configured.")
+    if reseller_stores is None:
+        reseller_key_stores = ResellerKeyStores([
+            ResellerKeyStore(Path(f"reseller_keys_{index}.json"))
+            for index in range(1, token_stores.count + 1)
+        ])
+    elif isinstance(reseller_stores, ResellerKeyStores):
+        reseller_key_stores = reseller_stores
+    else:
+        reseller_key_stores = ResellerKeyStores(reseller_stores)
+    if reseller_key_stores.count != token_stores.count:
+        raise ValueError("Every token key store needs a matching reseller key store.")
+    for owner_index in range(1, reseller_key_stores.count + 1):
+        reseller_store = reseller_key_stores.for_owner(owner_index)
+        if reseller_store is not None:
+            reseller_store.ensure_exists()
+    if reseller_operation_stores is None:
+        operation_stores = tuple(
+            ResellerOperationStore(
+                reseller_key_stores.for_owner(owner_index).path.with_name(
+                    reseller_key_stores.for_owner(owner_index).path.stem + "_operations.json"
+                )
+            )
+            for owner_index in range(1, reseller_key_stores.count + 1)
+        )
+    else:
+        operation_stores = tuple(reseller_operation_stores)
+    if len(operation_stores) != reseller_key_stores.count:
+        raise ValueError("Every reseller key store needs a matching operation store.")
+    for operation_store in operation_stores:
+        operation_store.ensure_exists()
     promo_codes = promo_store or PromoCodeStore(Path("promo_codes.json"))
 
     configured_admins = tuple(admin for admin in (admins or ()) if admin.password and admin.primary_api_key)
@@ -938,10 +1283,13 @@ def create_tokens_routes(
 
     app.state.token_key_store = token_stores.for_owner(1)
     app.state.token_key_stores = token_stores
+    app.state.reseller_key_stores = reseller_key_stores
+    app.state.reseller_operation_stores = operation_stores
     app.state.promo_code_store = promo_codes
     app.state.secondary_key_client = key_client
     app.state.owner_secondary_key_clients = configured_clients
     admin_sessions: dict[str, int] = {}
+    reseller_sessions: dict[str, tuple[int, int]] = {}
     creation_lock = asyncio.Lock()
 
     def user_response(
@@ -973,6 +1321,28 @@ def create_tokens_routes(
     def is_admin(request: Request) -> bool:
         return admin_owner(request) is not None
 
+    def reseller_identity(request: Request) -> tuple[int, int] | None:
+        session = request.cookies.get(TOKENS_RESELLER_COOKIE, "")
+        identity = reseller_sessions.get(session)
+        if identity is None:
+            return None
+        owner_index, reseller_id = identity
+        reseller_store = reseller_key_stores.for_owner(owner_index)
+        if reseller_store is None:
+            return None
+        return identity
+
+    async def reseller_from_request(request: Request) -> StoredResellerKey | None:
+        identity = reseller_identity(request)
+        if identity is None:
+            return None
+        owner_index, reseller_id = identity
+        reseller_store = reseller_key_stores.for_owner(owner_index)
+        key = await reseller_store.get(reseller_id) if reseller_store is not None else None
+        if key is None or not key.active:
+            return None
+        return StoredResellerKey(owner_index=owner_index, store=reseller_store, key=key)
+
     def owner_client(owner_index: int) -> SecondaryKeyClient | None:
         """Return the owner's upstream client when it is configured.
 
@@ -983,6 +1353,30 @@ def create_tokens_routes(
         if not 1 <= owner_index <= len(configured_clients):
             return None
         return configured_clients[owner_index - 1]
+
+    def operation_store_for_owner(owner_index: int) -> ResellerOperationStore | None:
+        if not 1 <= owner_index <= len(operation_stores):
+            return None
+        return operation_stores[owner_index - 1]
+
+    async def upstream_call_with_backoff(call, *, retry_server_errors: bool = False):
+        """Retry definitive transient throttling/failures, never timeouts.
+
+        A timeout can mean the provider committed a create/top-up but lost its
+        response. Callers record that as ``unknown`` and retain the reserved
+        reseller budget rather than risk a duplicate primary-key allocation.
+        """
+        for attempt, delay in enumerate((0.4, 1.0), start=1):
+            try:
+                return await call()
+            except KeyServiceError as exc:
+                if exc.status_code != 429 and not (retry_server_errors and 500 <= exc.status_code < 600):
+                    raise
+                logger.info("Reseller upstream request rejected transiently; retrying in %.1fs (%s/2)", delay, attempt)
+                await asyncio.sleep(delay)
+            except RuntimeError:
+                raise
+        return await call()
 
     async def read_primary_remaining(owner_index: int) -> int | None:
         client = owner_client(owner_index)
@@ -1034,13 +1428,18 @@ def create_tokens_routes(
         table_state = token_admin_page_state(request.query_params)
         owner_index = admin_owner(request)
         owner_store = token_stores.for_owner(owner_index) if owner_index is not None else None
+        reseller_store = reseller_key_stores.for_owner(owner_index) if owner_index is not None else None
         authenticated = owner_store is not None
         all_keys = await owner_store.list() if owner_store else []
+        resellers = await reseller_store.list() if reseller_store else []
+        # Children are represented only inside their reseller's expandable
+        # panel, never as ordinary top-level admin records.
+        top_level_keys = [key for key in all_keys if key.reseller_id is None]
         promos = await promo_codes.list_for_owner(owner_index) if owner_index is not None else []
         # Search and global ordering must happen before the list is sliced for
         # the 100-row page.  Doing it in the browser would order only the
         # currently visible rows and make later pages inconsistent.
-        matching_keys = filter_token_admin_keys(all_keys, table_state.search_query)
+        matching_keys = filter_token_admin_keys(top_level_keys, table_state.search_query)
         ordered_keys = sort_token_admin_keys(matching_keys, table_state)
         keys, current_page, total_pages = paginate_token_admin_keys(ordered_keys, table_state.page)
         table_state = replace(table_state, page=current_page)
@@ -1055,7 +1454,7 @@ def create_tokens_routes(
             authenticated=authenticated,
             password_configured=bool(configured_admins),
             keys=keys,
-            total_key_count=len(all_keys),
+            total_key_count=len(top_level_keys),
             matching_key_count=len(matching_keys),
             page_state=table_state,
             total_pages=total_pages,
@@ -1064,6 +1463,11 @@ def create_tokens_routes(
             notice=notice,
             created_access_codes=created_access_codes or [],
             created_promo_codes=created_promo_codes or [],
+            resellers=resellers,
+            reseller_children={
+                reseller.id: [key for key in all_keys if key.reseller_id == reseller.id]
+                for reseller in resellers
+            },
         )
         response.status_code = status_code
         return attach_csrf(response, csrf_token, TOKENS_ADMIN_CSRF_COOKIE, "/ai/tokens/adm")
@@ -1365,7 +1769,37 @@ def create_tokens_routes(
         async with creation_lock:
             existing = await owner_store.list()
             all_stored_keys = await token_stores.list_all()
-            existing_codes = {stored.key.access_code for stored in all_stored_keys}
+            all_resellers = await reseller_key_stores.list_all()
+            existing_codes = {
+                stored.key.access_code for stored in all_stored_keys
+            } | {
+                stored.key.access_code for stored in all_resellers
+            }
+            if service == RESELLING_SERVICE:
+                reseller_store = reseller_key_stores.for_owner(owner_index)
+                if reseller_store is None:
+                    return await admin_response(request, error="Не настроено хранилище реселлеров.", status_code=503)
+                existing_resellers = await reseller_store.list()
+                records: list[ResellerKey] = []
+                for index in range(quantity):
+                    # Reserve each generated code before making the next one;
+                    # uniqueness holds for normal, reseller, and same-batch
+                    # keys alike.
+                    access_code = generate_access_code(existing_codes)
+                    existing_codes.add(access_code)
+                    records.append(ResellerKey(
+                        id=max((key.id for key in existing_resellers), default=0) + index + 1,
+                        created_at=utc_now(),
+                        access_code=access_code,
+                        name=name,
+                        token_limit=token_limit,
+                    ))
+                await reseller_store.add_many(records)
+                return await admin_response(
+                    request,
+                    notice=f"Создано реселлерских ключей: {len(records)}. Внешние ключи не создавались.",
+                    created_access_codes=[record.access_code for record in records],
+                )
             next_id = max((key.id for key in existing), default=0) + 1
             records: list[TokenKey] = []
             try:
@@ -1451,6 +1885,206 @@ def create_tokens_routes(
             created_promo_codes=[record.code for record in records],
         )
 
+    async def reseller_response(
+        request: Request,
+        *,
+        reseller: StoredResellerKey | None = None,
+        error: str = "",
+        notice: str = "",
+        submitted_code: str = "",
+        status_code: int = 200,
+    ) -> HTMLResponse:
+        csrf_token = secrets.token_urlsafe(32)
+        children: list[TokenKey] = []
+        operations: list[ResellerOperation] = []
+        if reseller is not None:
+            owner_store = token_stores.for_owner(reseller.owner_index)
+            if owner_store is not None:
+                children = [key for key in await owner_store.list() if key.reseller_id == reseller.key.id]
+            operation_store = operation_store_for_owner(reseller.owner_index)
+            if operation_store is not None:
+                operations = await operation_store.list_for_reseller(reseller.key.id)
+        response = render_reseller_page(
+            csrf_token=csrf_token,
+            reseller=reseller.key if reseller is not None else None,
+            children=children,
+            operations=operations,
+            error=error,
+            notice=notice,
+            submitted_code=submitted_code,
+        )
+        response.status_code = status_code
+        return attach_csrf(response, csrf_token, TOKENS_RESELLER_CSRF_COOKIE, "/ai/tokens/reselling")
+
+    async def reseller_page(request: Request) -> HTMLResponse:
+        reseller = await reseller_from_request(request)
+        linked_code = normalize_access_code(request.query_params.get("key") or "")
+        return await reseller_response(request, reseller=reseller, submitted_code=linked_code)
+
+    async def reseller_login(request: Request) -> HTMLResponse:
+        form = await read_form(request)
+        if not valid_csrf(request, form, TOKENS_RESELLER_CSRF_COOKIE):
+            return RedirectResponse(url="/ai/tokens/reselling", status_code=303)
+        found = await reseller_key_stores.find_by_code(form.get("access_code", ""))
+        if found is None or not found.key.active:
+            return await reseller_response(
+                request,
+                error="Реселлерский ключ не существует или заморожен.",
+                submitted_code=normalize_access_code(form.get("access_code", "")),
+                status_code=401,
+            )
+        session = secrets.token_urlsafe(32)
+        reseller_sessions[session] = (found.owner_index, found.key.id)
+        response = RedirectResponse(url="/ai/tokens/reselling", status_code=303)
+        response.headers["Cache-Control"] = "no-store"
+        response.set_cookie(
+            TOKENS_RESELLER_COOKIE,
+            session,
+            httponly=True,
+            samesite="lax",
+            secure=True,
+            path="/ai/tokens/reselling",
+            max_age=60 * 60 * 24 * 30,
+        )
+        return response
+
+    async def reseller_logout(request: Request) -> HTMLResponse:
+        form = await read_form(request)
+        if not valid_csrf(request, form, TOKENS_RESELLER_CSRF_COOKIE):
+            return RedirectResponse(url="/ai/tokens/reselling", status_code=303)
+        reseller_sessions.pop(request.cookies.get(TOKENS_RESELLER_COOKIE, ""), None)
+        response = await reseller_response(request, notice="Вы вышли из кабинета реселлера.")
+        response.delete_cookie(TOKENS_RESELLER_COOKIE, path="/ai/tokens/reselling")
+        return response
+
+    async def reseller_create_child(request: Request) -> HTMLResponse:
+        form = await read_form(request)
+        reseller = await reseller_from_request(request)
+        if reseller is None:
+            return await reseller_response(request, error="Сессия реселлера завершена.", status_code=401)
+        if not valid_csrf(request, form, TOKENS_RESELLER_CSRF_COOKIE):
+            return RedirectResponse(url="/ai/tokens/reselling", status_code=303)
+        service = form.get("service", "")
+        name = form.get("name", "").strip()
+        token_limit = positive_int(form.get("token_limit", ""))
+        if service not in RESELLER_SERVICE_OPTIONS:
+            return await reseller_response(request, reseller=reseller, error="Выберите обычный доступный сервис.", status_code=400)
+        if not name or token_limit is None or token_limit < 1:
+            return await reseller_response(request, reseller=reseller, error="Введите название и положительное количество токенов.", status_code=400)
+        owner_store = token_stores.for_owner(reseller.owner_index)
+        client = owner_client(reseller.owner_index)
+        operation_store = operation_store_for_owner(reseller.owner_index)
+        if owner_store is None or client is None or operation_store is None:
+            return await reseller_response(request, reseller=reseller, error="Сервис создания ключей временно недоступен.", status_code=503)
+        # Reserve first under the reseller-store lock; do not automatically
+        # retry an ambiguous create after a network failure.
+        reserved = await reseller.store.reserve(reseller.key.id, token_limit)
+        if reserved is None:
+            return await reseller_response(request, reseller=reseller, error="Недостаточно доступного лимита реселлера.", status_code=409)
+        operation = ResellerOperation(
+            id=secrets.token_urlsafe(18), created_at=utc_now(), reseller_id=reseller.key.id,
+            action="create", amount=token_limit, state="pending",
+        )
+        await operation_store.add(operation)
+        try:
+            api_key = await upstream_call_with_backoff(lambda: client.create_key(name=name, token_limit=token_limit))
+        except KeyServiceError as exc:
+            if 400 <= exc.status_code < 500 and exc.status_code != 429:
+                await reseller.store.release_rejected_reservation(reseller.key.id, token_limit)
+                await operation_store.update(operation.id, state="rejected", detail=exc.detail)
+                return await reseller_response(request, reseller=reseller, error="Внешний сервис отклонил создание ключа.", status_code=502)
+            await operation_store.update(operation.id, state="unknown", detail=exc.detail)
+            return await reseller_response(request, reseller=reseller, error="Создание не подтверждено. Лимит зарезервирован; повтор не выполнен, чтобы не создать ключ дважды.", status_code=502)
+        except RuntimeError as exc:
+            await operation_store.update(operation.id, state="unknown", detail=str(exc))
+            return await reseller_response(request, reseller=reseller, error="Создание не подтверждено. Лимит зарезервирован; повтор не выполнен, чтобы не создать ключ дважды.", status_code=502)
+        all_codes = {stored.key.access_code for stored in await token_stores.list_all()} | {
+            stored.key.access_code for stored in await reseller_key_stores.list_all()
+        }
+        child = TokenKey(
+            id=max((key.id for key in await owner_store.list()), default=0) + 1,
+            created_at=utc_now(), access_code=generate_access_code(all_codes), api_key=api_key,
+            service=service, name=name, token_limit=token_limit, reseller_id=reseller.key.id,
+        )
+        await owner_store.add_many([child])
+        await operation_store.update(operation.id, state="confirmed", child_key_id=child.id)
+        current = await reseller_from_request(request)
+        return await reseller_response(request, reseller=current, notice="Производный ключ создан.")
+
+    async def reseller_top_up_child(request: Request, key_id: int) -> HTMLResponse:
+        form = await read_form(request)
+        reseller = await reseller_from_request(request)
+        if reseller is None:
+            return await reseller_response(request, error="Сессия реселлера завершена.", status_code=401)
+        if not valid_csrf(request, form, TOKENS_RESELLER_CSRF_COOKIE):
+            return RedirectResponse(url="/ai/tokens/reselling", status_code=303)
+        additional_tokens = positive_int(form.get("additional_tokens", ""))
+        owner_store = token_stores.for_owner(reseller.owner_index)
+        client = owner_client(reseller.owner_index)
+        operation_store = operation_store_for_owner(reseller.owner_index)
+        child = await owner_store.get(key_id) if owner_store is not None else None
+        if child is None or child.reseller_id != reseller.key.id:
+            return await reseller_response(request, reseller=reseller, error="Производный ключ не найден.", status_code=404)
+        if additional_tokens is None or additional_tokens < 1:
+            return await reseller_response(request, reseller=reseller, error="Введите положительное количество токенов.", status_code=400)
+        if client is None or operation_store is None:
+            return await reseller_response(request, reseller=reseller, error="Сервис пополнения временно недоступен.", status_code=503)
+        reserved = await reseller.store.reserve(reseller.key.id, additional_tokens)
+        if reserved is None:
+            return await reseller_response(request, reseller=reseller, error="Недостаточно доступного лимита реселлера.", status_code=409)
+        operation = ResellerOperation(
+            id=secrets.token_urlsafe(18), created_at=utc_now(), reseller_id=reseller.key.id,
+            action="top_up", amount=additional_tokens, state="pending", child_key_id=child.id,
+        )
+        await operation_store.add(operation)
+        try:
+            await upstream_call_with_backoff(lambda: client.add_tokens(api_key=child.api_key, additional_tokens=additional_tokens, active=child.active))
+        except KeyServiceError as exc:
+            if 400 <= exc.status_code < 500 and exc.status_code != 429:
+                await reseller.store.release_rejected_reservation(reseller.key.id, additional_tokens)
+                await operation_store.update(operation.id, state="rejected", detail=exc.detail)
+                return await reseller_response(request, reseller=reseller, error="Внешний сервис отклонил пополнение.", status_code=502)
+            await operation_store.update(operation.id, state="unknown", detail=exc.detail)
+            return await reseller_response(request, reseller=reseller, error="Пополнение не подтверждено. Лимит зарезервирован; повтор отключён во избежание двойного начисления.", status_code=502)
+        except RuntimeError as exc:
+            await operation_store.update(operation.id, state="unknown", detail=str(exc))
+            return await reseller_response(request, reseller=reseller, error="Пополнение не подтверждено. Лимит зарезервирован; повтор отключён во избежание двойного начисления.", status_code=502)
+        updated = replace(child, token_limit=child.token_limit + additional_tokens)
+        await owner_store.update(child.id, updated)
+        await operation_store.update(operation.id, state="confirmed")
+        current = await reseller_from_request(request)
+        return await reseller_response(request, reseller=current, notice="Лимит производного ключа увеличен.")
+
+    async def reseller_toggle_child(request: Request, key_id: int) -> HTMLResponse:
+        form = await read_form(request)
+        reseller = await reseller_from_request(request)
+        if reseller is None:
+            return await reseller_response(request, error="Сессия реселлера завершена.", status_code=401)
+        if not valid_csrf(request, form, TOKENS_RESELLER_CSRF_COOKIE):
+            return RedirectResponse(url="/ai/tokens/reselling", status_code=303)
+        owner_store = token_stores.for_owner(reseller.owner_index)
+        client = owner_client(reseller.owner_index)
+        child = await owner_store.get(key_id) if owner_store is not None else None
+        if child is None or child.reseller_id != reseller.key.id:
+            return await reseller_response(request, reseller=reseller, error="Производный ключ не найден.", status_code=404)
+        if client is None:
+            return await reseller_response(request, reseller=reseller, error="Сервис изменения статуса временно недоступен.", status_code=503)
+        target_active = not child.active
+        try:
+            await upstream_call_with_backoff(
+                lambda: client.set_key_active(api_key=child.api_key, active=target_active),
+                retry_server_errors=True,
+            )
+        except RuntimeError as exc:
+            log_key_state_failure(owner_index=reseller.owner_index, key_id=child.id, error=exc)
+            return await reseller_response(request, reseller=reseller, error="Не удалось изменить статус производного ключа.", status_code=502)
+        await owner_store.update(child.id, replace(child, active=target_active))
+        current = await reseller_from_request(request)
+        return await reseller_response(
+            request, reseller=current,
+            notice="Производный ключ разморожен." if target_active else "Производный ключ заморожен.",
+        )
+
     async def admin_update(request: Request, key_id: int) -> HTMLResponse:
         form = await read_form(request)
         owner_index = admin_owner(request)
@@ -1469,6 +2103,50 @@ def create_tokens_routes(
             return await admin_response(request, error=str(exc), status_code=400)
         await owner_store.update(key_id, updated)
         return await admin_response(request, notice=f"Ключ #{key_id} обновлен.")
+
+    async def admin_toggle_reseller(request: Request, reseller_id: int) -> HTMLResponse:
+        """Freeze/unfreeze a local reseller and mirror it to every child.
+
+        Local state changes only after the upstream action for each child has
+        succeeded. A later retry can safely repeat ``active=False/True``.
+        """
+        form = await read_form(request)
+        owner_index = admin_owner(request)
+        reseller_store = reseller_key_stores.for_owner(owner_index) if owner_index is not None else None
+        owner_store = token_stores.for_owner(owner_index) if owner_index is not None else None
+        client = owner_client(owner_index) if owner_index is not None else None
+        if reseller_store is None or owner_store is None:
+            return await admin_response(request, error="Сессия администратора завершена.", status_code=401)
+        if not valid_csrf(request, form, TOKENS_ADMIN_CSRF_COOKIE):
+            return RedirectResponse(url="/ai/tokens/adm", status_code=303)
+        reseller = await reseller_store.get(reseller_id)
+        if reseller is None:
+            return await admin_response(request, error="Реселлерский ключ не найден.", status_code=404)
+        target_active = not reseller.active
+        children = [key for key in await owner_store.list() if key.reseller_id == reseller.id]
+        if children and client is None:
+            return await admin_response(request, error="Не настроен основной API-ключ администратора.", status_code=503)
+        for child in children:
+            if child.active == target_active:
+                continue
+            try:
+                await upstream_call_with_backoff(
+                    lambda child=child: client.set_key_active(api_key=child.api_key, active=target_active),
+                    retry_server_errors=True,
+                )
+            except RuntimeError as exc:
+                log_key_state_failure(owner_index=owner_index, key_id=child.id, error=exc)
+                return await admin_response(
+                    request,
+                    error=f"Каскадная смена статуса остановлена на производном ключе #{child.id}. Повторите операцию.",
+                    status_code=502,
+                )
+            await owner_store.update(child.id, replace(child, active=target_active))
+        await reseller_store.update(reseller.id, replace(reseller, active=target_active))
+        return await admin_response(
+            request,
+            notice=("Реселлер и все производные ключи разморожены." if target_active else "Реселлер и все производные ключи заморожены."),
+        )
 
     async def admin_delete(request: Request, key_id: int) -> HTMLResponse:
         form = await read_form(request)
@@ -1503,7 +2181,13 @@ def create_tokens_routes(
             )
         target_active = not current.active
         try:
-            await client.set_key_active(api_key=current.api_key, active=target_active)
+            # State changes are idempotent upstream, so transient throttling
+            # and gateway failures can be retried without changing a token
+            # limit or risking a duplicate allocation.
+            await upstream_call_with_backoff(
+                lambda: client.set_key_active(api_key=current.api_key, active=target_active),
+                retry_server_errors=True,
+            )
         except (RuntimeError, ValueError) as exc:
             log_key_state_failure(owner_index=owner_index, key_id=key_id, error=exc)
             return await admin_response(
@@ -1531,6 +2215,13 @@ def create_tokens_routes(
     app.add_api_route("/ai/tokens/adm/{key_id}/update", admin_update, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm/{key_id}/freeze", admin_toggle_freeze, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/adm/{key_id}/delete", admin_delete, methods=["POST"], response_class=HTMLResponse, response_model=None)
+    app.add_api_route("/ai/tokens/adm/resellers/{reseller_id}/freeze", admin_toggle_reseller, methods=["POST"], response_class=HTMLResponse, response_model=None)
+    app.add_api_route("/ai/tokens/reselling", reseller_page, methods=["GET"], response_class=HTMLResponse, response_model=None)
+    app.add_api_route("/ai/tokens/reselling/login", reseller_login, methods=["POST"], response_class=HTMLResponse, response_model=None)
+    app.add_api_route("/ai/tokens/reselling/logout", reseller_logout, methods=["POST"], response_class=HTMLResponse, response_model=None)
+    app.add_api_route("/ai/tokens/reselling/create", reseller_create_child, methods=["POST"], response_class=HTMLResponse, response_model=None)
+    app.add_api_route("/ai/tokens/reselling/{key_id}/top-up", reseller_top_up_child, methods=["POST"], response_class=HTMLResponse, response_model=None)
+    app.add_api_route("/ai/tokens/reselling/{key_id}/freeze", reseller_toggle_child, methods=["POST"], response_class=HTMLResponse, response_model=None)
 
 
 def positive_int(value: str) -> int | None:
@@ -1553,7 +2244,9 @@ def input_datetime(value: datetime | None) -> str:
 
 def record_from_admin_form(form: dict[str, str], current: TokenKey, all_keys: list[TokenKey]) -> TokenKey:
     service = form.get("service", "")
-    if service not in SERVICE_OPTIONS:
+    # Reseller masters are local records with their own ledger and editing
+    # form. They must never be converted from/to ordinary upstream keys.
+    if service not in RESELLER_SERVICE_OPTIONS:
         raise ValueError("Выберите доступный сервис.")
     name = form.get("name", "").strip()
     api_key = form.get("api_key", "").strip()
@@ -1561,7 +2254,7 @@ def record_from_admin_form(form: dict[str, str], current: TokenKey, all_keys: li
     token_limit = positive_int(form.get("token_limit", ""))
     used_tokens = positive_int(form.get("used_tokens", ""))
     if not name:
-        raise ValueError("Название ключа не ложет быть пустым.")
+        raise ValueError("Название ключа не может быть пустым.")
     if not api_key:
         raise ValueError("API key не может быть пустым.")
     if len(access_code) != 20 or any(char not in TOKEN_CODE_ALPHABET for char in access_code):
@@ -2159,6 +2852,8 @@ def render_tokens_admin(
     notice: str = "",
     created_access_codes: list[str] | None = None,
     created_promo_codes: list[str] | None = None,
+    resellers: list[ResellerKey] | None = None,
+    reseller_children: dict[int, list[TokenKey]] | None = None,
 ) -> HTMLResponse:
     flash = ""
     if error:
@@ -2181,6 +2876,9 @@ def render_tokens_admin(
         return HTMLResponse(render_layout("Админ-панель ключей", content))
     state = page_state or TokenAdminPageState()
     rows = render_admin_rows(keys, csrf_token, state)
+    reseller_rows = render_admin_reseller_rows(
+        resellers or [], reseller_children or {}, csrf_token, state,
+    )
     promo_rows = render_admin_promo_rows(promos or [])
     created_access_codes = created_access_codes or []
     created_promo_codes = created_promo_codes or []
@@ -2253,6 +2951,11 @@ def render_tokens_admin(
         <tbody>{rows or "<tr><td colspan='9' class='empty'>По вашему запросу ключей не найдено.</td></tr>"}</tbody></table></div>
         <div id='keys-table-groups' hidden></div>
         {table_pagination}
+      </section>
+      <section class='card'>
+        <h2>РЕСЕЛЛЕРСКИЕ КЛЮЧИ</h2>
+        <p class='hint'>Бюджет «выдано навсегда» не возвращается при заморозке, удалении или изменении производного ключа. Нажмите «Производные ключи», чтобы раскрыть вложенный список.</p>
+        <div class='reseller-list'>{reseller_rows or "<p class='empty'>Реселлерских ключей пока нет.</p>"}</div>
       </section>
       <section class='card'>
         <h2>СОЗДАНИЯ ПРОМОКОДОВ</h2>
@@ -2429,7 +3132,7 @@ def render_admin_rows(
         </form></div></td></tr>""")
         options = "".join(
             f"<option value='{html.escape(service, quote=True)}' {'selected' if service == key.service else ''}>{html.escape(service)}</option>"
-            for service in SERVICE_OPTIONS
+            for service in RESELLER_SERVICE_OPTIONS
         )
         rows.append(f"""
         <tr class='edit-row' hidden><td colspan='9'>
@@ -2455,6 +3158,85 @@ def render_admin_rows(
     return "".join(rows)
 
 
+def render_admin_reseller_rows(
+    resellers: list[ResellerKey], children_by_reseller: dict[int, list[TokenKey]], csrf_token: str,
+    state: TokenAdminPageState,
+) -> str:
+    action_query = urlencode({
+        "page": str(state.page), "sort": state.sort_key, "order": state.sort_order,
+        **({"search": state.search_query} if state.search_query else {}),
+    })
+    cards: list[str] = []
+    for reseller in resellers:
+        children = children_by_reseller.get(reseller.id, [])
+        status = "Активен" if reseller.active else "Заморожен"
+        freeze_label = "Заморозить" if reseller.active else "Разморозить"
+        child_rows = "".join(
+            f"<tr><td>{child.id}</td><td>{html.escape(child.service)}</td><td>{html.escape(child.name)}</td>"
+            f"<td><code>{html.escape(child.access_code)}</code></td>"
+            f"<td class='copyable-api-key' data-copy-api-key='{html.escape(child.api_key, quote=True)}' role='button' tabindex='0' title='Нажмите, чтобы скопировать API key' aria-label='Скопировать API key'><code class='api-preview'>{html.escape(child.api_key)}</code></td>"
+            f"<td>{format_tokens(child.token_limit)}</td><td>{format_tokens(child.used_tokens)}</td>"
+            f"<td>{format_tokens(child.remaining_tokens)}</td><td>{'Активен' if child.active else 'Заморожен'}</td></tr>"
+            for child in children
+        ) or "<tr><td colspan='9' class='empty'>Производных ключей пока нет.</td></tr>"
+        cards.append(f"""
+        <article class='reseller-card' data-reseller-id='{reseller.id}'>
+          <div class='reseller-summary'>
+            <div><strong>{html.escape(reseller.name)}</strong><span class='hint'> · Реселлинг · {status}</span></div>
+            <div class='reseller-values'><span>Ключ: <code>{html.escape(reseller.access_code)}</code></span><span>Лимит: {format_tokens(reseller.token_limit)}</span><span>Выдано навсегда: {format_tokens(reseller.issued_tokens)}</span><span>Доступно: {format_tokens(reseller.available_tokens)}</span><span>Производных: {len(children)}</span></div>
+            <div class='management-actions'>
+              <button type='button' class='secondary' data-reseller-children>Производные ключи</button>
+              <form method='post' action='/ai/tokens/adm/resellers/{reseller.id}/freeze?{html.escape(action_query, quote=True)}' class='inline-freeze-form'>
+                <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><button class='freeze-key {'frozen' if not reseller.active else ''}' type='submit'>{freeze_label}</button>
+              </form>
+            </div>
+          </div>
+          <div class='table-wrap reseller-children' hidden><table><thead><tr><th>ID</th><th>Сервис</th><th>Название</th><th>Ключ доступа</th><th>API key</th><th>Лимит</th><th>Использовано</th><th>Остаток</th><th>Статус</th></tr></thead><tbody>{child_rows}</tbody></table></div>
+        </article>""")
+    return "".join(cards)
+
+
+def render_reseller_page(
+    *, csrf_token: str, reseller: ResellerKey | None, children: list[TokenKey],
+    operations: list[ResellerOperation], error: str = "", notice: str = "", submitted_code: str = "",
+) -> HTMLResponse:
+    flash = f"<div class='flash error'>{html.escape(error)}</div>" if error else (
+        f"<div class='flash success'>{html.escape(notice)}</div>" if notice else ""
+    )
+    if reseller is None:
+        content = f"""
+        <main class='page narrow'><section class='card'><h1>КАБИНЕТ РЕСЕЛЛЕРА</h1>{flash}
+          <form method='post' action='/ai/tokens/reselling/login'>
+            <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'>
+            <label>Реселлерский ключ<input name='access_code' value='{html.escape(submitted_code, quote=True)}' autocomplete='off' required></label>
+            <button type='submit' class='primary wide'>ВОЙТИ</button>
+          </form>
+        </section></main>"""
+        return HTMLResponse(render_layout("Кабинет реселлера", content))
+    services = "".join(
+        f"<option value='{html.escape(service)}'>{html.escape(service)}</option>" for service in RESELLER_SERVICE_OPTIONS
+    )
+    child_rows: list[str] = []
+    for child in children:
+        status = "Активен" if child.active else "Заморожен"
+        freeze_label = "Заморозить" if child.active else "Разморозить"
+        child_rows.append(f"""
+        <tr><td>{child.id}</td><td>{html.escape(child.service)}</td><td>{html.escape(child.name)}</td><td><code>{html.escape(child.access_code)}</code></td><td class='copyable-api-key' data-copy-api-key='{html.escape(child.api_key, quote=True)}' role='button' tabindex='0' title='Нажмите, чтобы скопировать API key' aria-label='Скопировать API key'><code class='api-preview'>{html.escape(child.api_key)}</code></td><td>{format_tokens(child.token_limit)}</td><td>{format_tokens(child.used_tokens)}</td><td>{format_tokens(child.remaining_tokens)}</td><td>{status}</td>
+        <td><form method='post' action='/ai/tokens/reselling/{child.id}/top-up'><input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><input name='additional_tokens' type='number' min='1' step='1' required placeholder='Токенов'><button class='secondary' type='submit'>Пополнить</button></form><form method='post' action='/ai/tokens/reselling/{child.id}/freeze'><input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><button class='freeze-key {'frozen' if not child.active else ''}' type='submit'>{freeze_label}</button></form></td></tr>""")
+    unknown_operations = [operation for operation in operations if operation.state == "unknown"]
+    pending_notice = "" if not unknown_operations else f"<p class='warning'>Есть неподтверждённые операции: {len(unknown_operations)}. Их лимит остаётся зарезервированным, чтобы исключить двойное списание.</p>"
+    content = f"""
+    <main class='page admin-page'><section class='card'>
+      <div class='title-row'><h1>КАБИНЕТ РЕСЕЛЛЕРА</h1><form method='post' action='/ai/tokens/reselling/logout'><input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><button class='secondary' type='submit'>Выйти</button></form></div>
+      {flash}{pending_notice}
+      <dl class='details'><dt>Название</dt><dd>{html.escape(reseller.name)}</dd><dt>Общий лимит</dt><dd>{format_tokens(reseller.token_limit)}</dd><dt>Выдано навсегда</dt><dd>{format_tokens(reseller.issued_tokens)}</dd><dt>Доступно к выдаче</dt><dd>{format_tokens(reseller.available_tokens)}</dd></dl>
+    </section>
+    <section class='card'><h2>СОЗДАТЬ ПРОИЗВОДНЫЙ КЛЮЧ</h2><form method='post' action='/ai/tokens/reselling/create' class='create-form'><input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><label>Сервис<select name='service' required>{services}</select></label><label>Название<input name='name' maxlength='200' required></label><label>Количество токенов<input name='token_limit' type='number' min='1' step='1' required></label><button type='submit' class='primary wide'>СОЗДАТЬ КЛЮЧ</button></form></section>
+    <section class='card'><h2>ПРОИЗВОДНЫЕ КЛЮЧИ</h2><p class='hint'>Доступны только поддерживаемые операции: создание, пополнение и заморозка. Уменьшение лимита и удаление не отображаются, так как upstream пока не поддерживает их безопасно.</p><div class='table-wrap'><table class='reseller-child-table'><thead><tr><th>ID</th><th>Сервис</th><th>Название</th><th>Ключ доступа</th><th>API key</th><th>Лимит</th><th>Использовано</th><th>Остаток</th><th>Статус</th><th>Действия</th></tr></thead><tbody>{''.join(child_rows) or "<tr><td colspan='10' class='empty'>Производных ключей пока нет.</td></tr>"}</tbody></table></div></section>
+    </main>"""
+    return HTMLResponse(render_layout("Кабинет реселлера", content))
+
+
 def render_layout(title: str, content: str, locale: str = "ru") -> str:
     return f"""<!doctype html>
 <html lang='{token_locale(locale)}'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width, initial-scale=1'>
@@ -2474,7 +3256,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 .instruction-mode-tabs {{ display:flex; gap:6px; margin:16px 0 10px; border-bottom:1px solid var(--line); }} .instruction-mode {{ color:var(--muted); background:transparent; border-radius:8px 8px 0 0; padding:9px 12px; }} .instruction-mode.active {{ color:var(--text); background:#1b2940; box-shadow:inset 0 -2px 0 var(--accent); }} .instruction-mode-panel {{ padding:2px 0 4px; }} .manual-heading {{ color:var(--text); font-weight:700; }} .manual-downloads {{ display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 14px; }} .download-file {{ color:var(--text); background:#1b2940; border:1px solid var(--line); border-radius:8px; padding:8px 11px; font-size:14px; font-weight:700; text-decoration:none; }} .download-file:hover,.download-file:focus {{ border-color:var(--accent); color:var(--accent); }} .manual-note {{ margin:8px 0 14px; color:var(--muted); line-height:1.55; }} .remove-integration {{ margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:10px; background:#0b1321; }} .remove-integration summary,.faq-item summary {{ cursor:pointer; padding:12px 14px; font-weight:700; }} .remove-integration pre {{ margin:0 12px 12px; }} .remove-integration {{ border-color:rgba(255,120,133,.42); background:rgba(255,120,133,.07); }} .remove-integration summary {{ color:#ffdce0; }} .remove-integration .hint,.remove-integration button {{ margin-left:12px; margin-right:12px; }} .remove-integration button {{ margin-bottom:12px; }}
 .faq {{ scroll-margin-top:24px; }} .faq-items {{ border-top:1px solid var(--line); }} .faq-item {{ display:block; border-bottom:1px solid var(--line); }} .faq-item summary {{ list-style:none; padding-right:38px; position:relative; }} .faq-item summary::-webkit-details-marker {{ display:none; }} .faq-item summary::after {{ content:'+'; position:absolute; right:14px; color:var(--accent); font-size:20px; line-height:1; }} .faq-item[open] summary::after {{ content:'−'; }} .faq-item p {{ color:var(--muted); padding:0 14px 14px; margin:0; }}
 .title-row {{ display:flex; justify-content:space-between; gap:16px; align-items:start; }} .title-row form {{ margin:0; }} .create-form,.edit-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); column-gap:18px; }} .create-form .wide {{ grid-column:1 / -1; }}
-.table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form,.inline-freeze-form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .freeze-key {{ margin:0; color:#e3f3ff; background:#375d80; }} .freeze-key:hover,.freeze-key:focus {{ background:#48789f; }} .freeze-key.frozen {{ color:#05233c; background:linear-gradient(135deg,#d9f6ff,#83d5f4); box-shadow:0 0 0 1px rgba(174,235,255,.55),0 0 16px rgba(106,210,247,.35); }} .freeze-key.frozen:hover,.freeze-key.frozen:focus {{ background:linear-gradient(135deg,#e9faff,#a9e5fa); }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} .promos-table {{ min-width:640px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} .sort-link,.service-group-header {{ color:inherit; font:inherit; font-weight:700; text-align:left; text-decoration:none; }} .sort-link:hover,.sort-link:focus,.service-group-header:hover,.service-group-header:focus,th[data-group-service].grouped {{ color:var(--accent); }} th[data-group-service] {{ cursor:pointer; user-select:none; }} .service-group-header {{ padding:0; background:transparent; border-radius:0; }} .keys-search-form {{ margin:14px 0 18px; }} .keys-search-form label {{ margin-top:0; }} .keys-search-controls {{ display:flex; gap:9px; align-items:end; }} .keys-search-controls input {{ margin-top:0; min-width:0; flex:1 1 auto; }} .keys-search-controls .secondary,.reset-search {{ white-space:nowrap; }} .reset-search {{ display:inline-flex; align-items:center; justify-content:center; min-height:46px; text-decoration:none; }} .admin-page.is-updating {{ opacity:.64; pointer-events:none; transition:opacity .12s ease; }} .pagination {{ display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; margin-top:18px; }} .pagination-summary {{ margin:0; color:var(--muted); }} .pagination-links {{ display:flex; flex-wrap:wrap; gap:6px; align-items:center; }} .page-link {{ display:inline-flex; align-items:center; justify-content:center; min-width:38px; min-height:36px; padding:7px 10px; border-radius:8px; color:var(--text); background:#263652; font-weight:700; text-decoration:none; }} .page-link:hover,.page-link:focus {{ color:#08101e; background:var(--accent); }} .page-link.current {{ color:#08101e; background:var(--accent); cursor:default; }} .page-link.disabled {{ color:var(--muted); opacity:.55; cursor:not-allowed; }} .page-ellipsis {{ padding:0 3px; color:var(--muted); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .created-key-actions {{ display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .service-group-toggle {{ color:var(--text); background:transparent; padding:0; font-size:16px; }} .service-group-toggle:hover,.service-group-toggle:focus {{ color:var(--accent); }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-row>td {{ padding:0 8px 14px; border-bottom:1px solid var(--line); }} .edit-form {{ margin:0; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
+.table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form,.inline-freeze-form,.reseller-child-table form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .freeze-key {{ margin:0; color:#e3f3ff; background:#375d80; }} .freeze-key:hover,.freeze-key:focus {{ background:#48789f; }} .freeze-key.frozen {{ color:#05233c; background:linear-gradient(135deg,#d9f6ff,#83d5f4); box-shadow:0 0 0 1px rgba(174,235,255,.55),0 0 16px rgba(106,210,247,.35); }} .freeze-key.frozen:hover,.freeze-key.frozen:focus {{ background:linear-gradient(135deg,#e9faff,#a9e5fa); }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} .promos-table {{ min-width:640px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} .sort-link,.service-group-header {{ color:inherit; font:inherit; font-weight:700; text-align:left; text-decoration:none; }} .sort-link:hover,.sort-link:focus,.service-group-header:hover,.service-group-header:focus,th[data-group-service].grouped {{ color:var(--accent); }} th[data-group-service] {{ cursor:pointer; user-select:none; }} .service-group-header {{ padding:0; background:transparent; border-radius:0; }} .keys-search-form {{ margin:14px 0 18px; }} .keys-search-form label {{ margin-top:0; }} .keys-search-controls {{ display:flex; gap:9px; align-items:end; }} .keys-search-controls input {{ margin-top:0; min-width:0; flex:1 1 auto; }} .keys-search-controls .secondary,.reset-search {{ white-space:nowrap; }} .reset-search {{ display:inline-flex; align-items:center; justify-content:center; min-height:46px; text-decoration:none; }} .admin-page.is-updating {{ opacity:.64; pointer-events:none; transition:opacity .12s ease; }} .pagination {{ display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; margin-top:18px; }} .pagination-summary {{ margin:0; color:var(--muted); }} .pagination-links {{ display:flex; flex-wrap:wrap; gap:6px; align-items:center; }} .page-link {{ display:inline-flex; align-items:center; justify-content:center; min-width:38px; min-height:36px; padding:7px 10px; border-radius:8px; color:var(--text); background:#263652; font-weight:700; text-decoration:none; }} .page-link:hover,.page-link:focus {{ color:#08101e; background:var(--accent); }} .page-link.current {{ color:#08101e; background:var(--accent); cursor:default; }} .page-link.disabled {{ color:var(--muted); opacity:.55; cursor:not-allowed; }} .page-ellipsis {{ padding:0 3px; color:var(--muted); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .created-key-actions {{ display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; }} .reseller-card {{ margin:12px 0; padding:14px; border:1px solid var(--line); border-radius:10px; background:#0b1321; }} .reseller-summary {{ display:grid; gap:10px; }} .reseller-values {{ display:flex; flex-wrap:wrap; gap:8px 16px; color:var(--muted); }} .reseller-children {{ margin-top:12px; }} .reseller-child-table td:last-child {{ display:grid; gap:7px; min-width:180px; }} .reseller-child-table input {{ margin:0 0 6px; padding:7px; min-width:160px; }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .service-group-toggle {{ color:var(--text); background:transparent; padding:0; font-size:16px; }} .service-group-toggle:hover,.service-group-toggle:focus {{ color:var(--accent); }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-row>td {{ padding:0 8px 14px; border-bottom:1px solid var(--line); }} .edit-form {{ margin:0; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }}
 @media(max-width:650px) {{ .page,.admin-page {{ width:min(100% - 20px,960px); margin-top:12px; }} .card {{ padding:18px; border-radius:12px; }} h1 {{ font-size:24px; }} .details,.create-form,.edit-grid,.info-actions {{ grid-template-columns:1fr; }} .title-row {{ display:block; }} .title-row form {{ margin-top:12px; }} .keys-search-controls {{ flex-wrap:wrap; }} .keys-search-controls input {{ flex-basis:100%; }} .pagination {{ align-items:start; flex-direction:column; }} }}
 </style></head><body>{content}<script data-tokens-admin-refresh>
 (function() {{
@@ -2509,6 +3291,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
   document.querySelectorAll('.copyable-api-key').forEach(function(cell) {{ cell.addEventListener('click',function() {{ copyApiKey(cell); }}); cell.addEventListener('keydown',function(event) {{ if(event.key==='Enter'||event.key===' ') {{ event.preventDefault(); copyApiKey(cell); }} }}); }});
   function copyCreatedValue(container, button, value) {{ if(!button) return; button.addEventListener('click',function() {{ navigator.clipboard.writeText(value||'').then(function() {{ var old=button.textContent; button.textContent='Скопировано'; setTimeout(function() {{ button.textContent=old; }},1500); }}); }}); }}
   document.querySelectorAll('.copy-created-codes').forEach(function(container) {{ copyCreatedValue(container,container.querySelector('.copy-created-codes-button'),container.dataset.createdCodes); copyCreatedValue(container,container.querySelector('.copy-created-links-button'),container.dataset.createdLinks); }});
+  document.querySelectorAll('[data-reseller-children]').forEach(function(button) {{ button.addEventListener('click',function() {{ var card=button.closest('.reseller-card'), children=card&&card.querySelector('.reseller-children'); if(!children) return; children.hidden=!children.hidden; button.textContent=children.hidden?'Производные ключи':'Скрыть производные ключи'; }}); }});
   // Keep the admin shell in place: forms and table navigation fetch fresh
   // markup, replace only <main>, and re-run this initializer. This preserves
   // the current document instead of doing a browser-level page reload.
@@ -2583,8 +3366,8 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 
 
 __all__ = [
-    "CheapVibeCodeClient", "SecondaryKeyClient", "SERVICE_OPTIONS", "StoredTokenKey", "TokenAdmin", "TokenKey", "TokenKeyStore", "TokenKeyStores",
-    "create_token_key_stores", "indexed_token_store_path",
+    "CheapVibeCodeClient", "SecondaryKeyClient", "SERVICE_OPTIONS", "RESELLING_SERVICE", "RESELLER_SERVICE_OPTIONS", "StoredTokenKey", "StoredResellerKey", "TokenAdmin", "TokenKey", "TokenKeyStore", "TokenKeyStores", "ResellerKey", "ResellerKeyStore", "ResellerKeyStores", "ResellerOperation", "ResellerOperationStore",
+    "create_token_key_stores", "create_reseller_key_stores", "indexed_token_store_path", "indexed_reseller_store_path",
     "create_tokens_routes", "default_instruction_choice", "generate_access_code",
     "instruction_command", "instruction_remove_command", "instruction_steps", "manual_instruction_command", "manual_instruction_note", "manual_download_buttons",
     "normalize_access_code", "trusted_secondary_remaining", "used_tokens_from_remaining",

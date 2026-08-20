@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     grok_activation_api_url: str = "https://bypriceactivate.pro"
     grok_activation_timeout_seconds: float = 30.0
     token_key_store_path: Path = Path("token_keys.json")
+    reseller_key_store_path: Path = Path("reseller_keys.json")
     promo_code_store_path: Path = Path("promo_codes.json")
     cvc_primary_api_key: str | None = None
     cvc_api_base_url: str = "https://starimg.ru/ai/common"

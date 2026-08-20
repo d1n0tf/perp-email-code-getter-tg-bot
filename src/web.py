@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 from src.config import settings
 from src.grok import GrokActivationClient, create_grok_routes
-from src.tokens import CheapVibeCodeClient, PromoCodeStore, TokenAdmin, TokenKeyStores, create_token_key_stores, create_tokens_routes
+from src.tokens import CheapVibeCodeClient, PromoCodeStore, ResellerKeyStores, TokenAdmin, TokenKeyStores, create_reseller_key_stores, create_token_key_stores, create_tokens_routes
 from src.messages import DEFAULT_LOCALE, SUPPORTED_LOCALES, translate
 from src.service import ActivatedSubscription, BotService
 from src.time_utils import MOSCOW_TZ, to_moscow, to_utc
@@ -297,9 +297,14 @@ def create_web_app(service: BotService) -> FastAPI:
         settings.token_key_store_path,
         max(1, len(configured_token_admins)),
     )
+    reseller_stores = create_reseller_key_stores(
+        settings.reseller_key_store_path,
+        max(1, len(configured_token_admins)),
+    )
     create_tokens_routes(
         app,
         stores=TokenKeyStores(token_stores),
+        reseller_stores=ResellerKeyStores(reseller_stores),
         promo_store=PromoCodeStore(settings.promo_code_store_path),
         admins=configured_token_admins,
         owner_key_clients=[

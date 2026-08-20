@@ -15,6 +15,9 @@ from src.tokens import (
     INSTRUCTION_SYSTEMS_BY_APP,
     PromoCode,
     PromoCodeStore,
+    ResellerKeyStore,
+    ResellerKeyStores,
+    ResellerKey,
     SERVICE_OPTIONS,
     TokenKey,
     TokenKeyStore,
@@ -109,12 +112,14 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.directory = tempfile.TemporaryDirectory()
         self.store = TokenKeyStore(Path(self.directory.name) / "token_keys.json")
+        self.reseller_store = ResellerKeyStore(Path(self.directory.name) / "reseller_keys.json")
         self.promo_store = PromoCodeStore(Path(self.directory.name) / "promo_codes.json")
         self.key_client = FakeKeyClient()
         self.app = FastAPI()
         create_tokens_routes(
             self.app,
             store=self.store,
+            reseller_stores=ResellerKeyStores([self.reseller_store]),
             promo_store=self.promo_store,
             key_client=self.key_client,
             admin_password="secret",
@@ -707,6 +712,154 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
                 f"https://starimg.ru/ai/tokens?key={key.access_code}",
                 response.text,
             )
+
+    async def test_admin_creates_local_reseller_key_without_upstream_key(self) -> None:
+        login_form, login_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        login = await self.client.post(
+            "/ai/tokens/adm/login", data={**login_form, "password": "secret"},
+            headers=login_headers, follow_redirects=False,
+        )
+        session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        create_form, csrf_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        response = await self.client.post(
+            "/ai/tokens/adm/create",
+            data={
+                **create_form, "service": "Реселлинг", "name": "Reseller One",
+                "token_limit": "1000", "quantity": "1",
+            },
+            headers={"Cookie": csrf_headers["Cookie"] + "; " + session_cookie},
+        )
+
+        resellers = await self.reseller_store.list()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(self.key_client.calls, [])
+        self.assertEqual(len(resellers), 1)
+        self.assertEqual(resellers[0].token_limit, 1_000)
+        self.assertIn("РЕСЕЛЛЕРСКИЕ КЛЮЧИ", response.text)
+        self.assertIn("Выдано навсегда: 0", response.text)
+        self.assertIn(resellers[0].access_code, response.text)
+
+    async def test_admin_creates_unique_local_reseller_keys_in_one_batch(self) -> None:
+        login_form, login_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        login = await self.client.post(
+            "/ai/tokens/adm/login", data={**login_form, "password": "secret"},
+            headers=login_headers, follow_redirects=False,
+        )
+        session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        create_form, csrf_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        response = await self.client.post(
+            "/ai/tokens/adm/create",
+            data={
+                **create_form, "service": "Реселлинг", "name": "Batch",
+                "token_limit": "1000", "quantity": "2",
+            },
+            headers={"Cookie": csrf_headers["Cookie"] + "; " + session_cookie},
+        )
+
+        resellers = await self.reseller_store.list()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(resellers), 2)
+        self.assertEqual(len({reseller.access_code for reseller in resellers}), 2)
+
+    async def test_reseller_creates_child_and_permanently_uses_budget(self) -> None:
+        await self.reseller_store.add_many([
+            ResellerKey(1, utc_now(), "ABCDEFGHIJKLMNOPQRST", "Reseller", 1_000)
+        ])
+        login_page = await self.client.get("/ai/tokens/reselling")
+        parser = HiddenInputParser()
+        parser.feed(login_page.text)
+        login = await self.client.post(
+            "/ai/tokens/reselling/login",
+            data={"csrf_token": parser.values["csrf_token"], "access_code": "ABCDEFGHIJKLMNOPQRST"},
+            headers={"Cookie": f"tokens_reseller_csrf={parser.values['csrf_token']}"},
+            follow_redirects=False,
+        )
+        session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        page = await self.client.get("/ai/tokens/reselling", headers={"Cookie": session_cookie})
+        parser = HiddenInputParser()
+        parser.feed(page.text)
+        created = await self.client.post(
+            "/ai/tokens/reselling/create",
+            data={
+                "csrf_token": parser.values["csrf_token"], "service": "Grok", "name": "Child",
+                "token_limit": "600",
+            },
+            headers={"Cookie": f"tokens_reseller_csrf={parser.values['csrf_token']}; {session_cookie}"},
+        )
+
+        children = await self.store.list()
+        reseller = await self.reseller_store.get(1)
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(self.key_client.calls, [("Child", 600)])
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0].reseller_id, 1)
+        self.assertEqual(reseller.issued_tokens if reseller else None, 600)
+        self.assertEqual(reseller.available_tokens if reseller else None, 400)
+        self.assertNotIn("Реселлинг</option>", created.text)
+        self.assertNotIn("Удалить</button>", created.text)
+
+    async def test_reseller_top_up_cannot_exceed_budget_and_never_returns_it(self) -> None:
+        await self.reseller_store.add_many([
+            ResellerKey(1, utc_now(), "ABCDEFGHIJKLMNOPQRST", "Reseller", 1_000, issued_tokens=600)
+        ])
+        await self.store.add_many([
+            TokenKey(1, utc_now(), "QRSTUVWXYZABCDEFGHIJ", "sk-child", "Claude", "Child", 600, reseller_id=1)
+        ])
+        login_page = await self.client.get("/ai/tokens/reselling")
+        parser = HiddenInputParser()
+        parser.feed(login_page.text)
+        login = await self.client.post(
+            "/ai/tokens/reselling/login",
+            data={"csrf_token": parser.values["csrf_token"], "access_code": "ABCDEFGHIJKLMNOPQRST"},
+            headers={"Cookie": f"tokens_reseller_csrf={parser.values['csrf_token']}"},
+            follow_redirects=False,
+        )
+        session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        page = await self.client.get("/ai/tokens/reselling", headers={"Cookie": session_cookie})
+        parser = HiddenInputParser()
+        parser.feed(page.text)
+        too_much = await self.client.post(
+            "/ai/tokens/reselling/1/top-up", data={"csrf_token": parser.values["csrf_token"], "additional_tokens": "401"},
+            headers={"Cookie": f"tokens_reseller_csrf={parser.values['csrf_token']}; {session_cookie}"},
+        )
+        topped_up = await self.client.post(
+            "/ai/tokens/reselling/1/top-up", data={"csrf_token": parser.values["csrf_token"], "additional_tokens": "400"},
+            headers={"Cookie": f"tokens_reseller_csrf={parser.values['csrf_token']}; {session_cookie}"},
+        )
+
+        child = await self.store.get(1)
+        reseller = await self.reseller_store.get(1)
+        self.assertEqual(too_much.status_code, 409)
+        self.assertEqual(topped_up.status_code, 200)
+        self.assertEqual(self.key_client.add_token_calls, [("sk-child", 400)])
+        self.assertEqual(child.token_limit if child else None, 1_000)
+        self.assertEqual(reseller.issued_tokens if reseller else None, 1_000)
+
+    async def test_admin_freezes_reseller_and_all_children(self) -> None:
+        await self.reseller_store.add_many([
+            ResellerKey(1, utc_now(), "ABCDEFGHIJKLMNOPQRST", "Reseller", 1_000, issued_tokens=100)
+        ])
+        await self.store.add_many([
+            TokenKey(1, utc_now(), "QRSTUVWXYZABCDEFGHIJ", "sk-child", "Grok", "Child", 100, reseller_id=1)
+        ])
+        login_form, login_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        login = await self.client.post(
+            "/ai/tokens/adm/login", data={**login_form, "password": "secret"},
+            headers=login_headers, follow_redirects=False,
+        )
+        session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        page_form, csrf_headers = await self.csrf("/ai/tokens/adm", "tokens_admin_csrf")
+        response = await self.client.post(
+            "/ai/tokens/adm/resellers/1/freeze", data=page_form,
+            headers={"Cookie": csrf_headers["Cookie"] + "; " + session_cookie},
+        )
+
+        reseller = await self.reseller_store.get(1)
+        child = await self.store.get(1)
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(reseller.active if reseller else True)
+        self.assertFalse(child.active if child else True)
+        self.assertEqual(self.key_client.set_active_calls, [("sk-child", False)])
 
     async def test_admin_freezes_and_unfreezes_key_with_its_owner_client(self) -> None:
         await self.store.add_many([
