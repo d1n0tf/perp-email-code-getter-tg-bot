@@ -46,7 +46,7 @@ TOKEN_TEXT = {
     "ru": {
         "switch": "English", "title": "Сервис активации", "intro": "Здесь вы сможете активировать и использовать API ключи с токенами для сервисов Claude / Codex / Grok / Google и другие.<br>Для этого следуйте инструкции ниже.",
         "activation": "Активация ключа", "access": "Ключ доступа", "access_hint": "➥ Здесь вводите ключ доступа который получили от продавца.", "activate": "АКТИВИРОВАТЬ КЛЮЧ",
-        "info": "ИНФОРМАЦИЯ", "service": "Подключенный сервис:", "activated": "Дата активации ключа:", "limit": "Количество токенов:", "remaining": "Оставшиеся токены:", "status": "Статус:", "api": "API ключ:", "bonus": "Получить бонус", "bonus_instructions": "Чтобы получить бонусные токены, оставьте положительный отзыв на странице оплаты у продавца. После этого продавец отправит вам промокод в чат. Введите его в поле ниже и нажмите «Получить».", "promo_code": "Промокод", "claim_bonus": "Получить", "promo_missing": "🔴 Промокод не существует или уже был использован ранее.", "promo_success": "✅ Промокод #{code} был активирован и вам начислено {tokens} токенов.", "promo_error": "Не удалось начислить бонус. Попробуйте ещё раз.", "download_logs": "Скачать логи", "logs_downloading": "Скачивание…", "logs_error": "Не удалось скачать логи. Попробуйте ещё раз.",
+        "info": "ИНФОРМАЦИЯ", "service": "Подключенный сервис:", "activated": "Дата активации ключа:", "base_url": "Base URL:", "limit": "Количество токенов:", "remaining": "Оставшиеся токены:", "status": "Статус:", "api": "API ключ:", "bonus": "Получить бонус", "bonus_instructions": "Чтобы получить бонусные токены, оставьте положительный отзыв на странице оплаты у продавца. После этого продавец отправит вам промокод в чат. Введите его в поле ниже и нажмите «Получить».", "promo_code": "Промокод", "claim_bonus": "Получить", "promo_missing": "🔴 Промокод не существует или уже был использован ранее.", "promo_success": "✅ Промокод #{code} был активирован и вам начислено {tokens} токенов.", "promo_error": "Не удалось начислить бонус. Попробуйте ещё раз.", "download_logs": "Скачать логи", "logs_downloading": "Скачивание…", "logs_error": "Не удалось скачать логи. Попробуйте ещё раз.",
         "exhausted": "Токены были полностью использованы. Дата: {date}", "not_activated": "Не активирован", "activated_status": "Активирован ({date})", "exhausted_status": "Исчерпан ({date})",
         "instructions": "ИНСТРУКЦИЯ ПО ИСПОЛЬЗОВАНИЮ", "instructions_intro": "Если вы не знаете как использовать API ключ, мы поможем, для начала выберите через что вы будете использовать API",
         "choose_service": "1. Выберите сервис", "choose_app": "2. Выберите приложение", "choose_os": "3. Выберите операционную систему", "selected": "Выбрано:", "description": "Описание:", "os": "Операционная система:",
@@ -60,7 +60,7 @@ TOKEN_TEXT = {
     "en": {
         "switch": "Русский", "title": "Activation Service", "intro": "Activate and use token-based API keys for Claude / Codex / Grok / Google and other services.<br>Follow the instructions below.",
         "activation": "Key activation", "access": "Access key", "access_hint": "➥ Enter the access key received from the seller.", "activate": "ACTIVATE KEY",
-        "info": "INFORMATION", "service": "Connected service:", "activated": "Key activation date:", "limit": "Token amount:", "remaining": "Remaining tokens:", "status": "Status:", "api": "API key:", "bonus": "Get bonus", "bonus_instructions": "To receive bonus tokens, leave a positive review on the seller's payment page. The seller will then send you a promo code in the chat. Enter it below and click “Get”.", "promo_code": "Promo code", "claim_bonus": "Get", "promo_missing": "🔴 The promo code does not exist or has already been used.", "promo_success": "✅ Promo code #{code} was activated and {tokens} tokens were credited to your account.", "promo_error": "Could not credit the bonus. Please try again.", "download_logs": "Download logs", "logs_downloading": "Downloading…", "logs_error": "Could not download logs. Please try again.",
+        "info": "INFORMATION", "service": "Connected service:", "activated": "Key activation date:", "base_url": "Base URL:", "limit": "Token amount:", "remaining": "Remaining tokens:", "status": "Status:", "api": "API key:", "bonus": "Get bonus", "bonus_instructions": "To receive bonus tokens, leave a positive review on the seller's payment page. The seller will then send you a promo code in the chat. Enter it below and click “Get”.", "promo_code": "Promo code", "claim_bonus": "Get", "promo_missing": "🔴 The promo code does not exist or has already been used.", "promo_success": "✅ Promo code #{code} was activated and {tokens} tokens were credited to your account.", "promo_error": "Could not credit the bonus. Please try again.", "download_logs": "Download logs", "logs_downloading": "Downloading…", "logs_error": "Could not download logs. Please try again.",
         "exhausted": "All tokens have been used. Date: {date}", "not_activated": "Not activated", "activated_status": "Activated ({date})", "exhausted_status": "Exhausted ({date})",
         "instructions": "INSTRUCTIONS FOR USE", "instructions_intro": "If you do not know how to use the API key, we can help. First choose how you will use the API.",
         "choose_service": "1. Choose a service", "choose_app": "2. Choose an application", "choose_os": "3. Choose an operating system", "selected": "Selected:", "description": "Description:", "os": "Operating system:",
@@ -2491,15 +2491,28 @@ def render_tokens_page(
     return HTMLResponse(render_layout(text['title'], content, locale))
 
 
+def public_base_url_for_service(service: str) -> str:
+    """Return the customer-facing endpoint documented by the installer scripts.
+
+    Claude-native clients use the gateway root. Every other ordinary service
+    is served through the OpenAI-compatible API. The proxy domain is kept here
+    deliberately: customers must never receive the upstream provider domain.
+    """
+    root = "https://starimg.ru/ai/common"
+    return root if service.strip().casefold() == "claude" else f"{root}/v1"
+
+
 def render_key_information(key: TokenKey, *, csrf_token: str, locale: str = "ru") -> str:
     text = TOKEN_TEXT[token_locale(locale)]
     status = text["frozen"] if not key.active else (text["exhausted_status"].format(date=format_datetime(key.exhausted_at or key.activated_at)) if key.is_exhausted else (text["activated_status"].format(date=format_datetime(key.activated_at)) if key.activated_at else text["not_activated"]))
     freeze_label = text["freeze"] if key.active else text["unfreeze"]
     freeze_class = "freeze-key frozen" if not key.active else "freeze-key"
+    base_url = public_base_url_for_service(key.service)
     return f"""
     <section class='card info-card'><h2>{html.escape(text['info'])}</h2><dl class='details'>
       <dt>{html.escape(text['service'])}</dt><dd>{html.escape(key.service.upper())}</dd>
       <dt>{html.escape(text['activated'])}</dt><dd>{format_datetime(key.activated_at)}</dd>
+      <dt>{html.escape(text['base_url'])}</dt><dd><code class='api-key'>{html.escape(base_url)}</code></dd>
       <dt>{html.escape(text['limit'])}</dt><dd>{format_tokens(key.token_limit)}</dd>
       <dt>{html.escape(text['remaining'])}</dt><dd id='token-balance' data-separator='{html.escape(text['remaining_sep'], quote=True)}' data-fallback='{format_tokens(key.remaining_tokens)}'>{format_tokens(key.remaining_tokens)} {html.escape(text['remaining_sep'])} {format_tokens(key.token_limit)}</dd>
       <dt>{html.escape(text['status'])}</dt><dd>{html.escape(status)}</dd>

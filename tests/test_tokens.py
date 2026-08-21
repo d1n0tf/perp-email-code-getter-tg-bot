@@ -513,6 +513,21 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("/ai/tokens?lang=ru", response.text)
         self.assertIn("name='lang' value='en'", response.text)
 
+    async def test_public_information_shows_proxy_base_url_for_each_protocol(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(1, utc_now(), access_code, "sk-cvc-claude", "Claude", "Claude key", 100),
+        ])
+        claude = await self.client.get("/ai/tokens", headers={"Cookie": f"tokens_access_key={access_code}"})
+        self.assertEqual(claude.status_code, 200)
+        self.assertIn("Base URL:", claude.text)
+        self.assertIn("https://starimg.ru/ai/common</code>", claude.text)
+        await self.store.update(1, TokenKey(1, utc_now(), access_code, "sk-cvc-openai", "OpenAI", "OpenAI key", 100))
+        openai = await self.client.get("/ai/tokens", headers={"Cookie": f"tokens_access_key={access_code}"})
+        self.assertEqual(openai.status_code, 200)
+        self.assertIn("https://starimg.ru/ai/common/v1</code>", openai.text)
+        self.assertNotIn("cheapvibecode", openai.text.casefold())
+
     async def test_public_page_prefills_access_key_from_link(self) -> None:
         access_code = "abcdefghijklmnopqrst"
 
