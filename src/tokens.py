@@ -41,6 +41,8 @@ SERVICE_OPTIONS = (
 )
 RESELLING_SERVICE = "Реселлинг"
 RESELLER_SERVICE_OPTIONS = tuple(service for service in SERVICE_OPTIONS if service != RESELLING_SERVICE)
+RESELLER_ALL_SERVICES = "Все"
+RESELLER_CHILD_SERVICE_OPTIONS = (RESELLER_ALL_SERVICES, *RESELLER_SERVICE_OPTIONS)
 
 TOKEN_TEXT = {
     "ru": {
@@ -81,6 +83,13 @@ def token_locale(value: str | None) -> str:
 def reseller_locale(value: str | None) -> str:
     """The reseller portal is English by default, unlike the public token page."""
     return "ru" if value == "ru" else "en"
+
+
+def reseller_service_label(service: str, locale: str) -> str:
+    """Keep the stored all-services marker localised in customer-facing UI."""
+    if service.strip().casefold() == RESELLER_ALL_SERVICES.casefold():
+        return "All" if token_locale(locale) == "en" else RESELLER_ALL_SERVICES
+    return service
 
 
 RESELLER_TEXT = {
@@ -2092,7 +2101,7 @@ def create_tokens_routes(
         service = form.get("service", "")
         name = form.get("name", "").strip()
         token_limit = positive_int(form.get("token_limit", ""))
-        if service not in RESELLER_SERVICE_OPTIONS:
+        if service not in RESELLER_CHILD_SERVICE_OPTIONS:
             return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "ordinary_service"), status_code=400)
         if not name or token_limit is None or token_limit < 1:
             return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "name_limit"), status_code=400)
@@ -2498,8 +2507,11 @@ def public_base_url_for_service(service: str) -> str:
     is served through the OpenAI-compatible API. The proxy domain is kept here
     deliberately: customers must never receive the upstream provider domain.
     """
+    normalized = service.strip().casefold()
+    if normalized == RESELLER_ALL_SERVICES.casefold():
+        return "—"
     root = "https://starimg.ru/ai/common"
-    return root if service.strip().casefold() == "claude" else f"{root}/v1"
+    return root if normalized == "claude" else f"{root}/v1"
 
 
 def render_key_information(key: TokenKey, *, csrf_token: str, locale: str = "ru") -> str:
@@ -2510,7 +2522,7 @@ def render_key_information(key: TokenKey, *, csrf_token: str, locale: str = "ru"
     base_url = public_base_url_for_service(key.service)
     return f"""
     <section class='card info-card'><h2>{html.escape(text['info'])}</h2><dl class='details'>
-      <dt>{html.escape(text['service'])}</dt><dd>{html.escape(key.service.upper())}</dd>
+      <dt>{html.escape(text['service'])}</dt><dd>{html.escape(reseller_service_label(key.service, locale).upper())}</dd>
       <dt>{html.escape(text['activated'])}</dt><dd>{format_datetime(key.activated_at)}</dd>
       <dt>{html.escape(text['base_url'])}</dt><dd><code class='api-key'>{html.escape(base_url)}</code></dd>
       <dt>{html.escape(text['limit'])}</dt><dd>{format_tokens(key.token_limit)}</dd>
@@ -3402,8 +3414,8 @@ def render_reseller_page(
         </section></main>"""
         return HTMLResponse(render_layout(text["title"], content, locale=locale))
     services = "".join(
-        f"<option value='{html.escape(service, quote=True)}'>{html.escape(service)}</option>"
-        for service in RESELLER_SERVICE_OPTIONS
+        f"<option value='{html.escape(service, quote=True)}'>{html.escape(reseller_service_label(service, locale))}</option>"
+        for service in RESELLER_CHILD_SERVICE_OPTIONS
     )
     child_rows: list[str] = []
     for child in children:
@@ -3427,7 +3439,7 @@ def render_reseller_page(
         api_key = html.escape(child.api_key, quote=True)
         child_rows.append(f"""
         <tr class='reseller-child-row'>
-          <td>{child.id}</td><td>{html.escape(child.service)}</td><td>{html.escape(child.name)}</td>
+          <td>{child.id}</td><td>{html.escape(reseller_service_label(child.service, locale))}</td><td>{html.escape(child.name)}</td>
           <td><code class='reseller-key-cell' title='{html.escape(child.access_code, quote=True)}'>{html.escape(child.access_code)}</code></td>
           <td class='copyable-api-key' data-copy-api-key='{api_key}' role='button' tabindex='0' title='{html.escape(text["copy_hint"], quote=True)}' aria-label='{html.escape(text["copy_hint"], quote=True)}'><code class='reseller-key-cell' title='{api_key}'>{api_key}</code></td>
           <td>{format_tokens(child.token_limit)}</td><td>{format_tokens(child.used_tokens)}</td><td>{format_tokens(child.remaining_tokens)}</td><td><span class='reseller-status {status_class}'>{html.escape(status)}</span>{f"<div class='reseller-activation-detail'>{html.escape(activation_detail)}</div>" if activation_detail else ""}</td>

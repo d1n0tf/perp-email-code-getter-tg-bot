@@ -528,6 +528,20 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertIn("https://starimg.ru/ai/common/v1</code>", openai.text)
         self.assertNotIn("cheapvibecode", openai.text.casefold())
 
+    async def test_all_services_key_shows_a_dash_instead_of_a_base_url(self) -> None:
+        access_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.store.add_many([
+            TokenKey(1, utc_now(), access_code, "sk-cvc-all", "Все", "All services key", 100),
+        ])
+
+        response = await self.client.get(
+            "/ai/tokens?lang=en", headers={"Cookie": f"tokens_access_key={access_code}"}
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("<dt>Base URL:</dt><dd><code class='api-key'>—</code></dd>", response.text)
+        self.assertIn("<dt>Connected service:</dt><dd>ALL</dd>", response.text)
+
     async def test_public_page_prefills_access_key_from_link(self) -> None:
         access_code = "abcdefghijklmnopqrst"
 
@@ -812,6 +826,40 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reseller.available_tokens if reseller else None, 400)
         self.assertNotIn("Реселлинг</option>", created.text)
         self.assertNotIn("Удалить</button>", created.text)
+
+    async def test_reseller_can_create_an_all_services_key(self) -> None:
+        reseller_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.reseller_store.add_many([
+            ResellerKey(1, utc_now(), reseller_code, "Reseller", 1_000)
+        ])
+        login_page = await self.client.get("/ai/tokens/reselling")
+        parser = HiddenInputParser()
+        parser.feed(login_page.text)
+        login = await self.client.post(
+            "/ai/tokens/reselling/login",
+            data={"csrf_token": parser.values["csrf_token"], "access_code": reseller_code},
+            headers={"Cookie": f"tokens_reseller_csrf={parser.values['csrf_token']}"},
+            follow_redirects=False,
+        )
+        session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        page = await self.client.get("/ai/tokens/reselling", headers={"Cookie": session_cookie})
+        self.assertIn("<option value='Все'>All</option>", page.text)
+        parser = HiddenInputParser()
+        parser.feed(page.text)
+        created = await self.client.post(
+            "/ai/tokens/reselling/create",
+            data={
+                "csrf_token": parser.values["csrf_token"], "service": "Все", "name": "All services",
+                "token_limit": "600",
+            },
+            headers={"Cookie": f"tokens_reseller_csrf={parser.values['csrf_token']}; {session_cookie}"},
+        )
+
+        children = await self.store.list()
+        self.assertEqual(created.status_code, 200)
+        self.assertEqual(self.key_client.calls, [("All services", 600)])
+        self.assertEqual(len(children), 1)
+        self.assertEqual(children[0].service, "Все")
 
     async def test_reseller_top_up_cannot_exceed_budget_and_never_returns_it(self) -> None:
         await self.reseller_store.add_many([
