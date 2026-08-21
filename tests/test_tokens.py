@@ -830,6 +830,21 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Реселлинг</option>", created.text)
         self.assertNotIn("Удалить</button>", created.text)
 
+    async def test_reseller_debit_finds_a_later_reseller_record(self) -> None:
+        await self.reseller_store.add_many([
+            ResellerKey(1, utc_now(), "AAAAAAAAAAAAAAAAAAAA", "First", 1_000),
+            ResellerKey(2, utc_now(), "BBBBBBBBBBBBBBBBBBBB", "Second", 1_000),
+        ])
+
+        charged = await self.reseller_store.spend_confirmed(2, 111)
+
+        first = await self.reseller_store.get(1)
+        second = await self.reseller_store.get(2)
+        self.assertIsNotNone(charged)
+        self.assertEqual(first.issued_tokens if first else None, 0)
+        self.assertEqual(second.issued_tokens if second else None, 111)
+        self.assertEqual(second.available_tokens if second else None, 889)
+
     async def test_reseller_can_create_an_all_services_key(self) -> None:
         reseller_code = "ABCDEFGHIJKLMNOPQRST"
         await self.reseller_store.add_many([

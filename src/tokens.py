@@ -471,7 +471,9 @@ class ResellerKeyStore:
                 # Activity is checked before an upstream request starts. Once
                 # that request succeeds, the debit must be recorded even if
                 # an administrator froze the reseller in the meantime.
-                if key.id != key_id or key.available_tokens < amount:
+                if key.id != key_id:
+                    continue
+                if key.available_tokens < amount:
                     return None
                 updated = replace(key, issued_tokens=key.issued_tokens + amount)
                 keys[index] = updated
