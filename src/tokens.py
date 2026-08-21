@@ -108,11 +108,11 @@ RESELLER_TEXT = {
         "active": "Активен", "frozen": "Заморожен", "freeze": "Заморозить", "unfreeze": "Разморозить", "top_up_placeholder": "Токенов", "top_up": "Пополнить",
         "activated_at": "Активирован ({date})", "not_activated": "Не активирован", "exhausted": "Истрачен ({date})",
         "regenerate_child": "Перегенерировать", "regenerate_child_confirm": "Перегенерировать ключ доступа этого клиента? Старый ключ сразу перестанет работать.", "regenerate_child_notice": "Ключ доступа производного ключа перегенерирован.",
-        "empty": "Клиентских ключей пока нет.", "pending": "Есть неподтверждённые операции: {count}. Зарезервированный лимит сохранён, чтобы исключить двойное списание.",
+        "empty": "Клиентских ключей пока нет.",
         "session_expired": "Сессия реселлера завершена.", "invalid_key": "Реселлерский ключ не существует или заморожен.", "not_found": "Производный ключ не найден.",
         "ordinary_service": "Выберите обычный доступный сервис.", "name_limit": "Введите название и положительное количество токенов.", "service_unavailable": "Сервис создания ключей временно недоступен.",
-        "insufficient": "Недостаточно доступного лимита реселлера.", "created": "Производный ключ создан.", "topup_unavailable": "Сервис пополнения временно недоступен.",
-        "topup_invalid": "Введите положительное количество токенов.", "topup_rejected": "Внешний сервис отклонил пополнение.", "topup_unknown": "Пополнение не подтверждено. Лимит зарезервирован; повтор отключён во избежание двойного начисления.",
+        "insufficient": "Недостаточно доступного лимита реселлера.", "created": "Производный ключ создан.", "network_error": "Сетевая ошибка при обращении к сервису. Попробуйте ещё раз позже.", "topup_unavailable": "Сервис пополнения временно недоступен.",
+        "topup_invalid": "Введите положительное количество токенов.", "topup_rejected": "Внешний сервис отклонил пополнение.",
         "topup_success": "Лимит производного ключа увеличен.", "state_unavailable": "Сервис изменения статуса временно недоступен.", "state_error": "Не удалось изменить статус производного ключа.",
         "frozen_notice": "Производный ключ заморожен.", "unfrozen_notice": "Производный ключ разморожен.", "logout_notice": "Вы вышли из кабинета реселлера.",
         "access_code_label": "Ключ доступа", "copy_hint": "Нажмите, чтобы скопировать API key",
@@ -132,11 +132,11 @@ RESELLER_TEXT = {
         "active": "Active", "frozen": "Frozen", "freeze": "Freeze", "unfreeze": "Unfreeze", "top_up_placeholder": "Tokens", "top_up": "Top up",
         "activated_at": "Activated ({date})", "not_activated": "Not activated", "exhausted": "Exhausted ({date})",
         "regenerate_child": "Regenerate", "regenerate_child_confirm": "Regenerate this customer's access key? The old key will stop working immediately.", "regenerate_child_notice": "The customer access key was regenerated.",
-        "empty": "No customer keys yet.", "pending": "There are {count} unconfirmed operations. The reserved limit is retained to prevent double charging.",
+        "empty": "No customer keys yet.",
         "session_expired": "The reseller session has expired.", "invalid_key": "The reseller key does not exist or is frozen.", "not_found": "Customer key not found.",
         "ordinary_service": "Choose a supported regular service.", "name_limit": "Enter a name and a positive token amount.", "service_unavailable": "Key creation is temporarily unavailable.",
-        "insufficient": "The reseller has insufficient available token balance.", "created": "Customer key created.", "topup_unavailable": "Top-up is temporarily unavailable.",
-        "topup_invalid": "Enter a positive token amount.", "topup_rejected": "The upstream service rejected the top-up.", "topup_unknown": "The top-up was not confirmed. The limit is reserved; retrying is disabled to prevent double crediting.",
+        "insufficient": "The reseller has insufficient available token balance.", "created": "Customer key created.", "network_error": "A network error occurred while contacting the service. Please try again later.", "topup_unavailable": "Top-up is temporarily unavailable.",
+        "topup_invalid": "Enter a positive token amount.", "topup_rejected": "The upstream service rejected the top-up.",
         "topup_success": "The customer key limit was increased.", "state_unavailable": "Status changes are temporarily unavailable.", "state_error": "Could not change the customer key status.",
         "frozen_notice": "Customer key frozen.", "unfrozen_notice": "Customer key unfrozen.", "logout_notice": "You have signed out of the reseller dashboard.",
         "access_code_label": "Access key", "copy_hint": "Click to copy API key",
@@ -398,7 +398,8 @@ class ResellerKeyStore:
 
     ``issued_tokens`` never decreases: creation and an upstream-confirmed
     top-up consume budget permanently, including after a child is frozen or
-    later archived. The lock makes the check-and-reserve operation atomic.
+    later archived. The ledger is changed only after the upstream confirms the
+    actual create or top-up request.
     """
 
     def __init__(self, path: Path) -> None:
@@ -460,36 +461,19 @@ class ResellerKeyStore:
                     return True
         return False
 
-    async def reserve(self, key_id: int, amount: int) -> ResellerKey | None:
-        """Permanently allocate ``amount`` only when the whole budget fits."""
+    async def spend_confirmed(self, key_id: int, amount: int) -> ResellerKey | None:
+        """Debit a reseller only after the upstream operation succeeded."""
         if amount < 1:
             return None
         async with self._lock:
             keys = self._read()
             for index, key in enumerate(keys):
-                if key.id != key_id or not key.active or key.available_tokens < amount:
+                # Activity is checked before an upstream request starts. Once
+                # that request succeeds, the debit must be recorded even if
+                # an administrator froze the reseller in the meantime.
+                if key.id != key_id or key.available_tokens < amount:
                     return None
                 updated = replace(key, issued_tokens=key.issued_tokens + amount)
-                keys[index] = updated
-                self._write(keys)
-                return updated
-        return None
-
-    async def release_rejected_reservation(self, key_id: int, amount: int) -> ResellerKey | None:
-        """Undo only a request that upstream explicitly rejected.
-
-        This is deliberately not used after a timeout or broken connection:
-        the provider may have accepted that request, so returning its budget
-        could allow a second allocation to overspend the primary account.
-        """
-        if amount < 1:
-            return None
-        async with self._lock:
-            keys = self._read()
-            for index, key in enumerate(keys):
-                if key.id != key_id or key.issued_tokens < amount:
-                    return None
-                updated = replace(key, issued_tokens=key.issued_tokens - amount)
                 keys[index] = updated
                 self._write(keys)
                 return updated
@@ -538,9 +522,8 @@ class ResellerOperation:
 class ResellerOperationStore:
     """Append-only-ish persistent ledger of allocation attempts.
 
-    The state transitions ``pending -> confirmed/rejected/unknown`` are
-    persisted before an HTTP response is returned. A request that ends in an
-    unknown state intentionally retains its budget reservation.
+    Entries are written after a confirmed upstream allocation or a failed
+    attempt. Failed network requests do not change the reseller's balance.
     """
 
     def __init__(self, path: Path) -> None:
@@ -1494,12 +1477,7 @@ def create_tokens_routes(
         return operation_stores[owner_index - 1]
 
     async def upstream_call_with_backoff(call, *, retry_server_errors: bool = False):
-        """Retry definitive transient throttling/failures, never timeouts.
-
-        A timeout can mean the provider committed a create/top-up but lost its
-        response. Callers record that as ``unknown`` and retain the reserved
-        reseller budget rather than risk a duplicate primary-key allocation.
-        """
+        """Retry only idempotent upstream state changes after transient errors."""
         for attempt, delay in enumerate((0.4, 1.0), start=1):
             try:
                 return await call()
@@ -2033,19 +2011,14 @@ def create_tokens_routes(
     ) -> HTMLResponse:
         csrf_token = secrets.token_urlsafe(32)
         children: list[TokenKey] = []
-        operations: list[ResellerOperation] = []
         if reseller is not None:
             owner_store = token_stores.for_owner(reseller.owner_index)
             if owner_store is not None:
                 children = [key for key in await owner_store.list() if key.reseller_id == reseller.key.id]
-            operation_store = operation_store_for_owner(reseller.owner_index)
-            if operation_store is not None:
-                operations = await operation_store.list_for_reseller(reseller.key.id)
         response = render_reseller_page(
             csrf_token=csrf_token,
             reseller=reseller.key if reseller is not None else None,
             children=children,
-            operations=operations,
             locale=reseller_locale(locale),
             error=error,
             notice=notice,
@@ -2110,38 +2083,53 @@ def create_tokens_routes(
         operation_store = operation_store_for_owner(reseller.owner_index)
         if owner_store is None or client is None or operation_store is None:
             return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "service_unavailable"), status_code=503)
-        # Reserve first under the reseller-store lock; do not automatically
-        # retry an ambiguous create after a network failure.
-        reserved = await reseller.store.reserve(reseller.key.id, token_limit)
-        if reserved is None:
-            return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "insufficient"), status_code=409)
-        operation = ResellerOperation(
-            id=secrets.token_urlsafe(18), created_at=utc_now(), reseller_id=reseller.key.id,
-            action="create", amount=token_limit, state="pending",
-        )
-        await operation_store.add(operation)
-        try:
-            api_key = await upstream_call_with_backoff(lambda: client.create_key(name=name, token_limit=token_limit))
-        except KeyServiceError as exc:
-            if 400 <= exc.status_code < 500 and exc.status_code != 429:
-                await reseller.store.release_rejected_reservation(reseller.key.id, token_limit)
-                await operation_store.update(operation.id, state="rejected", detail=exc.detail)
-                return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "service_unavailable"), status_code=502)
-            await operation_store.update(operation.id, state="unknown", detail=exc.detail)
-            return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "topup_unknown"), status_code=502)
-        except RuntimeError as exc:
-            await operation_store.update(operation.id, state="unknown", detail=str(exc))
-            return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "topup_unknown"), status_code=502)
-        all_codes = {stored.key.access_code for stored in await token_stores.list_all()} | {
-            stored.key.access_code for stored in await reseller_key_stores.list_all()
-        }
-        child = TokenKey(
-            id=max((key.id for key in await owner_store.list()), default=0) + 1,
-            created_at=utc_now(), access_code=generate_access_code(all_codes), api_key=api_key,
-            service=service, name=name, token_limit=token_limit, reseller_id=reseller.key.id,
-        )
-        await owner_store.add_many([child])
-        await operation_store.update(operation.id, state="confirmed", child_key_id=child.id)
+        # A local debit happens only after the upstream confirms a real key.
+        # This lock serializes create/top-up requests in this process, so two
+        # simultaneous requests cannot both spend the same displayed balance.
+        async with creation_lock:
+            current_reseller = await reseller.store.get(reseller.key.id)
+            if current_reseller is None or not current_reseller.active:
+                return await reseller_response(request, locale=locale, error=reseller_message(locale, "session_expired"), status_code=401)
+            if current_reseller.available_tokens < token_limit:
+                return await reseller_response(request, reseller=StoredResellerKey(reseller.owner_index, reseller.store, current_reseller), locale=locale, error=reseller_message(locale, "insufficient"), status_code=409)
+            try:
+                api_key = await client.create_key(name=name, token_limit=token_limit)
+            except KeyServiceError as exc:
+                logger.warning("Reseller create was rejected before local debit (owner=%s, reseller=%s, HTTP=%s): %s", reseller.owner_index, reseller.key.id, exc.status_code, exc.detail)
+                await operation_store.add(ResellerOperation(
+                    id=secrets.token_urlsafe(18), created_at=utc_now(), reseller_id=reseller.key.id,
+                    action="create", amount=token_limit, state="failed", detail=exc.detail,
+                ))
+                error_key = "service_unavailable" if 400 <= exc.status_code < 500 and exc.status_code != 429 else "network_error"
+                return await reseller_response(request, reseller=StoredResellerKey(reseller.owner_index, reseller.store, current_reseller), locale=locale, error=reseller_message(locale, error_key), status_code=502)
+            except RuntimeError as exc:
+                logger.warning("Reseller create failed before local debit (owner=%s, reseller=%s): %s", reseller.owner_index, reseller.key.id, exc)
+                await operation_store.add(ResellerOperation(
+                    id=secrets.token_urlsafe(18), created_at=utc_now(), reseller_id=reseller.key.id,
+                    action="create", amount=token_limit, state="failed", detail=str(exc),
+                ))
+                return await reseller_response(request, reseller=StoredResellerKey(reseller.owner_index, reseller.store, current_reseller), locale=locale, error=reseller_message(locale, "network_error"), status_code=502)
+            charged = await reseller.store.spend_confirmed(reseller.key.id, token_limit)
+            if charged is None:
+                logger.critical("Upstream created a reseller child but local debit failed (owner=%s, reseller=%s, amount=%s)", reseller.owner_index, reseller.key.id, token_limit)
+                await operation_store.add(ResellerOperation(
+                    id=secrets.token_urlsafe(18), created_at=utc_now(), reseller_id=reseller.key.id,
+                    action="create", amount=token_limit, state="failed", detail="upstream key created; local debit failed",
+                ))
+                return await reseller_response(request, reseller=StoredResellerKey(reseller.owner_index, reseller.store, current_reseller), locale=locale, error=reseller_message(locale, "service_unavailable"), status_code=503)
+            all_codes = {stored.key.access_code for stored in await token_stores.list_all()} | {
+                stored.key.access_code for stored in await reseller_key_stores.list_all()
+            }
+            child = TokenKey(
+                id=max((key.id for key in await owner_store.list()), default=0) + 1,
+                created_at=utc_now(), access_code=generate_access_code(all_codes), api_key=api_key,
+                service=service, name=name, token_limit=token_limit, reseller_id=reseller.key.id,
+            )
+            await owner_store.add_many([child])
+            await operation_store.add(ResellerOperation(
+                id=secrets.token_urlsafe(18), created_at=utc_now(), reseller_id=reseller.key.id,
+                action="create", amount=token_limit, state="confirmed", child_key_id=child.id,
+            ))
         current = await reseller_from_request(request)
         return await reseller_response(request, reseller=current, locale=locale, notice=reseller_message(locale, "created"))
 
@@ -2157,37 +2145,52 @@ def create_tokens_routes(
         owner_store = token_stores.for_owner(reseller.owner_index)
         client = owner_client(reseller.owner_index)
         operation_store = operation_store_for_owner(reseller.owner_index)
-        child = await owner_store.get(key_id) if owner_store is not None else None
-        if child is None or child.reseller_id != reseller.key.id:
-            return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "not_found"), status_code=404)
         if additional_tokens is None or additional_tokens < 1:
             return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "topup_invalid"), status_code=400)
-        if client is None or operation_store is None:
+        if owner_store is None or client is None or operation_store is None:
             return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "topup_unavailable"), status_code=503)
-        reserved = await reseller.store.reserve(reseller.key.id, additional_tokens)
-        if reserved is None:
-            return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "insufficient"), status_code=409)
-        operation = ResellerOperation(
-            id=secrets.token_urlsafe(18), created_at=utc_now(), reseller_id=reseller.key.id,
-            action="top_up", amount=additional_tokens, state="pending", child_key_id=child.id,
-        )
-        await operation_store.add(operation)
-        try:
-            await upstream_call_with_backoff(lambda: client.add_tokens(api_key=child.api_key, additional_tokens=additional_tokens, active=child.active))
-        except KeyServiceError as exc:
-            if 400 <= exc.status_code < 500 and exc.status_code != 429:
-                await reseller.store.release_rejected_reservation(reseller.key.id, additional_tokens)
-                await operation_store.update(operation.id, state="rejected", detail=exc.detail)
-                return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "topup_rejected"), status_code=502)
-            await operation_store.update(operation.id, state="unknown", detail=exc.detail)
-            return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "topup_unknown"), status_code=502)
-        except RuntimeError as exc:
-            await operation_store.update(operation.id, state="unknown", detail=str(exc))
-            return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "topup_unknown"), status_code=502)
-        updated = await owner_store.add_token_limit(child.id, additional_tokens)
-        if updated is None:
-            return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "not_found"), status_code=404)
-        await operation_store.update(operation.id, state="confirmed")
+        async with creation_lock:
+            current_reseller = await reseller.store.get(reseller.key.id)
+            child = await owner_store.get(key_id)
+            if child is None or child.reseller_id != reseller.key.id:
+                return await reseller_response(request, reseller=StoredResellerKey(reseller.owner_index, reseller.store, current_reseller) if current_reseller else reseller, locale=locale, error=reseller_message(locale, "not_found"), status_code=404)
+            if current_reseller is None or not current_reseller.active:
+                return await reseller_response(request, locale=locale, error=reseller_message(locale, "session_expired"), status_code=401)
+            if current_reseller.available_tokens < additional_tokens:
+                return await reseller_response(request, reseller=StoredResellerKey(reseller.owner_index, reseller.store, current_reseller), locale=locale, error=reseller_message(locale, "insufficient"), status_code=409)
+            try:
+                await client.add_tokens(api_key=child.api_key, additional_tokens=additional_tokens, active=child.active)
+            except KeyServiceError as exc:
+                logger.warning("Reseller top-up was rejected before local debit (owner=%s, reseller=%s, child=%s, HTTP=%s): %s", reseller.owner_index, reseller.key.id, child.id, exc.status_code, exc.detail)
+                await operation_store.add(ResellerOperation(
+                    id=secrets.token_urlsafe(18), created_at=utc_now(), reseller_id=reseller.key.id,
+                    action="top_up", amount=additional_tokens, state="failed", child_key_id=child.id, detail=exc.detail,
+                ))
+                error_key = "topup_rejected" if 400 <= exc.status_code < 500 and exc.status_code != 429 else "network_error"
+                return await reseller_response(request, reseller=StoredResellerKey(reseller.owner_index, reseller.store, current_reseller), locale=locale, error=reseller_message(locale, error_key), status_code=502)
+            except RuntimeError as exc:
+                logger.warning("Reseller top-up failed before local debit (owner=%s, reseller=%s, child=%s): %s", reseller.owner_index, reseller.key.id, child.id, exc)
+                await operation_store.add(ResellerOperation(
+                    id=secrets.token_urlsafe(18), created_at=utc_now(), reseller_id=reseller.key.id,
+                    action="top_up", amount=additional_tokens, state="failed", child_key_id=child.id, detail=str(exc),
+                ))
+                return await reseller_response(request, reseller=StoredResellerKey(reseller.owner_index, reseller.store, current_reseller), locale=locale, error=reseller_message(locale, "network_error"), status_code=502)
+            charged = await reseller.store.spend_confirmed(reseller.key.id, additional_tokens)
+            if charged is None:
+                logger.critical("Upstream topped up a reseller child but local debit failed (owner=%s, reseller=%s, child=%s, amount=%s)", reseller.owner_index, reseller.key.id, child.id, additional_tokens)
+                await operation_store.add(ResellerOperation(
+                    id=secrets.token_urlsafe(18), created_at=utc_now(), reseller_id=reseller.key.id,
+                    action="top_up", amount=additional_tokens, state="failed", child_key_id=child.id, detail="upstream top-up succeeded; local debit failed",
+                ))
+                return await reseller_response(request, reseller=StoredResellerKey(reseller.owner_index, reseller.store, current_reseller), locale=locale, error=reseller_message(locale, "topup_unavailable"), status_code=503)
+            updated = await owner_store.add_token_limit(child.id, additional_tokens)
+            if updated is None:
+                logger.critical("Upstream top-up and reseller debit succeeded but child update failed (owner=%s, reseller=%s, child=%s)", reseller.owner_index, reseller.key.id, child.id)
+                return await reseller_response(request, reseller=StoredResellerKey(reseller.owner_index, reseller.store, charged), locale=locale, error=reseller_message(locale, "not_found"), status_code=404)
+            await operation_store.add(ResellerOperation(
+                id=secrets.token_urlsafe(18), created_at=utc_now(), reseller_id=reseller.key.id,
+                action="top_up", amount=additional_tokens, state="confirmed", child_key_id=child.id,
+            ))
         current = await reseller_from_request(request)
         return await reseller_response(request, reseller=current, locale=locale, notice=reseller_message(locale, "topup_success"))
 
@@ -3387,7 +3390,7 @@ def render_admin_reseller_rows(
 
 def render_reseller_page(
     *, csrf_token: str, reseller: ResellerKey | None, children: list[TokenKey],
-    operations: list[ResellerOperation], error: str = "", notice: str = "", submitted_code: str = "",
+    error: str = "", notice: str = "", submitted_code: str = "",
     locale: str = "en",
 ) -> HTMLResponse:
     locale = reseller_locale(locale)
@@ -3452,8 +3455,6 @@ def render_reseller_page(
             <form method='post' action='/ai/tokens/reselling/{child.id}/freeze' class='reseller-freeze-form'><input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><input type='hidden' name='lang' value='{locale}'><button class='{freeze_class}' type='submit'>{html.escape(freeze_label)}</button></form>
           </td>
         </tr>""")
-    unknown_operations = [operation for operation in operations if operation.state == "unknown"]
-    pending_notice = "" if not unknown_operations else f"<p class='warning'>{html.escape(text['pending'].format(count=len(unknown_operations)))}</p>"
     total_tokens = format_tokens(reseller.token_limit)
     issued_tokens = format_tokens(reseller.issued_tokens)
     available_tokens = format_tokens(reseller.available_tokens)
@@ -3462,7 +3463,7 @@ def render_reseller_page(
       <section class='reseller-hero card'>
         <div class='reseller-header'>{language_switch}<form method='post' action='/ai/tokens/reselling/logout'><input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><input type='hidden' name='lang' value='{locale}'><button class='secondary' type='submit'>{html.escape(text['logout'])}</button></form></div>
         <div class='reseller-eyebrow'>{html.escape(text['eyebrow'])}</div><h1>{html.escape(text['title'])}</h1><p class='reseller-intro'>{html.escape(text['dashboard_intro'])}</p>
-        {flash}{pending_notice}
+        {flash}
         <div class='reseller-access-row'><div><div class='reseller-label'>{html.escape(text['portal_key'])}</div><code class='reseller-access-code'>{html.escape(reseller.access_code)}</code><div class='hint'>{html.escape(text['portal_key_hint'])}</div></div></div>
       </section>
       <section class='card reseller-balance-card'><div class='section-heading'><div><div class='reseller-eyebrow'>{html.escape(text['balance'])}</div><h2>{html.escape(text['balance'])}</h2></div><span class='reseller-child-count'>{len(children)} {html.escape(text['children_count'])}</span></div>

@@ -58,6 +58,7 @@ class HiddenInputParser(HTMLParser):
 class FakeKeyClient:
     def __init__(self) -> None:
         self.calls: list[tuple[str, int]] = []
+        self.create_error: Exception | None = None
         self.add_token_calls: list[tuple[str, int]] = []
         self.set_active_calls: list[tuple[str, bool]] = []
         self.add_tokens_error: Exception | None = None
@@ -71,6 +72,8 @@ class FakeKeyClient:
         self.exported_log_content: bytes = b'{"entries":[]}'
 
     async def create_key(self, *, name: str, token_limit: int) -> str:
+        if self.create_error is not None:
+            raise self.create_error
         self.calls.append((name, token_limit))
         return "sk-test-" + str(len(self.calls))
 
@@ -860,6 +863,92 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.key_client.calls, [("All services", 600)])
         self.assertEqual(len(children), 1)
         self.assertEqual(children[0].service, "Все")
+
+    async def test_reseller_network_error_does_not_debit_balance_and_can_be_retried(self) -> None:
+        reseller_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.reseller_store.add_many([
+            ResellerKey(1, utc_now(), reseller_code, "Reseller", 1_000)
+        ])
+        self.key_client.create_error = RuntimeError("connection lost")
+        login_page = await self.client.get("/ai/tokens/reselling")
+        parser = HiddenInputParser()
+        parser.feed(login_page.text)
+        login = await self.client.post(
+            "/ai/tokens/reselling/login",
+            data={"csrf_token": parser.values["csrf_token"], "access_code": reseller_code},
+            headers={"Cookie": f"tokens_reseller_csrf={parser.values['csrf_token']}"},
+            follow_redirects=False,
+        )
+        session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        page = await self.client.get("/ai/tokens/reselling", headers={"Cookie": session_cookie})
+        parser = HiddenInputParser()
+        parser.feed(page.text)
+        response = await self.client.post(
+            "/ai/tokens/reselling/create",
+            data={
+                "csrf_token": parser.values["csrf_token"], "service": "Grok", "name": "Retry",
+                "token_limit": "1 000",
+            },
+            headers={"Cookie": f"tokens_reseller_csrf={parser.values['csrf_token']}; {session_cookie}"},
+        )
+
+        reseller = await self.reseller_store.get(1)
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(reseller.available_tokens if reseller else None, 1_000)
+        self.assertIn("A network error occurred while contacting the service", response.text)
+        self.assertIn("<span>Available to issue</span><strong>1 000</strong>", response.text)
+        self.assertNotIn("The reseller has insufficient available token balance", response.text)
+        parser = HiddenInputParser()
+        parser.feed(response.text)
+        self.key_client.create_error = None
+        retried = await self.client.post(
+            "/ai/tokens/reselling/create",
+            data={
+                "csrf_token": parser.values["csrf_token"], "service": "Grok", "name": "Retry",
+                "token_limit": "1 000",
+            },
+            headers={"Cookie": f"tokens_reseller_csrf={parser.values['csrf_token']}; {session_cookie}"},
+        )
+        reseller = await self.reseller_store.get(1)
+        self.assertEqual(retried.status_code, 200)
+        self.assertEqual(reseller.available_tokens if reseller else None, 0)
+        self.assertEqual(self.key_client.calls, [("Retry", 1_000)])
+
+    async def test_reseller_top_up_network_error_does_not_debit_balance(self) -> None:
+        reseller_code = "ABCDEFGHIJKLMNOPQRST"
+        await self.reseller_store.add_many([
+            ResellerKey(1, utc_now(), reseller_code, "Reseller", 1_000)
+        ])
+        await self.store.add_many([
+            TokenKey(1, utc_now(), "QRSTUVWXYZABCDEFGHIJ", "sk-child", "Grok", "Child", 100, reseller_id=1)
+        ])
+        self.key_client.add_tokens_error = RuntimeError("connection lost")
+        login_page = await self.client.get("/ai/tokens/reselling")
+        parser = HiddenInputParser()
+        parser.feed(login_page.text)
+        login = await self.client.post(
+            "/ai/tokens/reselling/login",
+            data={"csrf_token": parser.values["csrf_token"], "access_code": reseller_code},
+            headers={"Cookie": f"tokens_reseller_csrf={parser.values['csrf_token']}"},
+            follow_redirects=False,
+        )
+        session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        page = await self.client.get("/ai/tokens/reselling", headers={"Cookie": session_cookie})
+        parser = HiddenInputParser()
+        parser.feed(page.text)
+        response = await self.client.post(
+            "/ai/tokens/reselling/1/top-up",
+            data={"csrf_token": parser.values["csrf_token"], "additional_tokens": "600"},
+            headers={"Cookie": f"tokens_reseller_csrf={parser.values['csrf_token']}; {session_cookie}"},
+        )
+
+        reseller = await self.reseller_store.get(1)
+        child = await self.store.get(1)
+        self.assertEqual(response.status_code, 502)
+        self.assertEqual(reseller.available_tokens if reseller else None, 1_000)
+        self.assertEqual(child.token_limit if child else None, 100)
+        self.assertEqual(self.key_client.add_token_calls, [])
+        self.assertIn("A network error occurred while contacting the service", response.text)
 
     async def test_reseller_top_up_cannot_exceed_budget_and_never_returns_it(self) -> None:
         await self.reseller_store.add_many([
