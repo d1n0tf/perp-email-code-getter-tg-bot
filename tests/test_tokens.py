@@ -835,6 +835,72 @@ class TokensRoutesTestCase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(child.token_limit if child else None, 1_000)
         self.assertEqual(reseller.issued_tokens if reseller else None, 1_000)
 
+    async def test_reseller_regenerates_only_a_child_access_key(self) -> None:
+        reseller_code = "ABCDEFGHIJKLMNOPQRST"
+        child_code = "QRSTUVWXYZABCDEFGHIJ"
+        await self.reseller_store.add_many([
+            ResellerKey(1, utc_now(), reseller_code, "Reseller", 1_000)
+        ])
+        await self.store.add_many([
+            TokenKey(1, utc_now(), child_code, "sk-child-unchanged", "Grok", "Child", 100, reseller_id=1)
+        ])
+        login_page = await self.client.get("/ai/tokens/reselling")
+        parser = HiddenInputParser()
+        parser.feed(login_page.text)
+        login = await self.client.post(
+            "/ai/tokens/reselling/login",
+            data={"csrf_token": parser.values["csrf_token"], "access_code": reseller_code},
+            headers={"Cookie": f"tokens_reseller_csrf={parser.values['csrf_token']}"},
+            follow_redirects=False,
+        )
+        session_cookie = login.headers["set-cookie"].split(";", 1)[0]
+        page = await self.client.get("/ai/tokens/reselling", headers={"Cookie": session_cookie})
+        parser = HiddenInputParser()
+        parser.feed(page.text)
+        regenerated = await self.client.post(
+            "/ai/tokens/reselling/1/regenerate",
+            data={"csrf_token": parser.values["csrf_token"]},
+            headers={"Cookie": f"tokens_reseller_csrf={parser.values['csrf_token']}; {session_cookie}"},
+        )
+
+        child = await self.store.get(1)
+        self.assertEqual(regenerated.status_code, 200)
+        self.assertEqual(child.api_key if child else None, "sk-child-unchanged")
+        self.assertNotEqual(child.access_code if child else child_code, child_code)
+        self.assertIsNone(await self.store.get_by_code(child_code))
+        self.assertEqual(self.key_client.set_active_calls, [])
+        self.assertIn("/ai/tokens/reselling/1/regenerate", regenerated.text)
+        self.assertNotIn("action='/ai/tokens/reselling/regenerate'", regenerated.text)
+
+    async def test_reseller_child_status_matches_real_state_and_activation(self) -> None:
+        reseller_code = "ABCDEFGHIJKLMNOPQRST"
+        activated_at = utc_now()
+        await self.reseller_store.add_many([
+            ResellerKey(1, utc_now(), reseller_code, "Reseller", 1_000)
+        ])
+        await self.store.add_many([
+            TokenKey(1, utc_now(), "QRSTUVWXYZABCDEFGHIJ", "sk-child-a", "Grok", "Not activated", 100, reseller_id=1),
+            TokenKey(2, utc_now(), "QRSTUVWXYZABCDEFGHIH", "sk-child-b", "Grok", "Activated", 100, activated_at=activated_at, reseller_id=1),
+            TokenKey(3, utc_now(), "QRSTUVWXYZABCDEFGHII", "sk-child-c", "Grok", "Exhausted", 100, used_tokens=100, activated_at=activated_at, exhausted_at=activated_at, reseller_id=1),
+            TokenKey(4, utc_now(), "QRSTUVWXYZABCDEFGHIJ", "sk-child-d", "Grok", "Frozen", 100, activated_at=activated_at, active=False, reseller_id=1),
+        ])
+        login_page = await self.client.get("/ai/tokens/reselling")
+        parser = HiddenInputParser()
+        parser.feed(login_page.text)
+        login = await self.client.post(
+            "/ai/tokens/reselling/login",
+            data={"csrf_token": parser.values["csrf_token"], "access_code": reseller_code},
+            headers={"Cookie": f"tokens_reseller_csrf={parser.values['csrf_token']}"},
+            follow_redirects=False,
+        )
+        page = await self.client.get("/ai/tokens/reselling", headers={"Cookie": login.headers["set-cookie"].split(";", 1)[0]})
+
+        self.assertEqual(page.status_code, 200)
+        self.assertIn("Not activated", page.text)
+        self.assertIn("Activated (", page.text)
+        self.assertIn("Exhausted (", page.text)
+        self.assertIn("Frozen", page.text)
+
     async def test_admin_freezes_reseller_and_all_children(self) -> None:
         await self.reseller_store.add_many([
             ResellerKey(1, utc_now(), "ABCDEFGHIJKLMNOPQRST", "Reseller", 1_000, issued_tokens=100)

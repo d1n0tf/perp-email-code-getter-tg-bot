@@ -90,8 +90,6 @@ RESELLER_TEXT = {
         "login": "Войти", "logout": "Выйти", "language": "Язык", "russian": "Русский", "english": "English",
         "dashboard_intro": "Создавайте и управляйте клиентскими API-ключами в рамках баланса токенов.",
         "portal_key": "Ключ доступа к сайту", "portal_key_hint": "Этот ключ используется только для входа в кабинет, это не API-ключ.",
-        "regenerate": "Перегенерировать", "regenerate_confirm": "Перегенерировать ключ доступа? Все старые сессии будут завершены.",
-        "regenerate_notice": "Ключ доступа перегенерирован. Все старые сессии завершены.",
         "balance": "Баланс токенов", "total": "Общий баланс токенов", "spent": "Израсходовано токенов",
         "available": "Доступно для выдачи", "children_count": "Клиентских ключей", "balance_hint": "Выданные лимиты списываются из баланса и не возвращаются после создания или пополнения ключа.",
         "create_title": "Создать клиентский API-ключ", "create_hint": "Выберите сервис и лимит токенов для нового клиентского ключа.",
@@ -99,6 +97,8 @@ RESELLER_TEXT = {
         "children_title": "Клиентские API-ключи", "children_hint": "Доступны создание, пополнение и заморозка. Уменьшение лимита и удаление не отображаются, пока upstream не поддерживает эти операции безопасно.",
         "id": "ID", "api_key": "API key", "access": "Ключ доступа", "limit": "Лимит токенов", "used": "Израсходовано", "remaining": "Остаток", "status": "Статус", "actions": "Действия",
         "active": "Активен", "frozen": "Заморожен", "freeze": "Заморозить", "unfreeze": "Разморозить", "top_up_placeholder": "Токенов", "top_up": "Пополнить",
+        "activated_at": "Активирован ({date})", "not_activated": "Не активирован", "exhausted": "Истрачен ({date})",
+        "regenerate_child": "Перегенерировать", "regenerate_child_confirm": "Перегенерировать ключ доступа этого клиента? Старый ключ сразу перестанет работать.", "regenerate_child_notice": "Ключ доступа производного ключа перегенерирован.",
         "empty": "Клиентских ключей пока нет.", "pending": "Есть неподтверждённые операции: {count}. Зарезервированный лимит сохранён, чтобы исключить двойное списание.",
         "session_expired": "Сессия реселлера завершена.", "invalid_key": "Реселлерский ключ не существует или заморожен.", "not_found": "Производный ключ не найден.",
         "ordinary_service": "Выберите обычный доступный сервис.", "name_limit": "Введите название и положительное количество токенов.", "service_unavailable": "Сервис создания ключей временно недоступен.",
@@ -114,8 +114,6 @@ RESELLER_TEXT = {
         "login": "Sign in", "logout": "Sign out", "language": "Language", "russian": "Русский", "english": "English",
         "dashboard_intro": "Create and manage customer API keys within your token balance.",
         "portal_key": "Website access key", "portal_key_hint": "This key is only used to sign in to the dashboard. It is not an API key.",
-        "regenerate": "Regenerate", "regenerate_confirm": "Regenerate the access key? All old sessions will be signed out.",
-        "regenerate_notice": "The access key was regenerated. All old sessions were signed out.",
         "balance": "Token balance", "total": "Total token balance", "spent": "Tokens allocated",
         "available": "Available to issue", "children_count": "Customer keys", "balance_hint": "Issued limits are deducted from the balance and are not returned after a key is created or topped up.",
         "create_title": "Create customer API key", "create_hint": "Choose a service and token limit for the new customer key.",
@@ -123,6 +121,8 @@ RESELLER_TEXT = {
         "children_title": "Customer API keys", "children_hint": "Creation, top-ups and freezing are available. Limit reduction and deletion are not shown until the upstream supports these operations safely.",
         "id": "ID", "api_key": "API key", "access": "Access key", "limit": "Token limit", "used": "Allocated", "remaining": "Remaining", "status": "Status", "actions": "Actions",
         "active": "Active", "frozen": "Frozen", "freeze": "Freeze", "unfreeze": "Unfreeze", "top_up_placeholder": "Tokens", "top_up": "Top up",
+        "activated_at": "Activated ({date})", "not_activated": "Not activated", "exhausted": "Exhausted ({date})",
+        "regenerate_child": "Regenerate", "regenerate_child_confirm": "Regenerate this customer's access key? The old key will stop working immediately.", "regenerate_child_notice": "The customer access key was regenerated.",
         "empty": "No customer keys yet.", "pending": "There are {count} unconfirmed operations. The reserved limit is retained to prevent double charging.",
         "session_expired": "The reseller session has expired.", "invalid_key": "The reseller key does not exist or is frozen.", "not_found": "Customer key not found.",
         "ordinary_service": "Choose a supported regular service.", "name_limit": "Enter a name and a positive token amount.", "service_unavailable": "Key creation is temporarily unavailable.",
@@ -659,6 +659,48 @@ class TokenKeyStore:
                     self._write(keys)
                     return True
         return False
+
+    async def set_access_code(self, key_id: int, access_code: str) -> TokenKey | None:
+        """Atomically rotate one local website access code without replacing other fields."""
+        normalized = normalize_access_code(access_code)
+        async with self._lock:
+            keys = self._read()
+            for index, key in enumerate(keys):
+                if key.id != key_id:
+                    continue
+                updated = replace(key, access_code=normalized)
+                keys[index] = updated
+                self._write(keys)
+                return updated
+        return None
+
+    async def add_token_limit(self, key_id: int, additional_tokens: int) -> TokenKey | None:
+        """Atomically add an upstream-confirmed allocation to the local limit."""
+        if additional_tokens < 1:
+            return None
+        async with self._lock:
+            keys = self._read()
+            for index, key in enumerate(keys):
+                if key.id != key_id:
+                    continue
+                updated = replace(key, token_limit=key.token_limit + additional_tokens)
+                keys[index] = updated
+                self._write(keys)
+                return updated
+        return None
+
+    async def set_active(self, key_id: int, active: bool) -> TokenKey | None:
+        """Atomically mirror an already-confirmed upstream active state."""
+        async with self._lock:
+            keys = self._read()
+            for index, key in enumerate(keys):
+                if key.id != key_id:
+                    continue
+                updated = replace(key, active=active)
+                keys[index] = updated
+                self._write(keys)
+                return updated
+        return None
 
     async def delete(self, key_id: int) -> bool:
         async with self._lock:
@@ -1738,8 +1780,9 @@ def create_tokens_routes(
         except (RuntimeError, ValueError):
             await promo_codes.restore_unclaimed(promo.code, access_code, found.owner_index)
             return user_response(locale=locale, key=found.key, error=TOKEN_TEXT[locale]["promo_error"], status_code=502)
-        updated_key = replace(found.key, token_limit=found.key.token_limit + promo.additional_tokens)
-        await found.store.update(found.key.id, updated_key)
+        updated_key = await found.store.add_token_limit(found.key.id, promo.additional_tokens)
+        if updated_key is None:
+            return user_response(locale=locale, key=found.key, error=TOKEN_TEXT[locale]["promo_error"], status_code=404)
         return user_response(
             locale=locale,
             key=updated_key,
@@ -1768,8 +1811,9 @@ def create_tokens_routes(
         except (RuntimeError, ValueError) as exc:
             log_key_state_failure(owner_index=found.owner_index, key_id=found.key.id, error=exc)
             return user_response(locale=locale, key=found.key, error=TOKEN_TEXT[locale]["freeze_error"], status_code=502)
-        updated_key = replace(found.key, active=target_active)
-        await found.store.update(found.key.id, updated_key)
+        updated_key = await found.store.set_active(found.key.id, target_active)
+        if updated_key is None:
+            return user_response(locale=locale, key=found.key, error=TOKEN_TEXT[locale]["freeze_error"], status_code=404)
         return user_response(
             locale=locale,
             key=updated_key,
@@ -2037,37 +2081,6 @@ def create_tokens_routes(
         response.delete_cookie(TOKENS_RESELLER_COOKIE, path="/ai/tokens/reselling")
         return response
 
-    async def reseller_regenerate_access(request: Request) -> HTMLResponse:
-        form = await read_form(request)
-        locale = reseller_locale(form.get("lang"))
-        reseller = await reseller_from_request(request)
-        if reseller is None:
-            return await reseller_response(request, locale=locale, error=reseller_message(locale, "session_expired"), status_code=401)
-        if not valid_csrf(request, form, TOKENS_RESELLER_CSRF_COOKIE):
-            return RedirectResponse(url=f"/ai/tokens/reselling?lang={locale}", status_code=303)
-
-        async with creation_lock:
-            current = await reseller.store.get(reseller.key.id)
-            if current is None or not current.active:
-                return await reseller_response(request, locale=locale, error=reseller_message(locale, "invalid_key"), status_code=401)
-            existing_codes = {stored.key.access_code for stored in await token_stores.list_all()}
-            existing_codes.update(stored.key.access_code for stored in await reseller_key_stores.list_all())
-            new_code = generate_access_code(existing_codes)
-            updated = replace(current, access_code=new_code)
-            await reseller.store.update(current.id, updated)
-
-        invalidate_reseller_sessions(reseller.owner_index, reseller.key.id)
-        session = issue_reseller_session(reseller.owner_index, reseller.key.id)
-        response = await reseller_response(
-            request,
-            reseller=StoredResellerKey(owner_index=reseller.owner_index, store=reseller.store, key=updated),
-            locale=locale,
-            notice=reseller_message(locale, "regenerate_notice"),
-        )
-        response.headers["Cache-Control"] = "no-store"
-        set_reseller_session_cookie(response, session)
-        return response
-
     async def reseller_create_child(request: Request) -> HTMLResponse:
         form = await read_form(request)
         locale = reseller_locale(form.get("lang"))
@@ -2162,8 +2175,9 @@ def create_tokens_routes(
         except RuntimeError as exc:
             await operation_store.update(operation.id, state="unknown", detail=str(exc))
             return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "topup_unknown"), status_code=502)
-        updated = replace(child, token_limit=child.token_limit + additional_tokens)
-        await owner_store.update(child.id, updated)
+        updated = await owner_store.add_token_limit(child.id, additional_tokens)
+        if updated is None:
+            return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "not_found"), status_code=404)
         await operation_store.update(operation.id, state="confirmed")
         current = await reseller_from_request(request)
         return await reseller_response(request, reseller=current, locale=locale, notice=reseller_message(locale, "topup_success"))
@@ -2192,11 +2206,44 @@ def create_tokens_routes(
         except RuntimeError as exc:
             log_key_state_failure(owner_index=reseller.owner_index, key_id=child.id, error=exc)
             return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "state_error"), status_code=502)
-        await owner_store.update(child.id, replace(child, active=target_active))
+        if await owner_store.set_active(child.id, target_active) is None:
+            return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "not_found"), status_code=404)
         current = await reseller_from_request(request)
         return await reseller_response(
             request, reseller=current, locale=locale,
             notice=reseller_message(locale, "unfrozen_notice" if target_active else "frozen_notice"),
+        )
+
+    async def reseller_regenerate_child_access(request: Request, key_id: int) -> HTMLResponse:
+        """Replace only a child's local website access key.
+
+        The upstream API key deliberately remains untouched.  The old access
+        key stops authorizing the public token page immediately because lookup
+        is performed against the current local store value on every request.
+        """
+        form = await read_form(request)
+        locale = reseller_locale(form.get("lang"))
+        reseller = await reseller_from_request(request)
+        if reseller is None:
+            return await reseller_response(request, locale=locale, error=reseller_message(locale, "session_expired"), status_code=401)
+        if not valid_csrf(request, form, TOKENS_RESELLER_CSRF_COOKIE):
+            return RedirectResponse(url=f"/ai/tokens/reselling?lang={locale}", status_code=303)
+        owner_store = token_stores.for_owner(reseller.owner_index)
+        child = await owner_store.get(key_id) if owner_store is not None else None
+        if child is None or child.reseller_id != reseller.key.id:
+            return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "not_found"), status_code=404)
+        async with creation_lock:
+            # The set is global because public activation searches every owner
+            # store and reseller codes share the same user-facing namespace.
+            existing_codes = {stored.key.access_code for stored in await token_stores.list_all()}
+            existing_codes.update(stored.key.access_code for stored in await reseller_key_stores.list_all())
+            updated = await owner_store.set_access_code(child.id, generate_access_code(existing_codes)) if owner_store else None
+            if updated is None:
+                return await reseller_response(request, reseller=reseller, locale=locale, error=reseller_message(locale, "not_found"), status_code=404)
+        current = await reseller_from_request(request)
+        return await reseller_response(
+            request, reseller=current, locale=locale,
+            notice=reseller_message(locale, "regenerate_child_notice"),
         )
 
     async def admin_update(request: Request, key_id: int) -> HTMLResponse:
@@ -2255,7 +2302,8 @@ def create_tokens_routes(
                     error=f"Каскадная смена статуса остановлена на производном ключе #{child.id}. Повторите операцию.",
                     status_code=502,
                 )
-            await owner_store.update(child.id, replace(child, active=target_active))
+            if await owner_store.set_active(child.id, target_active) is None:
+                return await admin_response(request, error=f"Производный ключ #{child.id} не найден.", status_code=404)
         await reseller_store.update(reseller.id, replace(reseller, active=target_active))
         return await admin_response(
             request,
@@ -2309,7 +2357,8 @@ def create_tokens_routes(
                 error=f"Не удалось {'разморозить' if target_active else 'заморозить'} ключ #{key_id}.",
                 status_code=502,
             )
-        await owner_store.update(key_id, replace(current, active=target_active))
+        if await owner_store.set_active(key_id, target_active) is None:
+            return await admin_response(request, error="Ключ не найден.", status_code=404)
         return await admin_response(
             request,
             notice=f"Ключ #{key_id} {'разморожен' if target_active else 'заморожен'}.",
@@ -2333,10 +2382,10 @@ def create_tokens_routes(
     app.add_api_route("/ai/tokens/reselling", reseller_page, methods=["GET"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/reselling/login", reseller_login, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/reselling/logout", reseller_logout, methods=["POST"], response_class=HTMLResponse, response_model=None)
-    app.add_api_route("/ai/tokens/reselling/regenerate", reseller_regenerate_access, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/reselling/create", reseller_create_child, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/reselling/{key_id}/top-up", reseller_top_up_child, methods=["POST"], response_class=HTMLResponse, response_model=None)
     app.add_api_route("/ai/tokens/reselling/{key_id}/freeze", reseller_toggle_child, methods=["POST"], response_class=HTMLResponse, response_model=None)
+    app.add_api_route("/ai/tokens/reselling/{key_id}/regenerate", reseller_regenerate_child_access, methods=["POST"], response_class=HTMLResponse, response_model=None)
 
 
 def positive_int(value: str) -> int | None:
@@ -3345,7 +3394,21 @@ def render_reseller_page(
     )
     child_rows: list[str] = []
     for child in children:
-        status = text["active"] if child.active else text["frozen"]
+        # Keep the meaning and ordering in sync with the main admin table:
+        # a frozen key must not masquerade as active, an exhausted active key
+        # remains exhausted, and activation is explicit for every other key.
+        if not child.active:
+            status = text["frozen"]
+        elif child.is_exhausted:
+            status = text["exhausted"].format(date=format_datetime(child.exhausted_at or child.activated_at))
+        elif child.activated_at is not None:
+            status = text["activated_at"].format(date=format_datetime(child.activated_at))
+        else:
+            status = text["not_activated"]
+        status_class = "status-frozen" if not child.active else ("status-exhausted" if child.is_exhausted else "status-active")
+        activation_detail = ""
+        if not child.active or child.is_exhausted:
+            activation_detail = text["activated_at"].format(date=format_datetime(child.activated_at)) if child.activated_at else text["not_activated"]
         freeze_label = text["freeze"] if child.active else text["unfreeze"]
         freeze_class = "freeze-key" if child.active else "freeze-key frozen"
         api_key = html.escape(child.api_key, quote=True)
@@ -3354,12 +3417,13 @@ def render_reseller_page(
           <td>{child.id}</td><td>{html.escape(child.service)}</td><td>{html.escape(child.name)}</td>
           <td><code class='reseller-key-cell' title='{html.escape(child.access_code, quote=True)}'>{html.escape(child.access_code)}</code></td>
           <td class='copyable-api-key' data-copy-api-key='{api_key}' role='button' tabindex='0' title='{html.escape(text["copy_hint"], quote=True)}' aria-label='{html.escape(text["copy_hint"], quote=True)}'><code class='reseller-key-cell' title='{api_key}'>{api_key}</code></td>
-          <td>{format_tokens(child.token_limit)}</td><td>{format_tokens(child.used_tokens)}</td><td>{format_tokens(child.remaining_tokens)}</td><td><span class='reseller-status {'status-active' if child.active else 'status-frozen'}'>{status}</span></td>
+          <td>{format_tokens(child.token_limit)}</td><td>{format_tokens(child.used_tokens)}</td><td>{format_tokens(child.remaining_tokens)}</td><td><span class='reseller-status {status_class}'>{html.escape(status)}</span>{f"<div class='reseller-activation-detail'>{html.escape(activation_detail)}</div>" if activation_detail else ""}</td>
           <td class='reseller-child-actions'>
             <form method='post' action='/ai/tokens/reselling/{child.id}/top-up' class='reseller-top-up-form'>
               <input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><input type='hidden' name='lang' value='{locale}'>
               <input name='additional_tokens' type='number' min='1' step='1' required aria-label='{html.escape(text["top_up"], quote=True)}' placeholder='{html.escape(text["top_up_placeholder"], quote=True)}'><button class='secondary reseller-top-up-button' type='submit' title='{html.escape(text["top_up"], quote=True)}' aria-label='{html.escape(text["top_up"], quote=True)}'>+</button>
             </form>
+            <form method='post' action='/ai/tokens/reselling/{child.id}/regenerate' class='reseller-regenerate-child-form' onsubmit="return confirm('{html.escape(text['regenerate_child_confirm'], quote=True)}')"><input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><input type='hidden' name='lang' value='{locale}'><button class='secondary' type='submit'>{html.escape(text['regenerate_child'])}</button></form>
             <form method='post' action='/ai/tokens/reselling/{child.id}/freeze' class='reseller-freeze-form'><input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><input type='hidden' name='lang' value='{locale}'><button class='{freeze_class}' type='submit'>{html.escape(freeze_label)}</button></form>
           </td>
         </tr>""")
@@ -3374,9 +3438,7 @@ def render_reseller_page(
         <div class='reseller-header'>{language_switch}<form method='post' action='/ai/tokens/reselling/logout'><input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><input type='hidden' name='lang' value='{locale}'><button class='secondary' type='submit'>{html.escape(text['logout'])}</button></form></div>
         <div class='reseller-eyebrow'>{html.escape(text['eyebrow'])}</div><h1>{html.escape(text['title'])}</h1><p class='reseller-intro'>{html.escape(text['dashboard_intro'])}</p>
         {flash}{pending_notice}
-        <div class='reseller-access-row'><div><div class='reseller-label'>{html.escape(text['portal_key'])}</div><code class='reseller-access-code'>{html.escape(reseller.access_code)}</code><div class='hint'>{html.escape(text['portal_key_hint'])}</div></div>
-          <form method='post' action='/ai/tokens/reselling/regenerate' class='reseller-regenerate-form' onsubmit="return confirm('{html.escape(text['regenerate_confirm'], quote=True)}')"><input type='hidden' name='csrf_token' value='{html.escape(csrf_token, quote=True)}'><input type='hidden' name='lang' value='{locale}'><button class='secondary' type='submit'>{html.escape(text['regenerate'])}</button></form>
-        </div>
+        <div class='reseller-access-row'><div><div class='reseller-label'>{html.escape(text['portal_key'])}</div><code class='reseller-access-code'>{html.escape(reseller.access_code)}</code><div class='hint'>{html.escape(text['portal_key_hint'])}</div></div></div>
       </section>
       <section class='card reseller-balance-card'><div class='section-heading'><div><div class='reseller-eyebrow'>{html.escape(text['balance'])}</div><h2>{html.escape(text['balance'])}</h2></div><span class='reseller-child-count'>{len(children)} {html.escape(text['children_count'])}</span></div>
         <div class='reseller-balance-grid'><div class='balance-metric'><span>{html.escape(text['total'])}</span><strong>{total_tokens}</strong></div><div class='balance-metric'><span>{html.escape(text['spent'])}</span><strong>{issued_tokens}</strong></div><div class='balance-metric balance-available'><span>{html.escape(text['available'])}</span><strong>{available_tokens}</strong></div></div>
@@ -3407,7 +3469,7 @@ button {{ border:0; border-radius:9px; padding:11px 15px; font:700 14px Arial,sa
 .instruction-mode-tabs {{ display:flex; gap:6px; margin:16px 0 10px; border-bottom:1px solid var(--line); }} .instruction-mode {{ color:var(--muted); background:transparent; border-radius:8px 8px 0 0; padding:9px 12px; }} .instruction-mode.active {{ color:var(--text); background:#1b2940; box-shadow:inset 0 -2px 0 var(--accent); }} .instruction-mode-panel {{ padding:2px 0 4px; }} .manual-heading {{ color:var(--text); font-weight:700; }} .manual-downloads {{ display:flex; flex-wrap:wrap; gap:8px; margin:10px 0 14px; }} .download-file {{ color:var(--text); background:#1b2940; border:1px solid var(--line); border-radius:8px; padding:8px 11px; font-size:14px; font-weight:700; text-decoration:none; }} .download-file:hover,.download-file:focus {{ border-color:var(--accent); color:var(--accent); }} .manual-note {{ margin:8px 0 14px; color:var(--muted); line-height:1.55; }} .remove-integration {{ margin-top:14px; overflow:hidden; border:1px solid var(--line); border-radius:10px; background:#0b1321; }} .remove-integration summary,.faq-item summary {{ cursor:pointer; padding:12px 14px; font-weight:700; }} .remove-integration pre {{ margin:0 12px 12px; }} .remove-integration {{ border-color:rgba(255,120,133,.42); background:rgba(255,120,133,.07); }} .remove-integration summary {{ color:#ffdce0; }} .remove-integration .hint,.remove-integration button {{ margin-left:12px; margin-right:12px; }} .remove-integration button {{ margin-bottom:12px; }}
 .faq {{ scroll-margin-top:24px; }} .faq-items {{ border-top:1px solid var(--line); }} .faq-item {{ display:block; border-bottom:1px solid var(--line); }} .faq-item summary {{ list-style:none; padding-right:38px; position:relative; }} .faq-item summary::-webkit-details-marker {{ display:none; }} .faq-item summary::after {{ content:'+'; position:absolute; right:14px; color:var(--accent); font-size:20px; line-height:1; }} .faq-item[open] summary::after {{ content:'−'; }} .faq-item p {{ color:var(--muted); padding:0 14px 14px; margin:0; }}
 .title-row {{ display:flex; justify-content:space-between; gap:16px; align-items:start; }} .title-row form {{ margin:0; }} .create-form,.edit-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); column-gap:18px; }} .create-form .wide {{ grid-column:1 / -1; }}
- .table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form,.inline-freeze-form,.reseller-child-table form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .freeze-key {{ margin:0; color:#e3f3ff; background:#375d80; }} .freeze-key:hover,.freeze-key:focus {{ background:#48789f; }} .freeze-key.frozen {{ color:#05233c; background:linear-gradient(135deg,#d9f6ff,#83d5f4); box-shadow:0 0 0 1px rgba(174,235,255,.55),0 0 16px rgba(106,210,247,.35); }} .freeze-key.frozen:hover,.freeze-key.frozen:focus {{ background:linear-gradient(135deg,#e9faff,#a9e5fa); }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} .promos-table {{ min-width:640px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} .sort-link,.service-group-header {{ color:inherit; font:inherit; font-weight:700; text-align:left; text-decoration:none; }} .sort-link:hover,.sort-link:focus,.service-group-header:hover,.service-group-header:focus,th[data-group-service].grouped {{ color:var(--accent); }} th[data-group-service] {{ cursor:pointer; user-select:none; }} .service-group-header {{ padding:0; background:transparent; border-radius:0; }} .keys-search-form {{ margin:14px 0 18px; }} .keys-search-form label {{ margin-top:0; }} .keys-search-controls {{ display:flex; gap:9px; align-items:end; }} .keys-search-controls input {{ margin-top:0; min-width:0; flex:1 1 auto; }} .keys-search-controls .secondary,.reset-search {{ white-space:nowrap; }} .reset-search {{ display:inline-flex; align-items:center; justify-content:center; min-height:46px; text-decoration:none; }} .admin-page.is-updating {{ opacity:.64; pointer-events:none; transition:opacity .12s ease; }} .pagination {{ display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; margin-top:18px; }} .pagination-summary {{ margin:0; color:var(--muted); }} .pagination-links {{ display:flex; flex-wrap:wrap; gap:6px; align-items:center; }} .page-link {{ display:inline-flex; align-items:center; justify-content:center; min-width:38px; min-height:36px; padding:7px 10px; border-radius:8px; color:var(--text); background:#263652; font-weight:700; text-decoration:none; }} .page-link:hover,.page-link:focus {{ color:#08101e; background:var(--accent); }} .page-link.current {{ color:#08101e; background:var(--accent); cursor:default; }} .page-link.disabled {{ color:var(--muted); opacity:.55; cursor:not-allowed; }} .page-ellipsis {{ padding:0 3px; color:var(--muted); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .created-key-actions {{ display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; }} .reseller-card {{ margin:12px 0; padding:14px; border:1px solid var(--line); border-radius:10px; background:#0b1321; }} .reseller-summary {{ display:grid; gap:10px; }} .reseller-values {{ display:flex; flex-wrap:wrap; gap:8px 16px; color:var(--muted); }} .reseller-children {{ margin-top:12px; }} .reseller-child-actions {{ white-space:nowrap; min-width:260px; }} .reseller-top-up-form {{ display:inline-flex; align-items:center; vertical-align:middle; gap:5px; }} .reseller-top-up-form input {{ width:115px; min-width:0; margin:0; padding:8px 9px; }} .reseller-top-up-button {{ min-width:34px; padding:8px 11px; font-size:18px; line-height:1; }} .reseller-freeze-form {{ display:inline-block; vertical-align:middle; margin-left:6px !important; }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .service-group-toggle {{ color:var(--text); background:transparent; padding:0; font-size:16px; }} .service-group-toggle:hover,.service-group-toggle:focus {{ color:var(--accent); }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-row>td {{ padding:0 8px 14px; border-bottom:1px solid var(--line); }} .edit-form {{ margin:0; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }} .reseller-page {{ width:min(1500px,calc(100% - 32px)); margin-top:26px; }} .reseller-login-page {{ max-width:560px; }} .reseller-login-card {{ position:relative; overflow:hidden; }} .reseller-language-switch {{ display:flex; justify-content:flex-end; align-items:center; gap:6px; margin-bottom:18px; color:var(--muted); font-size:14px; }} .reseller-language-switch a {{ color:var(--muted); text-decoration:none; padding:5px 8px; border-radius:7px; }} .reseller-language-switch a:hover,.reseller-language-switch a.active {{ color:#08101e; background:var(--accent); }} .reseller-eyebrow {{ color:var(--accent); font-size:12px; font-weight:800; letter-spacing:.14em; text-transform:uppercase; }} .reseller-intro {{ color:var(--muted); max-width:720px; }} .reseller-header {{ display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:20px; }} .reseller-header .reseller-language-switch {{ margin:0; }} .reseller-access-row {{ display:flex; justify-content:space-between; align-items:center; gap:20px; margin-top:22px; padding:16px; border:1px solid var(--line); border-radius:12px; background:rgba(8,19,33,.72); }} .reseller-label {{ color:var(--muted); font-size:13px; margin-bottom:5px; }} .reseller-access-code {{ color:#b9d4ff; font-size:18px; letter-spacing:.07em; word-break:break-all; }} .reseller-regenerate-form {{ flex:0 0 auto; margin:0; }} .reseller-balance-card {{ border-color:rgba(109,156,255,.38); background:linear-gradient(145deg,rgba(24,43,77,.94),rgba(17,26,42,.98)); }} .section-heading {{ display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }} .reseller-child-count {{ padding:6px 10px; border-radius:999px; color:#b9d4ff; background:rgba(109,156,255,.12); white-space:nowrap; font-size:13px; }} .reseller-balance-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin:20px 0 14px; }} .balance-metric {{ display:flex; flex-direction:column; gap:5px; min-width:0; padding:15px; border:1px solid var(--line); border-radius:11px; background:rgba(8,19,33,.66); }} .balance-metric span {{ color:var(--muted); font-size:13px; }} .balance-metric strong {{ color:var(--text); font-size:24px; line-height:1.15; }} .balance-available {{ border-color:rgba(95,213,160,.45); }} .balance-available strong {{ color:var(--success); }} .reseller-table-wrap {{ border:1px solid var(--line); border-radius:11px; }} .reseller-child-table {{ min-width:1240px; }} .reseller-child-table th,.reseller-child-table td {{ white-space:nowrap; }} .reseller-child-row:hover {{ background:rgba(109,156,255,.05); }} .reseller-key-cell {{ display:block; max-width:245px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }} .reseller-status {{ display:inline-flex; align-items:center; padding:4px 8px; border-radius:999px; font-size:13px; }} .status-active {{ color:#b9f6d6; background:rgba(95,213,160,.14); }} .status-frozen {{ color:#c9eeff; background:rgba(131,213,244,.16); }} .reseller-child-actions {{ display:flex; align-items:center; gap:8px; min-width:270px; }} .reseller-freeze-form {{ margin-left:0 !important; }} .reseller-top-up-form {{ flex:0 0 auto; }} .reseller-top-up-form input {{ width:90px; }} 
+.table-wrap {{ overflow-x:auto; }} .management-actions {{ display:flex; gap:6px; align-items:center; }} .inline-delete-form,.inline-freeze-form,.reseller-child-table form {{ margin:0; }} .inline-delete-form .danger {{ margin:0; padding:9px 11px; }} .freeze-key {{ margin:0; color:#e3f3ff; background:#375d80; }} .freeze-key:hover,.freeze-key:focus {{ background:#48789f; }} .freeze-key.frozen {{ color:#05233c; background:linear-gradient(135deg,#d9f6ff,#83d5f4); box-shadow:0 0 0 1px rgba(174,235,255,.55),0 0 16px rgba(106,210,247,.35); }} .freeze-key.frozen:hover,.freeze-key.frozen:focus {{ background:linear-gradient(135deg,#e9faff,#a9e5fa); }} .copyable-api-key {{ cursor:pointer; }} .copyable-api-key:hover,.copyable-api-key:focus {{ background:rgba(109,156,255,.13); outline:none; }} table {{ width:100%; border-collapse:collapse; min-width:990px; }} .promos-table {{ min-width:640px; }} th,td {{ padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }} .sort-link,.service-group-header {{ color:inherit; font:inherit; font-weight:700; text-align:left; text-decoration:none; }} .sort-link:hover,.sort-link:focus,.service-group-header:hover,.service-group-header:focus,th[data-group-service].grouped {{ color:var(--accent); }} th[data-group-service] {{ cursor:pointer; user-select:none; }} .service-group-header {{ padding:0; background:transparent; border-radius:0; }} .keys-search-form {{ margin:14px 0 18px; }} .keys-search-form label {{ margin-top:0; }} .keys-search-controls {{ display:flex; gap:9px; align-items:end; }} .keys-search-controls input {{ margin-top:0; min-width:0; flex:1 1 auto; }} .keys-search-controls .secondary,.reset-search {{ white-space:nowrap; }} .reset-search {{ display:inline-flex; align-items:center; justify-content:center; min-height:46px; text-decoration:none; }} .admin-page.is-updating {{ opacity:.64; pointer-events:none; transition:opacity .12s ease; }} .pagination {{ display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; margin-top:18px; }} .pagination-summary {{ margin:0; color:var(--muted); }} .pagination-links {{ display:flex; flex-wrap:wrap; gap:6px; align-items:center; }} .page-link {{ display:inline-flex; align-items:center; justify-content:center; min-width:38px; min-height:36px; padding:7px 10px; border-radius:8px; color:var(--text); background:#263652; font-weight:700; text-decoration:none; }} .page-link:hover,.page-link:focus {{ color:#08101e; background:var(--accent); }} .page-link.current {{ color:#08101e; background:var(--accent); cursor:default; }} .page-link.disabled {{ color:var(--muted); opacity:.55; cursor:not-allowed; }} .page-ellipsis {{ padding:0 3px; color:var(--muted); }} .created-keys {{ display:flex; justify-content:space-between; align-items:center; gap:12px; padding:12px 13px; margin:12px 0; border:1px solid rgba(95,213,160,.45); border-radius:9px; background:rgba(95,213,160,.12); }} .created-key-actions {{ display:flex; flex-wrap:wrap; justify-content:flex-end; gap:8px; }} .reseller-card {{ margin:12px 0; padding:14px; border:1px solid var(--line); border-radius:10px; background:#0b1321; }} .reseller-summary {{ display:grid; gap:10px; }} .reseller-values {{ display:flex; flex-wrap:wrap; gap:8px 16px; color:var(--muted); }} .reseller-children {{ margin-top:12px; }} .reseller-child-actions {{ white-space:nowrap; min-width:360px; }} .reseller-top-up-form {{ display:inline-flex; align-items:center; vertical-align:middle; gap:5px; }} .reseller-top-up-form input {{ width:115px; min-width:0; margin:0; padding:8px 9px; }} .reseller-top-up-button {{ min-width:34px; padding:8px 11px; font-size:18px; line-height:1; }} .reseller-freeze-form,.reseller-regenerate-child-form {{ display:inline-block; vertical-align:middle; margin-left:0 !important; }} .service-group {{ margin:18px 0 28px; }} .service-group h3 {{ margin-bottom:8px; }} .service-group-toggle {{ color:var(--text); background:transparent; padding:0; font-size:16px; }} .service-group-toggle:hover,.service-group-toggle:focus {{ color:var(--accent); }} .api-preview {{ display:block; max-width:180px; overflow:hidden; text-overflow:ellipsis; }} .empty {{ text-align:center; color:var(--muted); }} .edit-row>td {{ padding:0 8px 14px; border-bottom:1px solid var(--line); }} .edit-form {{ margin:0; padding:18px; border:1px solid var(--line); border-radius:12px; background:#0b1321; }} .edit-actions {{ display:flex; gap:8px; margin-top:16px; }} .delete-form {{ margin-top:4px; }} .reseller-page {{ width:min(1500px,calc(100% - 32px)); margin-top:26px; }} .reseller-login-page {{ max-width:560px; }} .reseller-login-card {{ position:relative; overflow:hidden; }} .reseller-language-switch {{ display:flex; justify-content:flex-end; align-items:center; gap:6px; margin-bottom:18px; color:var(--muted); font-size:14px; }} .reseller-language-switch a {{ color:var(--muted); text-decoration:none; padding:5px 8px; border-radius:7px; }} .reseller-language-switch a:hover,.reseller-language-switch a.active {{ color:#08101e; background:var(--accent); }} .reseller-eyebrow {{ color:var(--accent); font-size:12px; font-weight:800; letter-spacing:.14em; text-transform:uppercase; }} .reseller-intro {{ color:var(--muted); max-width:720px; }} .reseller-header {{ display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:20px; }} .reseller-header .reseller-language-switch {{ margin:0; }} .reseller-access-row {{ display:flex; justify-content:space-between; align-items:center; gap:20px; margin-top:22px; padding:16px; border:1px solid var(--line); border-radius:12px; background:rgba(8,19,33,.72); }} .reseller-label {{ color:var(--muted); font-size:13px; margin-bottom:5px; }} .reseller-access-code {{ color:#b9d4ff; font-size:18px; letter-spacing:.07em; word-break:break-all; }} .reseller-balance-card {{ border-color:rgba(109,156,255,.38); background:linear-gradient(145deg,rgba(24,43,77,.94),rgba(17,26,42,.98)); }} .section-heading {{ display:flex; justify-content:space-between; align-items:flex-start; gap:16px; }} .reseller-child-count {{ padding:6px 10px; border-radius:999px; color:#b9d4ff; background:rgba(109,156,255,.12); white-space:nowrap; font-size:13px; }} .reseller-balance-grid {{ display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; margin:20px 0 14px; }} .balance-metric {{ display:flex; flex-direction:column; gap:5px; min-width:0; padding:15px; border:1px solid var(--line); border-radius:11px; background:rgba(8,19,33,.66); }} .balance-metric span {{ color:var(--muted); font-size:13px; }} .balance-metric strong {{ color:var(--text); font-size:24px; line-height:1.15; }} .balance-available {{ border-color:rgba(95,213,160,.45); }} .balance-available strong {{ color:var(--success); }} .reseller-table-wrap {{ border:1px solid var(--line); border-radius:11px; }} .reseller-child-table {{ min-width:1240px; }} .reseller-child-table th,.reseller-child-table td {{ white-space:nowrap; }} .reseller-child-row:hover {{ background:rgba(109,156,255,.05); }} .reseller-key-cell {{ display:block; max-width:245px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }} .reseller-status {{ display:inline-flex; align-items:center; padding:4px 8px; border-radius:999px; font-size:13px; }} .status-active {{ color:#b9f6d6; background:rgba(95,213,160,.14); }} .status-frozen {{ color:#c9eeff; background:rgba(131,213,244,.16); }} .status-exhausted {{ color:#ffe0a3; background:rgba(245,158,11,.16); }} .reseller-child-actions {{ display:flex; align-items:center; gap:8px; min-width:360px; }} .reseller-freeze-form {{ margin-left:0 !important; }} .reseller-top-up-form {{ flex:0 0 auto; }} .reseller-top-up-form input {{ width:90px; }}
 @media(max-width:650px) {{ .page,.admin-page {{ width:min(100% - 20px,960px); margin-top:12px; }} .card {{ padding:18px; border-radius:12px; }} h1 {{ font-size:24px; }} .details,.create-form,.edit-grid,.info-actions {{ grid-template-columns:1fr; }} .title-row {{ display:block; }} .title-row form {{ margin-top:12px; }} .keys-search-controls {{ flex-wrap:wrap; }} .keys-search-controls input {{ flex-basis:100%; }} .pagination {{ align-items:start; flex-direction:column; }} }}
 </style></head><body>{content}<script data-tokens-admin-refresh>
 (function() {{
