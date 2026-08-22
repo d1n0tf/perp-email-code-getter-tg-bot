@@ -599,6 +599,13 @@ def create_web_app(service: BotService) -> FastAPI:
             samesite="lax",
             max_age=60 * 60 * 24 * 365,
         )
+        # This response is a live mailbox snapshot.  Browser-side
+        # ``fetch(..., {cache: 'no-store'})`` is not enough when a reverse
+        # proxy has a generic cache policy, so make the response uncacheable
+        # for every intermediary as well.
+        response.headers["Cache-Control"] = "no-store, private, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["X-Accel-Expires"] = "0"
         return response
 
     async def request_code(request: Request):
@@ -1491,7 +1498,7 @@ def render_page(
           copyValue(value).then(function() {{ markCopied(button); }});
         }});
       }});
-      var historyUrl={json.dumps(history_path)}, tableBody=document.getElementById('login-code-rows'), lastMessage=document.getElementById('last-login-message'), accountStatus=document.getElementById('account-status');
+      var historyUrl={json.dumps(history_path)}, tableBody=document.getElementById('login-code-rows'), lastMessage=document.getElementById('last-login-message'), accountStatus=document.getElementById('account-status'), historyRefreshInFlight=false;
       function addCell(row,text,className) {{ var cell=document.createElement('td'); cell.textContent=text; if(className) cell.className=className; row.appendChild(cell); }}
       function renderHistory(entries) {{
         if(!tableBody) return;
@@ -1501,9 +1508,11 @@ def render_page(
         lastMessage.textContent=entries[0].received_at;
       }}
       async function refreshHistory() {{
-        if(!historyUrl||!tableBody) return;
+        if(!historyUrl||!tableBody||historyRefreshInFlight) return;
+        historyRefreshInFlight=true;
         try {{
-          var response=await fetch(historyUrl,{{cache:'no-store',credentials:'same-origin'}}), data=null;
+          var separator=historyUrl.indexOf('?')===-1?'?':'&';
+          var response=await fetch(historyUrl+separator+'_='+Date.now(),{{cache:'no-store',credentials:'same-origin'}}), data=null;
           try {{ data=await response.json(); }} catch(_) {{ /* A proxy may return a non-JSON response. */ }}
           if(data&&data.status==='active') {{
             renderHistory(data.entries||[]);
@@ -1518,6 +1527,7 @@ def render_page(
             if(accountStatus) {{ accountStatus.textContent=data.account_status_label||{json.dumps(text['status_inactive'])}; accountStatus.className='account-inactive'; }}
           }}
         }} catch(_) {{ /* Keep the last safely rendered state on a transient network failure. */ }}
+        finally {{ historyRefreshInFlight=false; }}
       }}
       if(tableBody) {{ refreshHistory(); window.setInterval(refreshHistory,10000); }}
     }})();

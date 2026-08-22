@@ -1,6 +1,7 @@
 import asyncio
 import contextlib
 import json
+import logging
 import secrets
 import string
 import traceback
@@ -34,6 +35,9 @@ from src.storage import (
     normalize_email,
     normalize_key_code,
 )
+
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -70,6 +74,13 @@ class BotService:
             max_workers=settings.concurrent_mail_workers,
             thread_name_prefix="mail-worker",
         )
+        # History imports must not sit behind long-running Telegram/legacy
+        # code waits.  They still share the fetcher's global IMAP limiter, so
+        # this adds capacity without bypassing provider throttling.
+        self.history_executor = ThreadPoolExecutor(
+            max_workers=max(1, min(4, settings.concurrent_mail_workers)),
+            thread_name_prefix="mail-history-worker",
+        )
         self._tasks: set[asyncio.Task[None]] = set()
         self._web_requests_lock = asyncio.Lock()
         self._web_requests: dict[str, WebCodeRequest] = {}
@@ -83,6 +94,7 @@ class BotService:
         self._active_subscription_code_tasks: dict[str, asyncio.Task[None]] = {}
         self._login_code_scan_locks: dict[str, asyncio.Lock] = {}
         self._login_code_last_scan_at: dict[str, float] = {}
+        self._login_code_scan_tasks: dict[str, asyncio.Task[None]] = {}
         self._login_code_scan_interval_seconds = 10.0
 
     def is_admin(self, user_id: int) -> bool:
@@ -492,11 +504,12 @@ class BotService:
         if subscription.account is None:
             return "email_missing", subscription.key, []
 
-        # Mailbox failures are temporary and must not hide codes already
-        # imported into the local history from an authorized key holder.
+        # Scanning used to run synchronously here.  Under the global IMAP
+        # limiter an HTTP response could wait behind legacy ten-minute code
+        # requests and never reach the browser.  Schedule exactly one
+        # background import for the mailbox and return the current snapshot.
         if scan:
-            with contextlib.suppress(Exception):
-                await self._scan_login_code_history(subscription.account)
+            self._schedule_login_code_history_scan(subscription.account)
         entries = await self.storage.list_login_code_history(
             self._login_code_history_key(subscription.key)
         )
@@ -577,8 +590,12 @@ class BotService:
             loop = asyncio.get_running_loop()
             try:
                 found_codes = await loop.run_in_executor(
-                    self.executor,
-                    lambda: self.fetcher.scan_recent_codes(account, limit=20),
+                    self.history_executor,
+                    lambda: self.fetcher.scan_recent_codes(
+                        account,
+                        limit=20,
+                        priority=True,
+                    ),
                 )
             except Exception:
                 # Do not turn a transient mailbox issue into a permanent
@@ -603,14 +620,47 @@ class BotService:
             # in every current key bucket for that mailbox.  Holders of the
             # same key share one bucket; a replacement key starts empty.
             keys = await self.storage.list_subscription_keys()
+            imported_count = 0
             for key in keys:
                 if key.email_address != email_address:
                     continue
-                await self.storage.add_login_code_history_entries(
+                added = await self.storage.add_login_code_history_entries(
                     self._login_code_history_key(key),
                     history_entries,
                     limit_per_key=100,
                 )
+                imported_count += len(added)
+            if imported_count:
+                LOGGER.info(
+                    "Imported %s Perplexity login code(s) for mailbox %s",
+                    imported_count,
+                    email_address,
+                )
+
+    def _schedule_login_code_history_scan(self, account: EmailAccount) -> None:
+        """Start one non-blocking recent-code import for an active mailbox."""
+        email_address = account.login_email
+        running_task = self._login_code_scan_tasks.get(email_address)
+        if running_task is not None and not running_task.done():
+            return
+
+        last_scan_at = self._login_code_last_scan_at.get(email_address)
+        if (
+            last_scan_at is not None
+            and monotonic() - last_scan_at < self._login_code_scan_interval_seconds
+        ):
+            return
+
+        task = asyncio.create_task(self._scan_login_code_history(account))
+        self._login_code_scan_tasks[email_address] = task
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+        task.add_done_callback(
+            lambda done_task, mailbox=email_address: self._drop_login_code_scan_task(
+                mailbox,
+                done_task,
+            )
+        )
 
     async def begin_refresh_prompt(self, user_id: int) -> None:
         async with self._refresh_lock:
@@ -895,6 +945,7 @@ class BotService:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self.executor.shutdown(wait=False, cancel_futures=True)
+        self.history_executor.shutdown(wait=False, cancel_futures=True)
 
     @staticmethod
     def format_date(date_value: datetime) -> str:
@@ -1159,6 +1210,24 @@ class BotService:
         current_task = self._active_subscription_code_tasks.get(requester_id)
         if current_task is task:
             self._active_subscription_code_tasks.pop(requester_id, None)
+
+    def _drop_login_code_scan_task(
+        self,
+        email_address: str,
+        task: asyncio.Task[None],
+    ) -> None:
+        current_task = self._login_code_scan_tasks.get(email_address)
+        if current_task is task:
+            self._login_code_scan_tasks.pop(email_address, None)
+        if task.cancelled():
+            return
+        try:
+            task.result()
+        except Exception:
+            LOGGER.exception(
+                "Perplexity login-code history scan crashed for mailbox %s",
+                email_address,
+            )
 
     def _register_web_request_task(
         self,

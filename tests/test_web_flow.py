@@ -224,6 +224,7 @@ class WebFlowTests(BaseWebFlowTestCase):
 
     async def test_login_code_history_is_shared_by_active_key_holders(self) -> None:
         await self.activate_key(locale="en")
+        self.service.fetcher.scan_recent_codes = lambda *args, **kwargs: []  # type: ignore[method-assign]
         history_key = self.service._login_code_history_key(self.key)
         await self.storage.add_login_code_history_entries(
             history_key,
@@ -255,6 +256,8 @@ class WebFlowTests(BaseWebFlowTestCase):
         self.assertEqual(payload["status"], "active")
         self.assertEqual([entry["code"] for entry in payload["entries"]], ["654321", "123456"])
         self.assertEqual(payload["entries"][0]["received_at"], "20.08.2026 \\ 16:00:13")
+        self.assertEqual(response.headers["cache-control"], "no-store, private, max-age=0")
+        self.assertEqual(response.headers["x-accel-expires"], "0")
 
     async def test_history_endpoint_imports_scanned_codes_without_duplicates(self) -> None:
         await self.activate_key(locale="en")
@@ -271,12 +274,48 @@ class WebFlowTests(BaseWebFlowTestCase):
 
         first = await self.client.get(self.route("/login-code-history"), params={"lang": "en"})
         self.assertEqual(first.status_code, 200)
-        self.assertEqual([entry["code"] for entry in first.json()["entries"]], ["654321"])
+        self.assertEqual(first.json()["entries"], [])
+
+        second = None
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            second = await self.client.get(
+                self.route("/login-code-history"),
+                params={"lang": "en"},
+            )
+            if [entry["code"] for entry in second.json()["entries"]] == ["654321"]:
+                break
+        assert second is not None
+        self.assertEqual([entry["code"] for entry in second.json()["entries"]], ["654321"])
 
         self.service._login_code_last_scan_at.clear()
-        second = await self.client.get(self.route("/login-code-history"), params={"lang": "en"})
-        self.assertEqual(second.status_code, 200)
-        self.assertEqual([entry["code"] for entry in second.json()["entries"]], ["654321"])
+        third = await self.client.get(self.route("/login-code-history"), params={"lang": "en"})
+        self.assertEqual(third.status_code, 200)
+        for _ in range(20):
+            await asyncio.sleep(0.01)
+            if not self.service._login_code_scan_tasks:
+                break
+        fourth = await self.client.get(self.route("/login-code-history"), params={"lang": "en"})
+        self.assertEqual([entry["code"] for entry in fourth.json()["entries"]], ["654321"])
+
+    async def test_history_endpoint_returns_before_a_slow_mailbox_scan_finishes(self) -> None:
+        await self.activate_key(locale="en")
+
+        # A blocking fake is unnecessary for the HTTP assertion; make the
+        # scan slow enough that a synchronous endpoint would time out.
+        def blocking_scan(*args, **kwargs):
+            import time
+
+            time.sleep(0.2)
+            return []
+
+        self.service.fetcher.scan_recent_codes = blocking_scan  # type: ignore[method-assign]
+        started_at = asyncio.get_running_loop().time()
+        response = await self.client.get(self.route("/login-code-history"), params={"lang": "en"})
+        elapsed = asyncio.get_running_loop().time() - started_at
+
+        self.assertEqual(response.status_code, 200)
+        self.assertLess(elapsed, 0.1)
 
     async def test_replacing_key_starts_a_fresh_history_bucket(self) -> None:
         await self.activate_key(locale="en")

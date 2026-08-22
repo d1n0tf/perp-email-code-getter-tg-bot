@@ -1,5 +1,6 @@
 import email
 import hashlib
+import html
 import imaplib
 import json
 import logging
@@ -12,6 +13,7 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from email.header import decode_header, make_header
 from email.message import Message
 from email.utils import parseaddr, parsedate_to_datetime
 
@@ -19,25 +21,18 @@ from src.config import Settings
 from src.storage import EmailAccount
 
 
-CODE_REGEX = re.compile(r"\b\d{6}\b")
+CODE_REGEX = re.compile(r"(?<!\d)\d{6}(?!\d)")
+SPACED_CODE_REGEX = re.compile(
+    r"(?<!\d)(?:\d[\s\u00a0\u200b\u200c\u200d\ufeff]*){5}\d(?!\d)"
+)
 HTML_TAG_REGEX = re.compile(r"<[^>]+>")
 TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 LOGGER = logging.getLogger(__name__)
-IMAP_MONTH_NAMES = (
-    "Jan",
-    "Feb",
-    "Mar",
-    "Apr",
-    "May",
-    "Jun",
-    "Jul",
-    "Aug",
-    "Sep",
-    "Oct",
-    "Nov",
-    "Dec",
-)
-RECENT_SCAN_ALL_FALLBACK_UID_LIMIT = 100
+# Scanning is done every ten seconds while a page is open.  Fetch this many
+# newest messages per folder in one IMAP command, rather than re-reading an
+# entire 24-hour mailbox on every poll.
+RECENT_SCAN_UID_LIMIT = 50
+UID_IN_FETCH_RESPONSE_REGEX = re.compile(r"\bUID\s+(\d+)\b", re.IGNORECASE)
 
 
 class CodeWaitTimeout(RuntimeError):
@@ -87,17 +82,34 @@ class GlobalMailRequestLimiter:
         self._next_request_at = 0.0
         self._backoff_until = 0.0
         self._consecutive_failures = 0
+        self._priority_waiters = 0
 
-    def wait_for_slot(self) -> None:
+    def wait_for_slot(self, *, priority: bool = False) -> None:
         with self._condition:
-            while True:
-                now = time.monotonic()
-                allowed_at = max(self._next_request_at, self._backoff_until)
-                wait_seconds = allowed_at - now
-                if wait_seconds <= 0:
-                    self._next_request_at = now + self.min_interval_seconds
-                    return
-                self._condition.wait(timeout=wait_seconds)
+            if priority:
+                self._priority_waiters += 1
+                self._condition.notify_all()
+            try:
+                while True:
+                    # A live page must not remain behind a backlog of legacy
+                    # ten-minute code waiters.  One priority operation gets
+                    # the next available IMAP slot, then normal polling
+                    # resumes; this is priority, not a separate rate limit.
+                    if not priority and self._priority_waiters:
+                        self._condition.wait()
+                        continue
+
+                    now = time.monotonic()
+                    allowed_at = max(self._next_request_at, self._backoff_until)
+                    wait_seconds = allowed_at - now
+                    if wait_seconds <= 0:
+                        self._next_request_at = now + self.min_interval_seconds
+                        return
+                    self._condition.wait(timeout=wait_seconds)
+            finally:
+                if priority:
+                    self._priority_waiters -= 1
+                    self._condition.notify_all()
 
     def record_success(self) -> None:
         with self._condition:
@@ -126,41 +138,46 @@ class TokenManager:
         self.refresh_token = refresh_token
         self.access_token: str | None = None
         self.expire_time: datetime | None = None
+        self._lock = threading.Lock()
 
     def get_token(self) -> str | None:
-        now = datetime.now(timezone.utc)
-        if self.access_token and self.expire_time and now < self.expire_time:
+        # Several open pages may request the same mailbox concurrently.  One
+        # cached access token avoids a fresh OAuth exchange for every
+        # ten-second history poll, while the lock prevents duplicate refreshes.
+        with self._lock:
+            now = datetime.now(timezone.utc)
+            if self.access_token and self.expire_time and now < self.expire_time:
+                return self.access_token
+
+            payload = urllib.parse.urlencode(
+                {
+                    "client_id": self.client_id,
+                    "refresh_token": self.refresh_token,
+                    "grant_type": "refresh_token",
+                    "scope": "https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
+                }
+            ).encode()
+            request = urllib.request.Request(
+                TOKEN_URL,
+                data=payload,
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+
+            try:
+                with urllib.request.urlopen(request, timeout=30) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+            except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
+                return None
+
+            access_token = data.get("access_token")
+            if not access_token:
+                return None
+
+            expires_in = int(data.get("expires_in", 3600))
+            self.access_token = str(access_token)
+            self.expire_time = now + timedelta(seconds=max(expires_in - 60, 60))
             return self.access_token
-
-        payload = urllib.parse.urlencode(
-            {
-                "client_id": self.client_id,
-                "refresh_token": self.refresh_token,
-                "grant_type": "refresh_token",
-                "scope": "https://outlook.office.com/IMAP.AccessAsUser.All offline_access",
-            }
-        ).encode()
-        request = urllib.request.Request(
-            TOKEN_URL,
-            data=payload,
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
-            method="POST",
-        )
-
-        try:
-            with urllib.request.urlopen(request, timeout=30) as response:
-                data = json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError):
-            return None
-
-        access_token = data.get("access_token")
-        if not access_token:
-            return None
-
-        expires_in = int(data.get("expires_in", 3600))
-        self.access_token = str(access_token)
-        self.expire_time = now + timedelta(seconds=max(expires_in - 60, 60))
-        return self.access_token
 
 
 class EmailCodeFetcher:
@@ -173,6 +190,11 @@ class EmailCodeFetcher:
         self.poll_interval_min_seconds = settings.mail_poll_interval_min_seconds
         self.poll_interval_max_seconds = settings.mail_poll_interval_max_seconds
         self.reconnect_delay_seconds = settings.mail_reconnect_delay_seconds
+        self._token_managers: dict[tuple[str, str, str], TokenManager] = {}
+        self._token_managers_lock = threading.Lock()
+        self._request_priority = threading.local()
+        self._unparsed_message_keys: set[str] = set()
+        self._unparsed_message_keys_lock = threading.Lock()
         self.limiter = GlobalMailRequestLimiter(
             rate_limit_per_second=settings.mail_global_rate_limit_per_second,
             backoff_base_seconds=settings.mail_global_backoff_base_seconds,
@@ -182,7 +204,7 @@ class EmailCodeFetcher:
     def wait_for_code(self, account: EmailAccount) -> CodeResult:
         deadline = time.monotonic() + self.wait_timeout_seconds
         started_at = datetime.now(timezone.utc)
-        token_manager = TokenManager(account.client_id, account.refresh_token)
+        token_manager = self._token_manager_for(account)
         imap: imaplib.IMAP4_SSL | None = None
         baseline_uids: dict[str, str | None] | None = None
 
@@ -225,6 +247,7 @@ class EmailCodeFetcher:
         *,
         limit: int = 20,
         since: datetime | None = None,
+        priority: bool = False,
     ) -> list[RecentCodeRecord]:
         """Return up to ``limit`` recent Perplexity login codes, newest first.
 
@@ -240,6 +263,9 @@ class EmailCodeFetcher:
         if limit <= 0:
             return []
 
+        previous_priority = bool(getattr(self._request_priority, "enabled", False))
+        self._request_priority.enabled = priority
+
         now = datetime.now(timezone.utc)
         cutoff = since or now - timedelta(hours=24)
         if cutoff.tzinfo is None:
@@ -247,7 +273,7 @@ class EmailCodeFetcher:
         else:
             cutoff = cutoff.astimezone(timezone.utc)
 
-        token_manager = TokenManager(account.client_id, account.refresh_token)
+        token_manager = self._token_manager_for(account)
         imap: imaplib.IMAP4_SSL | None = None
         records: list[RecentCodeRecord] = []
         identities: set[str] = set()
@@ -301,6 +327,7 @@ class EmailCodeFetcher:
             return []
         finally:
             self._safe_logout(imap)
+            self._request_priority.enabled = previous_priority
 
         records.sort(
             key=lambda item: (item.timestamp, item.message_identity),
@@ -319,92 +346,44 @@ class EmailCodeFetcher:
         if status != "OK":
             return []
 
-        # IMAP SINCE works at day precision, so the precise UTC cutoff below
-        # remains necessary.  Search all matching UIDs instead of only the
-        # most recent UID: several login attempts may arrive between scans.
-        # IMAP requires English month names regardless of the host locale.
-        search_day = (
-            f"{cutoff.day:02d}-{IMAP_MONTH_NAMES[cutoff.month - 1]}-{cutoff.year:04d}"
-        )
-        # Do not rely on an IMAP ``FROM`` criterion here.  Outlook may index
-        # the display sender but not its RFC822 address, and Perplexity has
-        # changed its sender mailbox.  That made a successful search return
-        # only old messages, silently hiding a fresh code.  ``SINCE`` is a
-        # standard server-side filter; the trusted sender is checked locally
-        # from the actual message header below.
-        search_queries = self._recent_code_search_queries(search_day)
-        seen_uids: set[str] = set()
-        records: list[RecentCodeRecord] = []
-        for search_criteria in search_queries:
-            uids = self._search_recent_code_uids(imap, search_criteria)
-            if not uids:
-                continue
-
-            # ``ALL`` is only a recovery path for mailboxes whose Outlook
-            # implementation rejects or mis-indexes ``SINCE``.  Limit it to
-            # the newest UIDs to keep a ten-second page poll bounded.
-            if search_criteria == "ALL":
-                uids = uids[-RECENT_SCAN_ALL_FALLBACK_UID_LIMIT:]
-
-            records.extend(
-                self._records_from_uids(
-                    imap,
-                    folder=folder,
-                    cutoff=cutoff,
-                    uids=uids,
-                    seen_uids=seen_uids,
-                )
-            )
-            if records:
-                break
-        return records
-
-    def _recent_code_search_queries(self, search_day: str) -> list[str]:
-        """Return sender-independent searches for recent mailbox history."""
-        return [f"SINCE {search_day}", "ALL"]
-
-    def _search_recent_code_uids(
-        self,
-        imap: imaplib.IMAP4_SSL,
-        search_criteria: str,
-    ) -> list[str]:
-        """Execute one optional history search without cancelling fallbacks."""
-        try:
-            status, data = self._imap_uid(imap, "search", search_criteria)
-        except imaplib.IMAP4.error as exc:
-            # A BAD result for a particular SEARCH grammar is common on
-            # Outlook.  The next compatible query may still work.
-            LOGGER.debug("IMAP history search rejected (%s): %s", search_criteria, exc)
+        # Outlook has returned incomplete results for both ``FROM`` and
+        # ``SINCE`` searches in live mailboxes.  ``ALL`` is the only reliable
+        # index here; select a bounded newest tail and validate sender/date
+        # from the complete RFC822 message locally.
+        status, data = self._imap_uid(imap, "search", "ALL")
+        if status != "OK":
             return []
-        return self._extract_uids(data) if status == "OK" else []
+        uids = self._extract_uids(data)[-RECENT_SCAN_UID_LIMIT:]
+        if not uids:
+            return []
+        raw_messages = self._fetch_raw_messages_from_selected_folder(imap, uids)
+        if not raw_messages:
+            return []
+        return self._records_from_uids(
+            folder=folder,
+            cutoff=cutoff,
+            uids=uids,
+            raw_messages=raw_messages,
+        )
 
     def _records_from_uids(
         self,
-        imap: imaplib.IMAP4_SSL,
         *,
         folder: str,
         cutoff: datetime,
         uids: list[str],
-        seen_uids: set[str],
+        raw_messages: dict[str, bytes],
     ) -> list[RecentCodeRecord]:
         """Parse unseen UIDs from one selected folder, newest first."""
         records: list[RecentCodeRecord] = []
         for uid in reversed(uids):
-            if uid in seen_uids:
-                continue
-            seen_uids.add(uid)
             try:
-                raw_message = self._fetch_raw_message_from_selected_folder(imap, uid)
+                raw_message = raw_messages.get(uid)
                 if raw_message is None:
                     continue
 
                 message = email.message_from_bytes(raw_message)
-                timestamp = self._get_message_datetime(message)
-                if (
-                    timestamp is None
-                    or timestamp < cutoff
-                    or not self._is_expected_sender(message)
-                ):
+                if not self._is_expected_sender(message):
                     continue
 
                 # The history import accepts a code from any textual mail
@@ -412,6 +391,18 @@ class EmailCodeFetcher:
                 # because the existing wait path retains its parsing.
                 code = self._extract_recent_code(message)
                 if not code:
+                    self._log_unparsed_perplexity_message(message, folder=folder, uid=uid)
+                    continue
+
+                timestamp = self._get_message_datetime(message)
+                if timestamp is None or timestamp < cutoff:
+                    # The message's Date header is supplied by the sender and
+                    # can be malformed or delayed.  Outlook's Received
+                    # header reflects the actual mailbox delivery time.
+                    received_timestamp = self._get_received_datetime(message)
+                    if received_timestamp is not None:
+                        timestamp = received_timestamp
+                if timestamp is None or timestamp < cutoff:
                     continue
 
                 records.append(
@@ -487,31 +478,79 @@ class EmailCodeFetcher:
         )
 
     def _extract_recent_code(self, message: Message) -> str | None:
-        text_parts: list[str] = [str(message.get("Subject") or "")]
+        text_parts: list[str] = [self._decode_header_value(message.get("Subject"))]
 
         if message.is_multipart():
             for part in message.walk():
                 if part.get_content_disposition() == "attachment":
                     continue
-                if part.get_content_type() not in {"text/plain", "text/html"}:
+                content_type = part.get_content_type()
+                if not content_type.startswith("text/"):
                     continue
                 content = self._decode_part(part)
-                if part.get_content_type() == "text/html":
+                if content_type in {"text/html", "text/x-amp-html"}:
                     text_parts.append(HTML_TAG_REGEX.sub("", content))
                     content = HTML_TAG_REGEX.sub(" ", content)
                 text_parts.append(content)
         else:
             content = self._decode_part(message)
-            if message.get_content_type() == "text/html":
+            if message.get_content_type() in {"text/html", "text/x-amp-html"}:
                 text_parts.append(HTML_TAG_REGEX.sub("", content))
                 content = HTML_TAG_REGEX.sub(" ", content)
             text_parts.append(content)
 
         for content in text_parts:
-            match = CODE_REGEX.search(content)
-            if match:
-                return match.group(0)
+            code = self._find_login_code(content)
+            if code:
+                return code
         return None
+
+    @staticmethod
+    def _decode_header_value(value: object) -> str:
+        text = str(value or "")
+        try:
+            return str(make_header(decode_header(text)))
+        except (TypeError, ValueError):
+            return text
+
+    @staticmethod
+    def _find_login_code(content: str) -> str | None:
+        decoded = html.unescape(content)
+        direct_match = CODE_REGEX.search(decoded)
+        if direct_match:
+            return direct_match.group(0)
+
+        spaced_match = SPACED_CODE_REGEX.search(decoded)
+        if spaced_match:
+            code = "".join(character for character in spaced_match.group(0) if character.isdigit())
+            if len(code) == 6:
+                return code
+        return None
+
+    def _log_unparsed_perplexity_message(
+        self,
+        message: Message,
+        *,
+        folder: str,
+        uid: str,
+    ) -> None:
+        # This is actionable but deliberately excludes the mail body and any
+        # code.  It makes future provider-template changes visible instead of
+        # silently dropping every new message.
+        message_id = str(message.get("Message-ID") or f"{folder}:{uid}").strip()
+        with self._unparsed_message_keys_lock:
+            if message_id in self._unparsed_message_keys:
+                return
+            if len(self._unparsed_message_keys) >= 1_000:
+                self._unparsed_message_keys.clear()
+            self._unparsed_message_keys.add(message_id)
+        LOGGER.warning(
+            "Perplexity login mail has no readable six-digit code "
+            "(folder=%s, uid=%s, subject=%r)",
+            folder,
+            uid,
+            self._decode_header_value(message.get("Subject"))[:160],
+        )
 
     def _connect(
         self,
@@ -636,6 +675,56 @@ class EmailCodeFetcher:
                 return raw_message
         return None
 
+    def _fetch_raw_messages_from_selected_folder(
+        self,
+        imap: imaplib.IMAP4_SSL,
+        uids: list[str],
+    ) -> dict[str, bytes]:
+        """Fetch a mailbox tail in one IMAP command, keyed by stable UID."""
+        if not uids:
+            return {}
+
+        status, data = self._imap_uid(
+            imap,
+            "fetch",
+            ",".join(uids),
+            "(UID RFC822)",
+        )
+        if status != "OK" or not data:
+            return {}
+
+        found: dict[str, bytes] = {}
+        unresolved: list[bytes] = []
+        for item in data:
+            if not isinstance(item, tuple) or len(item) < 2:
+                continue
+            metadata, raw_message = item[0], item[1]
+            if not isinstance(raw_message, bytes):
+                continue
+            metadata_text = (
+                metadata.decode("utf-8", errors="ignore")
+                if isinstance(metadata, bytes)
+                else str(metadata)
+            )
+            uid_match = UID_IN_FETCH_RESPONSE_REGEX.search(metadata_text)
+            if uid_match:
+                found[uid_match.group(1)] = raw_message
+            else:
+                unresolved.append(raw_message)
+
+        # Standard UID FETCH responses include UID in their metadata.  The
+        # narrow fallback keeps compatibility with atypical servers and test
+        # doubles without letting a missing metadata item drop the whole scan.
+        if len(unresolved) == 1 and len(uids) == 1:
+            found[uids[0]] = unresolved[0]
+        elif unresolved:
+            for uid in uids:
+                if uid not in found:
+                    raw_message = self._fetch_raw_message_from_selected_folder(imap, uid)
+                    if raw_message is not None:
+                        found[uid] = raw_message
+        return found
+
     def _extract_code(self, message: Message) -> str | None:
         body_parts: list[str] = []
         html_parts: list[str] = []
@@ -692,6 +781,29 @@ class EmailCodeFetcher:
             return parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc)
 
+    @staticmethod
+    def _get_received_datetime(message: Message) -> datetime | None:
+        for raw_received in message.get_all("Received", []):
+            if not isinstance(raw_received, str) or ";" not in raw_received:
+                continue
+            try:
+                parsed = parsedate_to_datetime(raw_received.rsplit(";", 1)[-1].strip())
+            except (TypeError, ValueError, IndexError, OverflowError):
+                continue
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        return None
+
+    def _token_manager_for(self, account: EmailAccount) -> TokenManager:
+        key = (account.login_email, account.client_id, account.refresh_token)
+        with self._token_managers_lock:
+            manager = self._token_managers.get(key)
+            if manager is None:
+                manager = TokenManager(account.client_id, account.refresh_token)
+                self._token_managers[key] = manager
+            return manager
+
     def _safe_logout(self, imap: imaplib.IMAP4_SSL | None) -> None:
         if imap is None:
             return
@@ -722,7 +834,9 @@ class EmailCodeFetcher:
         )
 
     def _run_limited_imap_call(self, operation, *, command_name: str):
-        self.limiter.wait_for_slot()
+        self.limiter.wait_for_slot(
+            priority=bool(getattr(self._request_priority, "enabled", False))
+        )
         try:
             result = operation()
         except Exception as exc:
