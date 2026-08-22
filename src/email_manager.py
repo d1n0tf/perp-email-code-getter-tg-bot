@@ -325,37 +325,84 @@ class EmailCodeFetcher:
         search_day = (
             f"{cutoff.day:02d}-{IMAP_MONTH_NAMES[cutoff.month - 1]}-{cutoff.year:04d}"
         )
-        search_criteria = f'FROM "{self.search_from}" SINCE {search_day}'
-        status, data = self._imap_uid(imap, "search", search_criteria)
-        uids = self._extract_uids(data) if status == "OK" else []
+        # Perplexity has changed the local part of its sender address.  An
+        # exact ``team@mail.perplexity.ai`` search therefore misses current
+        # mails from e.g. ``no-reply@perplexity.ai``.  Search the trusted
+        # provider domain first, then retain progressively broader fallbacks
+        # for Outlook tenants with incomplete IMAP search indexes.  Crucially,
+        # fallbacks depend on *accepted records*, not merely on finding an old
+        # UID: an old mail from the former sender must not hide a fresh mail
+        # from the new sender.
+        search_queries = self._recent_code_search_queries(search_day)
+        seen_uids: set[str] = set()
+        records: list[RecentCodeRecord] = []
+        for search_criteria in search_queries:
+            uids = self._search_recent_code_uids(imap, search_criteria)
+            if not uids:
+                continue
 
-        # Keep the pre-history scanner's proven query as a fallback.  Some
-        # Outlook tenants reject or mis-index a compound FROM+SINCE search,
-        # even though a plain FROM search works correctly.
-        if not uids:
-            fallback_status, fallback_data = self._imap_uid(
-                imap,
-                "search",
-                f'FROM "{self.search_from}"',
+            records.extend(
+                self._records_from_uids(
+                    imap,
+                    folder=folder,
+                    cutoff=cutoff,
+                    uids=uids,
+                    seen_uids=seen_uids,
+                )
             )
-            if fallback_status == "OK":
-                uids.extend(self._extract_uids(fallback_data))
+            if records:
+                break
+        return records
 
-        # Some tenants index the displayed sender differently from the RFC822
-        # From header.  A final time-only search lets local sender validation
-        # accept provider aliases without making the normal path expensive.
-        if not uids:
-            fallback_status, fallback_data = self._imap_uid(
-                imap,
-                "search",
-                f"SINCE {search_day}",
-            )
-            if fallback_status == "OK":
-                uids.extend(self._extract_uids(fallback_data))
-        uids = list(dict.fromkeys(uids))
+    def _recent_code_search_queries(self, search_day: str) -> list[str]:
+        """Return compatible IMAP searches for current Perplexity senders."""
+        normalized_sender = self.search_from.strip().casefold()
+        sender_domain = normalized_sender.rsplit("@", 1)[-1]
+        is_perplexity_sender = sender_domain == "perplexity.ai" or sender_domain.endswith(
+            ".perplexity.ai"
+        )
 
+        # The provider domain query includes both the original and current
+        # Perplexity mailboxes.  It is intentionally first, so the presence
+        # of older exact-sender messages cannot prevent discovering aliases.
+        queries: list[str] = []
+        if is_perplexity_sender:
+            queries.append(f'FROM "perplexity.ai" SINCE {search_day}')
+        queries.append(f'FROM "{self.search_from}" SINCE {search_day}')
+        queries.append(f'FROM "{self.search_from}"')
+        queries.append(f"SINCE {search_day}")
+        return list(dict.fromkeys(queries))
+
+    def _search_recent_code_uids(
+        self,
+        imap: imaplib.IMAP4_SSL,
+        search_criteria: str,
+    ) -> list[str]:
+        """Execute one optional history search without cancelling fallbacks."""
+        try:
+            status, data = self._imap_uid(imap, "search", search_criteria)
+        except imaplib.IMAP4.error as exc:
+            # A BAD result for a particular SEARCH grammar is common on
+            # Outlook.  The next compatible query may still work.
+            LOGGER.debug("IMAP history search rejected (%s): %s", search_criteria, exc)
+            return []
+        return self._extract_uids(data) if status == "OK" else []
+
+    def _records_from_uids(
+        self,
+        imap: imaplib.IMAP4_SSL,
+        *,
+        folder: str,
+        cutoff: datetime,
+        uids: list[str],
+        seen_uids: set[str],
+    ) -> list[RecentCodeRecord]:
+        """Parse unseen UIDs from one selected folder, newest first."""
         records: list[RecentCodeRecord] = []
         for uid in reversed(uids):
+            if uid in seen_uids:
+                continue
+            seen_uids.add(uid)
             try:
                 raw_message = self._fetch_raw_message_from_selected_folder(imap, uid)
                 if raw_message is None:
@@ -385,8 +432,14 @@ class EmailCodeFetcher:
                         message_identity=self._message_identity(message, raw_message),
                     )
                 )
-            except Exception:
+            except Exception as exc:
                 # One malformed message must not hide all other login mails.
+                LOGGER.debug(
+                    "Skipping unreadable login-code message in %s (UID %s): %s",
+                    folder,
+                    uid,
+                    exc,
+                )
                 continue
         return records
 

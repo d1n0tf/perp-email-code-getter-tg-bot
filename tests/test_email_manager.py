@@ -116,7 +116,7 @@ class EmailCodeFetcherRecentScanTests(unittest.TestCase):
         self.assertTrue(imap.logged_out)
         self.assertEqual(len(imap.searches), 2)
         self.assertEqual(
-            sum("FROM \"team@mail.perplexity.ai\"" in item[0] for item in imap.searches),
+            sum("FROM \"perplexity.ai\"" in item[0] for item in imap.searches),
             2,
         )
         self.assertTrue(all("SINCE" in item[0] for item in imap.searches))
@@ -222,7 +222,7 @@ class EmailCodeFetcherRecentScanTests(unittest.TestCase):
         records = self.fetcher.scan_recent_codes(self.account)
 
         self.assertEqual([record.code for record in records], ["246810"])
-        self.assertEqual(len(imap.searches), 3)
+        self.assertEqual(len(imap.searches), 4)
         self.assertIn("SINCE", imap.searches[-1][0])
         self.assertRegex(imap.searches[-1][0], r"SINCE \d{2}-[A-Z][a-z]{2}-\d{4}")
 
@@ -249,9 +249,44 @@ class EmailCodeFetcherRecentScanTests(unittest.TestCase):
         records = self.fetcher.scan_recent_codes(self.account)
 
         self.assertEqual([record.code for record in records], ["975310"])
-        self.assertEqual(len(imap.searches), 2)
+        self.assertEqual(len(imap.searches), 3)
         self.assertIn('FROM "team@mail.perplexity.ai"', imap.searches[-1][0])
         self.assertNotIn("SINCE", imap.searches[-1][0])
+
+    def test_scan_recent_codes_finds_new_sender_alias_despite_old_exact_sender(self) -> None:
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        old_sender = _mail(
+            code="111111",
+            when=now - timedelta(hours=2),
+            message_id="<old-exact@example.com>",
+        )
+        current_sender = self._mail_from(
+            sender="Perplexity <no-reply@perplexity.ai>",
+            code="246802",
+            when=now - timedelta(minutes=1),
+            message_id="<current-alias@example.com>",
+        )
+        imap = FakeImap({"INBOX": {"1": old_sender, "2": current_sender}})
+        self.fetcher.folders = ["INBOX"]
+        self.fetcher._connect = lambda *_: imap  # type: ignore[method-assign]
+        original_uid = imap.uid
+
+        def search_by_sender(command: str, *args: str):
+            if command.lower() == "search":
+                assert imap.selected_folder is not None
+                imap.searches.append(args)
+                if 'FROM "perplexity.ai"' in args[0]:
+                    return "OK", [b"2"]
+                if 'FROM "team@mail.perplexity.ai"' in args[0]:
+                    return "OK", [b"1"]
+            return original_uid(command, *args)
+
+        imap.uid = search_by_sender  # type: ignore[method-assign]
+        records = self.fetcher.scan_recent_codes(self.account)
+
+        self.assertEqual([record.code for record in records], ["246802"])
+        self.assertEqual(len(imap.searches), 1)
+        self.assertIn('FROM "perplexity.ai"', imap.searches[0][0])
 
     def test_scan_recent_codes_accepts_current_perplexity_sender_alias(self) -> None:
         now = datetime.now(timezone.utc).replace(microsecond=0)
