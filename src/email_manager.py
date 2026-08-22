@@ -37,6 +37,7 @@ IMAP_MONTH_NAMES = (
     "Nov",
     "Dec",
 )
+RECENT_SCAN_ALL_FALLBACK_UID_LIMIT = 100
 
 
 class CodeWaitTimeout(RuntimeError):
@@ -325,14 +326,12 @@ class EmailCodeFetcher:
         search_day = (
             f"{cutoff.day:02d}-{IMAP_MONTH_NAMES[cutoff.month - 1]}-{cutoff.year:04d}"
         )
-        # Perplexity has changed the local part of its sender address.  An
-        # exact ``team@mail.perplexity.ai`` search therefore misses current
-        # mails from e.g. ``no-reply@perplexity.ai``.  Search the trusted
-        # provider domain first, then retain progressively broader fallbacks
-        # for Outlook tenants with incomplete IMAP search indexes.  Crucially,
-        # fallbacks depend on *accepted records*, not merely on finding an old
-        # UID: an old mail from the former sender must not hide a fresh mail
-        # from the new sender.
+        # Do not rely on an IMAP ``FROM`` criterion here.  Outlook may index
+        # the display sender but not its RFC822 address, and Perplexity has
+        # changed its sender mailbox.  That made a successful search return
+        # only old messages, silently hiding a fresh code.  ``SINCE`` is a
+        # standard server-side filter; the trusted sender is checked locally
+        # from the actual message header below.
         search_queries = self._recent_code_search_queries(search_day)
         seen_uids: set[str] = set()
         records: list[RecentCodeRecord] = []
@@ -340,6 +339,12 @@ class EmailCodeFetcher:
             uids = self._search_recent_code_uids(imap, search_criteria)
             if not uids:
                 continue
+
+            # ``ALL`` is only a recovery path for mailboxes whose Outlook
+            # implementation rejects or mis-indexes ``SINCE``.  Limit it to
+            # the newest UIDs to keep a ten-second page poll bounded.
+            if search_criteria == "ALL":
+                uids = uids[-RECENT_SCAN_ALL_FALLBACK_UID_LIMIT:]
 
             records.extend(
                 self._records_from_uids(
@@ -355,23 +360,8 @@ class EmailCodeFetcher:
         return records
 
     def _recent_code_search_queries(self, search_day: str) -> list[str]:
-        """Return compatible IMAP searches for current Perplexity senders."""
-        normalized_sender = self.search_from.strip().casefold()
-        sender_domain = normalized_sender.rsplit("@", 1)[-1]
-        is_perplexity_sender = sender_domain == "perplexity.ai" or sender_domain.endswith(
-            ".perplexity.ai"
-        )
-
-        # The provider domain query includes both the original and current
-        # Perplexity mailboxes.  It is intentionally first, so the presence
-        # of older exact-sender messages cannot prevent discovering aliases.
-        queries: list[str] = []
-        if is_perplexity_sender:
-            queries.append(f'FROM "perplexity.ai" SINCE {search_day}')
-        queries.append(f'FROM "{self.search_from}" SINCE {search_day}')
-        queries.append(f'FROM "{self.search_from}"')
-        queries.append(f"SINCE {search_day}")
-        return list(dict.fromkeys(queries))
+        """Return sender-independent searches for recent mailbox history."""
+        return [f"SINCE {search_day}", "ALL"]
 
     def _search_recent_code_uids(
         self,
